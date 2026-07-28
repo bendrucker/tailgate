@@ -34,6 +34,16 @@ func TestStatusOf(t *testing.T) {
 			expected: http.StatusBadGateway,
 		},
 		{
+			name:     "upstream timeout",
+			err:      ErrUpstreamTimeout,
+			expected: http.StatusGatewayTimeout,
+		},
+		{
+			name:     "draining",
+			err:      ErrDraining,
+			expected: http.StatusServiceUnavailable,
+		},
+		{
 			name:     "wrapped sentinel",
 			err:      fmt.Errorf("routing %q: %w", "ghost", ErrUnknownUpstream),
 			expected: http.StatusNotFound,

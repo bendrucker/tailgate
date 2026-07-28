@@ -19,10 +19,16 @@ import (
 // the introspection caller by tailnet node identity, which is why the client
 // must dial over tsnet (Server.HTTPClient), never the public internet.
 
-// ErrInvalidToken means the bearer failed verification: absent, inactive,
-// expired, or not issued for the requested resource. Handlers map it to 401
-// with a WWW-Authenticate challenge.
-var ErrInvalidToken = errors.New("auth: invalid token")
+var (
+	// ErrInvalidToken means the bearer failed verification: absent, inactive,
+	// expired, or not issued for the requested resource. Handlers map it to
+	// 401 with a WWW-Authenticate challenge.
+	ErrInvalidToken = errors.New("auth: invalid token")
+	// ErrUnavailable means verification could not run at all: the caller's
+	// token may be fine, tailgate just cannot prove it. Handlers map it to
+	// 503, never to a 401 challenge and never to an allow.
+	ErrUnavailable = errors.New("auth: verification unavailable")
+)
 
 // Verifier validates bearer tokens by introspecting them against the issuer.
 type Verifier struct {
@@ -37,32 +43,41 @@ type Verifier struct {
 // failure means no request can be verified, so callers must treat it as the
 // service being unavailable rather than skipping verification.
 func NewVerifier(ctx context.Context, client *http.Client, issuer string) (*Verifier, error) {
-	wellKnown := strings.TrimSuffix(issuer, "/") + "/.well-known/openid-configuration"
+	issuer = strings.TrimSuffix(issuer, "/")
+	issuerURL, err := url.Parse(issuer)
+	if err != nil {
+		return nil, fmt.Errorf("auth: parse issuer: %w", err)
+	}
+	wellKnown, err := url.JoinPath(issuer, ".well-known", "openid-configuration")
+	if err != nil {
+		return nil, fmt.Errorf("auth: discovery URL: %w", err)
+	}
+
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, wellKnown, nil)
 	if err != nil {
 		return nil, fmt.Errorf("auth: discovery request: %w", err)
 	}
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("auth: discovery: %w", err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("auth: discovery: unexpected status %d", resp.StatusCode)
-	}
-
 	var doc struct {
 		Issuer                string `json:"issuer"`
 		IntrospectionEndpoint string `json:"introspection_endpoint"`
 	}
-	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&doc); err != nil {
-		return nil, fmt.Errorf("auth: discovery: decode: %w", err)
+	if err := fetchJSON(client, req, &doc); err != nil {
+		return nil, fmt.Errorf("auth: discovery: %w", err)
 	}
 	if doc.Issuer != issuer {
 		return nil, fmt.Errorf("auth: discovery: issuer mismatch: got %q, want %q", doc.Issuer, issuer)
 	}
 	if doc.IntrospectionEndpoint == "" {
 		return nil, fmt.Errorf("auth: discovery: issuer advertises no introspection endpoint")
+	}
+	// Every bearer token is forwarded to this endpoint, so an off-origin
+	// value in a tampered discovery document would exfiltrate live tokens.
+	introspect, err := url.Parse(doc.IntrospectionEndpoint)
+	if err != nil {
+		return nil, fmt.Errorf("auth: discovery: parse introspection endpoint: %w", err)
+	}
+	if introspect.Scheme != issuerURL.Scheme || introspect.Host != issuerURL.Host {
+		return nil, fmt.Errorf("auth: discovery: introspection endpoint %q is not on issuer origin %q", doc.IntrospectionEndpoint, issuer)
 	}
 
 	return &Verifier{
@@ -78,9 +93,8 @@ func NewVerifier(ctx context.Context, client *http.Client, issuer string) (*Veri
 // against what the client requested and tsidp granted.
 //
 // Any verification failure returns ErrInvalidToken. Failure to complete
-// introspection at all returns a different error: the caller's token may be
-// fine, tailgate just cannot prove it, and the handler maps that to 503 rather
-// than challenging the client to re-authenticate.
+// introspection at all returns ErrUnavailable instead, so handlers can answer
+// 503 rather than challenging the client to re-authenticate.
 func (v *Verifier) Verify(ctx context.Context, token, resource string) (Identity, error) {
 	if token == "" {
 		return Identity{}, fmt.Errorf("%w: empty", ErrInvalidToken)
@@ -89,22 +103,13 @@ func (v *Verifier) Verify(ctx context.Context, token, resource string) (Identity
 	form := url.Values{"token": {token}}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, v.introspectURL, strings.NewReader(form.Encode()))
 	if err != nil {
-		return Identity{}, fmt.Errorf("auth: introspection request: %w", err)
+		return Identity{}, fmt.Errorf("%w: introspection request: %w", ErrUnavailable, err)
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 
-	resp, err := v.client.Do(req)
-	if err != nil {
-		return Identity{}, fmt.Errorf("auth: introspect: %w", err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return Identity{}, fmt.Errorf("auth: introspect: unexpected status %d", resp.StatusCode)
-	}
-
 	var claims map[string]any
-	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&claims); err != nil {
-		return Identity{}, fmt.Errorf("auth: introspect: decode: %w", err)
+	if err := fetchJSON(v.client, req, &claims); err != nil {
+		return Identity{}, fmt.Errorf("%w: introspect: %w", ErrUnavailable, err)
 	}
 
 	if active, ok := claims["active"].(bool); !ok || !active {
@@ -131,6 +136,24 @@ func (v *Verifier) Verify(ctx context.Context, token, resource string) (Identity
 	}
 	email, _ := claims["email"].(string)
 	return Identity{Subject: sub, Email: email, Claims: claims}, nil
+}
+
+// fetchJSON runs the request and decodes a 200 JSON response into v, holding
+// the response-handling policy (status acceptance, 1 MiB body cap) in one
+// place for discovery and introspection.
+func fetchJSON(client *http.Client, req *http.Request, v any) error {
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("unexpected status %d", resp.StatusCode)
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(v); err != nil {
+		return fmt.Errorf("decode: %w", err)
+	}
+	return nil
 }
 
 // numericClaim reads a JSON number claim, which decodes as float64 from an

@@ -19,10 +19,10 @@ const testResource = "https://tailgate.tail1234.ts.net/mcp/github"
 func fakeIssuer(t *testing.T, tokens map[string]map[string]any) *httptest.Server {
 	t.Helper()
 	mux := http.NewServeMux()
-	var srv *httptest.Server
 	mux.HandleFunc("GET /.well-known/openid-configuration", func(w http.ResponseWriter, r *http.Request) {
+		base := "http://" + r.Host
 		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprintf(w, `{"issuer":%q,"introspection_endpoint":%q}`, srv.URL, srv.URL+"/introspect")
+		fmt.Fprintf(w, `{"issuer":%q,"introspection_endpoint":%q}`, base, base+"/introspect")
 	})
 	mux.HandleFunc("POST /introspect", func(w http.ResponseWriter, r *http.Request) {
 		if err := r.ParseForm(); err != nil {
@@ -39,7 +39,7 @@ func fakeIssuer(t *testing.T, tokens map[string]map[string]any) *httptest.Server
 			t.Errorf("encode introspection response: %v", err)
 		}
 	})
-	srv = httptest.NewServer(mux)
+	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
 	return srv
 }
@@ -235,18 +235,36 @@ func TestVerify(t *testing.T) {
 
 func TestVerifyIntrospectionUnavailable(t *testing.T) {
 	issuer := fakeIssuer(t, nil)
-	verifier, err := NewVerifier(context.Background(), issuer.Client(), issuer.URL)
+	verifier, err := NewVerifier(t.Context(), issuer.Client(), issuer.URL)
 	if err != nil {
 		t.Fatalf("NewVerifier: %v", err)
 	}
 	issuer.Close()
 
-	_, err = verifier.Verify(context.Background(), "good", testResource)
-	if err == nil {
-		t.Fatal("expected error when introspection is unreachable")
+	_, err = verifier.Verify(t.Context(), "good", testResource)
+	if !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("expected ErrUnavailable when introspection is unreachable, got %v", err)
 	}
 	if errors.Is(err, ErrInvalidToken) {
 		t.Fatalf("infrastructure failure must not classify the token as invalid: %v", err)
+	}
+}
+
+func TestNewVerifierTrimsTrailingSlash(t *testing.T) {
+	issuer := fakeIssuer(t, nil)
+	if _, err := NewVerifier(t.Context(), issuer.Client(), issuer.URL+"/"); err != nil {
+		t.Fatalf("expected trailing-slash issuer to construct, got %v", err)
+	}
+}
+
+func TestNewVerifierRejectsForeignIntrospectionEndpoint(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(w, `{"issuer":%q,"introspection_endpoint":"https://attacker.example/introspect"}`, "http://"+r.Host)
+	}))
+	t.Cleanup(srv.Close)
+	if _, err := NewVerifier(t.Context(), srv.Client(), srv.URL); err == nil {
+		t.Fatal("expected construction to fail for an off-origin introspection endpoint")
 	}
 }
 

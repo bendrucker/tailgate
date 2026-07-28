@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -137,7 +138,8 @@ func readSSEEvent(t *testing.T, r *bufio.Reader) sseEvent {
 		if err != nil {
 			t.Fatalf("read SSE line: %v", err)
 		}
-		line = strings.TrimRight(line, "\n")
+		// SSE permits CRLF line endings, so trim both.
+		line = strings.TrimRight(line, "\r\n")
 		switch {
 		case line == "":
 			return ev
@@ -375,33 +377,232 @@ func TestShutdownDrains(t *testing.T) {
 		t.Fatal("in-flight request never reached upstream")
 	}
 
-	shutdownErr := make(chan error, 1)
-	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		shutdownErr <- transport.Shutdown(ctx)
-	}()
-
-	// Shutdown must refuse new work while the drain waits.
-	var refused int
-	for i := 0; i < 50; i++ {
-		resp := postMessage(t, gateway.Client(), gateway.URL, "", `{"jsonrpc":"2.0","method":"notifications/initialized"}`)
-		refused = resp.StatusCode
-		resp.Body.Close()
-		if refused == http.StatusServiceUnavailable {
-			break
-		}
-		time.Sleep(10 * time.Millisecond)
+	// An already-expired context makes Shutdown mark the transport draining
+	// and return immediately, so the 503 refusal can be asserted with one
+	// deterministic request.
+	expired, cancel := context.WithCancel(t.Context())
+	cancel()
+	if err := transport.Shutdown(expired); !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context.Canceled from expired drain, got %v", err)
 	}
-	if refused != http.StatusServiceUnavailable {
-		t.Fatalf("expected 503 during drain, got %d", refused)
+
+	resp := postMessage(t, gateway.Client(), gateway.URL, "", `{"jsonrpc":"2.0","method":"notifications/initialized"}`)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503 during drain, got %d", resp.StatusCode)
 	}
 
 	close(release)
-	if err := <-shutdownErr; err != nil {
+	if err := transport.Shutdown(t.Context()); err != nil {
 		t.Fatalf("shutdown: %v", err)
 	}
 	if status := <-inflightDone; status != http.StatusAccepted {
 		t.Fatalf("in-flight request should complete during drain, got %d", status)
+	}
+}
+
+func TestPathedTargetPreservesEndpointPath(t *testing.T) {
+	paths := make(chan string, 1)
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paths <- r.URL.Path
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer origin.Close()
+
+	target, err := url.Parse(origin.URL + "/mcp")
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	transport := New(target, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	defer transport.Close()
+	gateway := httptest.NewServer(transport)
+	defer gateway.Close()
+
+	resp := postMessage(t, gateway.Client(), gateway.URL, "", `{"jsonrpc":"2.0","method":"notifications/initialized"}`)
+	resp.Body.Close()
+	if got := <-paths; got != "/mcp" {
+		t.Fatalf("expected upstream path /mcp, got %q", got)
+	}
+}
+
+func TestCloseAbandonsStream(t *testing.T) {
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprint(w, "id: ev-1\ndata: {}\n\n")
+		w.(http.Flusher).Flush()
+		<-r.Context().Done()
+	}))
+	defer origin.Close()
+
+	target, err := url.Parse(origin.URL)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	transport := New(target, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	gateway := httptest.NewServer(transport)
+	defer gateway.Close()
+
+	req, err := http.NewRequest(http.MethodGet, gateway.URL, nil)
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	req.Header.Set("Accept", "text/event-stream")
+	resp, err := gateway.Client().Do(req)
+	if err != nil {
+		t.Fatalf("GET: %v", err)
+	}
+	defer resp.Body.Close()
+	readSSEEvent(t, bufio.NewReader(resp.Body))
+
+	closed := make(chan error, 1)
+	go func() { closed <- transport.Close() }()
+
+	select {
+	case err := <-closed:
+		if err != nil {
+			t.Fatalf("close: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Close did not sever the active stream")
+	}
+	if _, err := io.ReadAll(resp.Body); err == nil {
+		t.Fatal("expected the abandoned stream to error for the client")
+	}
+}
+
+func TestExchangeTimeout(t *testing.T) {
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Drain the body first: the server arms its disconnect watcher only
+		// once the request body reaches EOF, and a real upstream reads what
+		// it is sent.
+		io.Copy(io.Discard, r.Body)
+		select {
+		case <-r.Context().Done():
+		case <-time.After(5 * time.Second):
+			t.Error("upstream was never released by the exchange timeout")
+		}
+	}))
+	defer origin.Close()
+
+	target, err := url.Parse(origin.URL)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	transport := New(target, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	defer transport.Close()
+	transport.exchangeTimeout = 50 * time.Millisecond
+	gateway := httptest.NewServer(transport)
+	defer gateway.Close()
+
+	resp := postMessage(t, gateway.Client(), gateway.URL, "", `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}`)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusGatewayTimeout {
+		t.Fatalf("expected 504 for a stalled non-SSE exchange, got %d", resp.StatusCode)
+	}
+}
+
+func TestSSEExemptFromExchangeTimeout(t *testing.T) {
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		fl := w.(http.Flusher)
+		fmt.Fprint(w, "id: ev-1\ndata: {}\n\n")
+		fl.Flush()
+		time.Sleep(300 * time.Millisecond)
+		fmt.Fprint(w, "id: ev-2\ndata: {}\n\n")
+		fl.Flush()
+	}))
+	defer origin.Close()
+
+	target, err := url.Parse(origin.URL)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	transport := New(target, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	defer transport.Close()
+	transport.exchangeTimeout = 75 * time.Millisecond
+	gateway := httptest.NewServer(transport)
+	defer gateway.Close()
+
+	req, err := http.NewRequest(http.MethodGet, gateway.URL, nil)
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	req.Header.Set("Accept", "text/event-stream")
+	resp, err := gateway.Client().Do(req)
+	if err != nil {
+		t.Fatalf("GET: %v", err)
+	}
+	defer resp.Body.Close()
+
+	reader := bufio.NewReader(resp.Body)
+	if ev := readSSEEvent(t, reader); ev.id != "ev-1" {
+		t.Fatalf("expected ev-1, got %q", ev.id)
+	}
+	// The stream outlives the exchange timeout because ModifyResponse stops
+	// the timer for SSE responses.
+	if ev := readSSEEvent(t, reader); ev.id != "ev-2" {
+		t.Fatalf("expected ev-2 after the timeout window, got %q", ev.id)
+	}
+}
+
+func TestClientAbortIsNotAnUpstreamError(t *testing.T) {
+	arrived := make(chan struct{}, 1)
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.Copy(io.Discard, r.Body)
+		select {
+		case arrived <- struct{}{}:
+		default:
+		}
+		select {
+		case <-r.Context().Done():
+		case <-time.After(5 * time.Second):
+			t.Error("upstream never observed the client abort")
+		}
+	}))
+	defer origin.Close()
+
+	target, err := url.Parse(origin.URL)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	var logs strings.Builder
+	transport := New(target, slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	defer transport.Close()
+	gateway := httptest.NewServer(transport)
+	defer gateway.Close()
+
+	ctx, cancel := context.WithCancel(t.Context())
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, gateway.URL, strings.NewReader(`{"jsonrpc":"2.0","method":"notifications/initialized"}`))
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	errs := make(chan error, 1)
+	go func() {
+		resp, err := gateway.Client().Do(req)
+		if err == nil {
+			resp.Body.Close()
+		}
+		errs <- err
+	}()
+	select {
+	case <-arrived:
+	case <-time.After(5 * time.Second):
+		t.Fatal("request never reached upstream")
+	}
+	cancel()
+	if err := <-errs; err == nil {
+		t.Fatal("expected the aborted request to error")
+	}
+
+	// Drain so the proxy's error handling has finished before reading logs.
+	if err := transport.Shutdown(t.Context()); err != nil {
+		t.Fatalf("shutdown: %v", err)
+	}
+	if strings.Contains(logs.String(), "upstream proxy error") {
+		t.Fatalf("client abort logged as upstream error:\n%s", logs.String())
 	}
 }

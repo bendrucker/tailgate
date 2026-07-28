@@ -14,9 +14,12 @@
 //
 // # Error taxonomy
 //
-// The sentinel errors below are the shared vocabulary for request-path
-// failures. Handlers translate them with StatusOf so every layer-2 unit maps
-// the same condition to the same status code.
+// The sentinel errors below are the shared vocabulary for proxy-side
+// request-path failures. Handlers translate them with StatusOf so every
+// layer-2 unit maps the same condition to the same status code. Auth failures
+// are the router's to map, because they carry response content a status alone
+// cannot: auth.ErrInvalidToken becomes 401 with a WWW-Authenticate challenge,
+// and auth.ErrUnavailable becomes 503.
 //
 // # Lifecycle
 //
@@ -70,6 +73,11 @@ var (
 	// ErrUpstreamUnavailable is returned when the upstream cannot be reached
 	// or fails before producing a response.
 	ErrUpstreamUnavailable = errors.New("proxy: upstream unavailable")
+	// ErrUpstreamTimeout is returned when a non-SSE exchange exceeds the
+	// transport's deadline.
+	ErrUpstreamTimeout = errors.New("proxy: upstream timeout")
+	// ErrDraining is returned for requests arriving after shutdown began.
+	ErrDraining = errors.New("proxy: draining")
 )
 
 // StatusOf maps a request-path error to the HTTP status its handler writes.
@@ -85,6 +93,10 @@ func StatusOf(err error) int {
 		return http.StatusTooManyRequests
 	case errors.Is(err, ErrUpstreamUnavailable):
 		return http.StatusBadGateway
+	case errors.Is(err, ErrUpstreamTimeout):
+		return http.StatusGatewayTimeout
+	case errors.Is(err, ErrDraining):
+		return http.StatusServiceUnavailable
 	default:
 		return http.StatusInternalServerError
 	}

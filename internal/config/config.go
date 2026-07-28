@@ -2,9 +2,11 @@
 package config
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"os"
+	"regexp"
 	"time"
 
 	"github.com/tailscale/hujson"
@@ -64,13 +66,28 @@ type Rule struct {
 
 // Match is a single allow condition. An identity matches when every non-empty
 // field equals the corresponding claim from token introspection. tsidp's
-// introspection response carries sub, username, email, and scope only, so
-// arbitrary claim matches are limited to those until tsidp exposes extra
-// claims there.
+// introspection response carries sub, username, scope, and email (the last
+// only when the token was granted the email scope), so arbitrary claim
+// matches are limited to those until tsidp exposes extra claims there, and
+// email rules require clients to request the email scope.
 type Match struct {
 	Subject string            `json:"sub,omitempty"`
 	Email   string            `json:"email,omitempty"`
 	Claim   map[string]string `json:"claim,omitempty"`
+}
+
+// empty reports whether the match has no conditions. An empty match would
+// vacuously allow every identity, so validation rejects it.
+func (m *Match) empty() bool {
+	if m.Subject != "" || m.Email != "" {
+		return false
+	}
+	for k, v := range m.Claim {
+		if k != "" && v != "" {
+			return false
+		}
+	}
+	return true
 }
 
 // Load reads, parses, and validates the config file at path.
@@ -84,7 +101,11 @@ func Load(path string) (*Config, error) {
 		return nil, fmt.Errorf("config: parse hujson: %w", err)
 	}
 	var cfg Config
-	if err := json.Unmarshal(std, &cfg); err != nil {
+	// Unknown fields are errors, never silently dropped: a typoed or removed
+	// policy key that decodes to an empty match would fail open.
+	dec := json.NewDecoder(bytes.NewReader(std))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&cfg); err != nil {
 		return nil, fmt.Errorf("config: unmarshal: %w", err)
 	}
 	if err := cfg.Validate(); err != nil {
@@ -110,6 +131,13 @@ func (c *Config) Validate() error {
 		if u.Name == "" {
 			return fmt.Errorf("config: upstream name is required")
 		}
+		// The name becomes a single path segment of the canonical resource
+		// URI, matched byte-for-byte against grants and routes. Anything
+		// outside this set (slashes, dots, URL metacharacters, uppercase)
+		// would mint an aliased, unroutable, or divergently escaped URI.
+		if !upstreamName.MatchString(u.Name) {
+			return fmt.Errorf("config: upstream name %q must match %s", u.Name, upstreamName)
+		}
 		if names[u.Name] {
 			return fmt.Errorf("config: duplicate upstream %q", u.Name)
 		}
@@ -123,9 +151,20 @@ func (c *Config) Validate() error {
 		if !names[r.Upstream] {
 			return fmt.Errorf("config: policy references unknown upstream %q", r.Upstream)
 		}
+		if len(r.Allow) == 0 {
+			return fmt.Errorf("config: policy for %q has no allow conditions", r.Upstream)
+		}
+		for _, m := range r.Allow {
+			if m.empty() {
+				return fmt.Errorf("config: policy for %q has an empty allow condition, which would match every identity", r.Upstream)
+			}
+		}
 	}
 	return nil
 }
+
+// upstreamName restricts names to lowercase DNS-label-like segments.
+var upstreamName = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]*[a-z0-9])?$`)
 
 func (u *Upstream) validate() error {
 	switch u.Transport {

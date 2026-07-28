@@ -4,6 +4,9 @@ package resource
 
 import (
 	"fmt"
+	"net"
+	"net/url"
+	"strconv"
 	"strings"
 )
 
@@ -16,7 +19,7 @@ import (
 // The tailnet FQDN is unknown until the tsnet node joins, so construct URLs
 // after join and thread it through the spine.
 type URLs struct {
-	base string
+	base *url.URL
 }
 
 // NewURLs canonicalizes the node's FQDN and Funnel port into the base all
@@ -30,23 +33,22 @@ func NewURLs(fqdn string, port int) (*URLs, error) {
 	if strings.ContainsAny(host, "/:?#") {
 		return nil, fmt.Errorf("resource: FQDN %q must be a bare host", fqdn)
 	}
-	base := "https://" + host
 	if port != 443 {
-		base = fmt.Sprintf("%s:%d", base, port)
+		host = net.JoinHostPort(host, strconv.Itoa(port))
 	}
-	return &URLs{base: base}, nil
+	return &URLs{base: &url.URL{Scheme: "https", Host: host, Path: "/"}}, nil
 }
 
 // ResourceURL returns the canonical URI identifying the named upstream as a
 // protected resource: <base>/mcp/<name>, with no trailing slash, query, or
 // fragment.
 func (u *URLs) ResourceURL(name string) string {
-	return u.base + "/mcp/" + name
+	return u.base.JoinPath("mcp", name).String()
 }
 
 // Metadata returns the path serving the RFC 9728 protected-resource metadata
 // for the named upstream: the well-known prefix inserted ahead of the resource
 // path, per RFC 9728 section 3.
 func (u *URLs) Metadata(name string) string {
-	return "/.well-known/oauth-protected-resource/mcp/" + name
+	return u.base.JoinPath(".well-known", "oauth-protected-resource", "mcp", name).Path
 }
