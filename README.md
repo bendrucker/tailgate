@@ -64,11 +64,19 @@ An HTTP upstream needs a `url`. A stdio upstream needs a `command` and takes opt
 
 ## Deployment
 
-tailgate runs as a single binary under launchd. It needs:
+tailgate runs as a single binary under launchd:
 
-- **A Tailscale auth key** in the environment to join the tailnet on first start.
+```
+tailgate -config /etc/tailgate.hujson
+```
+
+It needs:
+
+- **A Tailscale auth key** in `TS_AUTHKEY` to join the tailnet on first start. Without one, tailgate logs an interactive login URL and waits.
 - **The `funnel` node attribute** granted to tailgate's node in the tailnet policy. Without it, Funnel fails at the public edge.
 - **A tsidp app-capability grant** that authorizes each upstream's resource URI and populates any claims the policy matches on.
+
+`SIGINT` and `SIGTERM` stop the listener, drain in-flight requests and open streams for up to 30 seconds, close whatever connections remain, then leave the tailnet.
 
 ## Development
 

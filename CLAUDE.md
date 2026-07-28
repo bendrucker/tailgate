@@ -25,7 +25,7 @@ Everything else is standard library: `net/http/httputil` for HTTP proxying, `net
 
 ## Settled Contracts
 
-The contract spike (research against pinned sources plus an end-to-end proxy test) resolved the questions that blocked fan-out. Layer-2 agents build on these facts and do not relitigate them.
+These facts come from research against pinned sources plus an end-to-end proxy test. Do not relitigate them. Re-verify them when the tsidp pin moves or the MCP revision changes.
 
 ### tsidp, Pinned at `99effa593a177e55f6e8ebd64041c4da602f9807` (2026-07-24)
 
@@ -48,34 +48,19 @@ The contract spike (research against pinned sources plus an end-to-end proxy tes
 - An invalid `Origin` gets `403`. Session IDs must be cryptographically random visible ASCII, must never serve as authentication, and should be bound to the authenticated identity, which shapes the stdio transport's synthesized sessions.
 - Client ID metadata documents (CIMD) are new and DCR is demoted to MAY, so tailnet-side pre-registration of confidential clients is spec-compliant onboarding.
 
-## Build Decomposition
+## Packages
 
-### Layer 1: Spine (Settled)
+`main` joins the tailnet, seeds `resource.URLs` from the node's FQDN, builds the verifier on the tsnet HTTP client, assembles the router, serves Funnel, and drains on signal. The order is forced: nothing serves until every step succeeds.
 
 - `internal/config`: schema and loader. Policy `Match` fields are limited to what introspection returns.
-- `internal/resource`: `URLs` is the single canonicalization point, seeded from the tailnet FQDN after join. `ResourceURL(name)` output is the byte-exact string used in the client `resource` param, the tsidp grant, the `aud` check, and each metadata doc.
-- `internal/auth`: `Identity` and `Decision` types, `Verifier` (introspection, fail closed), and identity-in-context helpers for transports and audit.
-- `internal/proxy`: the `Transport` seam is `http.Handler` plus `Shutdown` and `Close`. HTTP semantics are the contract, so the seam carries JSON and SSE responses, session headers, and resumption without a bespoke message layer. Sentinel errors plus `StatusOf` are the shared error taxonomy. The package doc records the lifecycle and drain contract.
-- `internal/proxy/httptransport`: the reverse proxy, built and proven by the spike's end-to-end test (initialize plus a streamed tool call, with credential stripping and SSE fidelity asserted).
-- `internal/tsnetserver`: node constructor, `FQDN` (the seed for `resource.URLs`), and the Funnel listener.
-
-### Layer 2: Parallel Units
-
-Fan out freely, with no ordering between units. Each builds against the layer-1 spine. Acceptance criteria in parentheses.
-
-- `internal/tsnetserver` behavior: join, Funnel serve, graceful shutdown (node comes up, listener accepts).
-- `internal/auth` verify hardening: adversarial corpus against the introspection verifier, caching bounded by `exp`, and abuse controls for the pre-auth introspection path, since every random token an internet client sprays at Funnel costs a tsidp round trip (every hostile token denied, fail closed, bounded introspection load).
-- `internal/auth` authorize path: evaluate policy against `Identity` (allow and deny match the rules).
-- `internal/resource`: RFC 9728 metadata handlers at the path-suffix well-known, and the `WWW-Authenticate` challenge with `resource_metadata` (a real MCP client completes discovery).
-- `internal/router`: exact-segment routing to transports, auth gating ahead of every transport, recover middleware, `Origin` validation, `ReadHeaderTimeout` and `MaxBytesReader`, header stripping, and identity injection (hostile paths rejected, no unauthenticated request reaches a transport).
-- `internal/router` session binding: bind `Mcp-Session-Id` to the authenticated identity for HTTP upstreams, per the spec's session-hijacking guidance. Without it, any authorized caller who learns another user's session ID can take over that live session, since the upstream sees only the header (a session ID presented by a different identity is refused).
-- `internal/proxy/stdiotransport`: the server side of streamable HTTP over a per-session child: synthesized session IDs keyed to identity, JSON-RPC correlation, per-identity-per-upstream cap, idle reap (cap holds under load, children reaped when idle, unknown session gets 404). The drain choreography (draining flag, inflight tracking, 503 refusal, cancel-on-Close) already exists in `httptransport`. Lift it into a shared `proxy` helper rather than re-implementing it.
+- `internal/resource`: `URLs` is the single canonicalization point, seeded from the tailnet FQDN after join. `ResourceURL(name)` output is the byte-exact string used in the client `resource` param, the tsidp grant, the `aud` check, and each metadata doc. `Handler` serves the RFC 9728 well-known subtree.
+- `internal/auth`: `Identity` and `Decision`, the introspection `Verifier`, the policy `Authorizer`, and identity-in-context helpers for transports and audit.
+- `internal/proxy`: the `Transport` seam is `http.Handler` plus `Shutdown` and `Close`. HTTP semantics are the contract. The seam carries JSON and SSE responses, session headers, and resumption without a bespoke message layer. Sentinel errors plus `StatusOf` are the shared error taxonomy, and `Drain` is the shared refuse-and-wait choreography. The package doc records the lifecycle and drain contract.
+- `internal/proxy/httptransport`: the reverse proxy for HTTP upstreams.
+- `internal/proxy/stdiotransport`: the server side of streamable HTTP over a child process per session, with session ids bound to the caller, JSON-RPC correlation, a per-identity-per-upstream cap, and idle reaping.
+- `internal/router`: the public handler. Exact-segment routing, auth ahead of every transport, session binding, `Origin` validation, body limits, header stripping, identity injection, and panic recovery.
+- `internal/tsnetserver`: the embedded node, the `FQDN` that seeds `resource.URLs`, and the Funnel listener.
 - `internal/audit`: structured decision log.
-
-### Layer 3: Integration and Verification (After the Layer-2 Barrier)
-
-- Wire everything in `main`: join, seed `resource.URLs` from `FQDN`, build the verifier on the tsnet HTTP client, serve Funnel, drain on shutdown.
-- Conformance: adversarial token corpus, MCP client discovery, session fidelity, spawn-DoS cap.
 
 ## Provisioning (Tailnet-Side, Outside the Binary)
 
@@ -105,4 +90,4 @@ tailgate is an internet-facing boundary where a validation gap is a remote explo
 
 ## Curation
 
-The settled-contracts and build-decomposition sections are scaffolding for the initial build. Trim them once the code embodies the contracts and layer 2 has landed.
+The settled-contracts section records pinned external research about tsidp and the MCP spec. It describes neither this code nor its intent. It stays until tsidp or the MCP revision moves, at which point re-verify it rather than trusting it.
