@@ -3,7 +3,6 @@ module github.com/bendrucker/tailgate
 go 1.26.5
 
 require (
-	github.com/coreos/go-oidc/v3 v3.20.0
 	github.com/google/go-cmp v0.7.0
 	github.com/tailscale/hujson v0.0.0-20260722022634-78b5b162ee49
 	tailscale.com v1.102.0
@@ -18,7 +17,6 @@ require (
 	github.com/dblohm7/wingoes v0.0.0-20240119213807-a09d6be7affa // indirect
 	github.com/fxamacker/cbor/v2 v2.9.0 // indirect
 	github.com/gaissmai/bart v0.26.1 // indirect
-	github.com/go-jose/go-jose/v4 v4.1.4 // indirect
 	github.com/go-json-experiment/json v0.0.0-20260214004413-d219187c3433 // indirect
 	github.com/godbus/dbus/v5 v5.2.2 // indirect
 	github.com/golang/groupcache v0.0.0-20241129210726-2c02b8208cf8 // indirect

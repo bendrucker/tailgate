@@ -1,40 +1,103 @@
 // Package proxy routes authorized requests to MCP upstreams.
+//
+// # Seam
+//
+// A Transport serves one upstream's MCP endpoint over streamable HTTP
+// (MCP 2025-11-25). The seam is HTTP itself. Expressing the transport as a
+// handler carries every protocol obligation without re-encoding it in a
+// bespoke interface: a POST answered with a single JSON object or an SSE
+// stream, the standalone GET stream, DELETE termination, Last-Event-ID
+// resumption, and Mcp-Session-Id. The HTTP adapter reverse-proxies and
+// preserves the upstream's session and SSE bytes verbatim. The stdio adapter implements the
+// server side of streamable HTTP over a child process, synthesizing session IDs
+// and correlating JSON-RPC messages itself.
+//
+// # Error taxonomy
+//
+// The sentinel errors below are the shared vocabulary for proxy-side
+// request-path failures. Handlers translate them with StatusOf so every
+// layer-2 unit maps the same condition to the same status code. Auth failures
+// are the router's to map, because they carry response content a status alone
+// cannot: auth.ErrInvalidToken becomes 401 with a WWW-Authenticate challenge,
+// and auth.ErrUnavailable becomes 503.
+//
+// # Lifecycle
+//
+// Construction never dials: a Transport that cannot reach its upstream reports
+// it per-request, so a broken upstream degrades to ErrUpstreamUnavailable
+// rather than blocking startup. Shutdown drains: the transport refuses new
+// work with 503, lets in-flight requests and open SSE streams finish, and
+// returns when they have or when ctx expires. Close tears down immediately and
+// is safe after Shutdown. The server stops the Funnel listener first, then
+// shuts down transports with a drain deadline, then closes the tsnet node.
 package proxy
 
 import (
 	"context"
 	"errors"
 	"io"
+	"net/http"
 )
 
-// Transport is the per-upstream seam between the router and a backing MCP
-// server. The HTTP and stdio adapters are independent implementations, selected
-// by an upstream's config transport field.
+// Transport serves one upstream's MCP endpoint.
 //
-// PROVISIONAL. This seam is too thin for streamable HTTP: it opens and closes a
-// session but does not carry messages. The real seam must express a POST that
-// returns either JSON or an SSE stream, a standalone GET server-to-client
-// stream, HTTP DELETE termination, Last-Event-ID resumption, and the split
-// where an HTTP upstream mints Mcp-Session-Id while a stdio upstream has none.
-// The layer-1.5 spike settles the final shape. See CLAUDE.md.
+// ServeHTTP receives requests already authorized and rewritten by the router:
+// the URL path is the endpoint root ("/"), the Authorization header and
+// inbound X-Forwarded-* headers are stripped, and the request context carries
+// the caller's auth.Identity. A Transport never sees an unauthenticated
+// request; anything reaching it may spawn work on the upstream.
+//
+// Timeout policy lives here, not on the server: only the transport knows
+// whether a response is a bounded JSON body or an SSE stream that must stay
+// open, so blanket server write timeouts are wrong. Servers set
+// ReadHeaderTimeout; transports bound everything after the headers.
 type Transport interface {
-	// Open establishes a new MCP session to the upstream.
-	Open(ctx context.Context) (Session, error)
-	// Close releases the transport and all of its sessions.
-	Close() error
-}
-
-// Session carries streamable-HTTP MCP messages in both directions for one
-// Mcp-Session-Id.
-type Session interface {
+	http.Handler
+	// Shutdown drains the transport: refuse new requests, then wait for
+	// in-flight requests and streams to finish or ctx to expire.
+	Shutdown(ctx context.Context) error
+	// Closer tears down immediately, abandoning in-flight work.
 	io.Closer
-	// ID is the Mcp-Session-Id the client uses to resume the session.
-	ID() string
 }
 
 var (
 	// ErrUnknownUpstream is returned when a route names no configured upstream.
 	ErrUnknownUpstream = errors.New("proxy: unknown upstream")
-	// ErrCapExceeded is returned when an upstream is at its session cap.
-	ErrCapExceeded = errors.New("proxy: upstream session cap exceeded")
+	// ErrSessionNotFound is returned for an Mcp-Session-Id that is expired or
+	// was never issued. The 404 mapping is load-bearing: it is what tells an
+	// MCP client to discard the session and re-initialize.
+	ErrSessionNotFound = errors.New("proxy: session not found")
+	// ErrCapExceeded is returned when the caller is at their session cap for
+	// an upstream.
+	ErrCapExceeded = errors.New("proxy: session cap exceeded")
+	// ErrUpstreamUnavailable is returned when the upstream cannot be reached
+	// or fails before producing a response.
+	ErrUpstreamUnavailable = errors.New("proxy: upstream unavailable")
+	// ErrUpstreamTimeout is returned when a non-SSE exchange exceeds the
+	// transport's deadline.
+	ErrUpstreamTimeout = errors.New("proxy: upstream timeout")
+	// ErrDraining is returned for requests arriving after shutdown began.
+	ErrDraining = errors.New("proxy: draining")
 )
+
+// StatusOf maps a request-path error to the HTTP status its handler writes.
+// Unrecognized errors map to 500: an unclassified failure is a server fault
+// and must never pass through as success.
+func StatusOf(err error) int {
+	switch {
+	case errors.Is(err, ErrUnknownUpstream):
+		return http.StatusNotFound
+	case errors.Is(err, ErrSessionNotFound):
+		return http.StatusNotFound
+	case errors.Is(err, ErrCapExceeded):
+		return http.StatusTooManyRequests
+	case errors.Is(err, ErrUpstreamUnavailable):
+		return http.StatusBadGateway
+	case errors.Is(err, ErrUpstreamTimeout):
+		return http.StatusGatewayTimeout
+	case errors.Is(err, ErrDraining):
+		return http.StatusServiceUnavailable
+	default:
+		return http.StatusInternalServerError
+	}
+}
