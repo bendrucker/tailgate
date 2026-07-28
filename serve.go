@@ -16,9 +16,17 @@ import (
 	"github.com/bendrucker/tailgate/internal/tsnetserver"
 )
 
-// drainTimeout bounds graceful shutdown. An MCP session's SSE stream stays open
-// until its client goes away, so a drain without a deadline is a hang.
-const drainTimeout = 30 * time.Second
+const (
+	// drainTimeout bounds the transport drain. An MCP session's SSE stream
+	// stays open until its client goes away, so a drain without a deadline is a
+	// hang.
+	drainTimeout = 30 * time.Second
+	// closeTimeout bounds the wait for connections whose handlers have already
+	// returned. It runs on its own clock so a transport that spends the entire
+	// drain budget still leaves the server a window to close cleanly rather
+	// than severing every connection it was about to finish with.
+	closeTimeout = 5 * time.Second
+)
 
 // serve runs tailgate until ctx is canceled or the listener fails.
 //
@@ -106,14 +114,18 @@ func drain(logger *slog.Logger, node stopper, server *http.Server, rt transports
 
 	stopped := node.StopAccepting()
 
-	ctx, cancel := context.WithTimeout(context.Background(), drainTimeout)
-	defer cancel()
+	draining, cancelDraining := context.WithTimeout(context.Background(), drainTimeout)
+	defer cancelDraining()
 
-	drained := rt.Shutdown(ctx)
+	drained := rt.Shutdown(draining)
 	if drained != nil {
 		logger.Warn("upstreams did not drain", "err", drained)
 	}
-	if err := server.Shutdown(ctx); err != nil {
+
+	closing, cancelClosing := context.WithTimeout(context.Background(), closeTimeout)
+	defer cancelClosing()
+
+	if err := server.Shutdown(closing); err != nil {
 		logger.Warn("connections did not close", "err", err)
 		// Close severs whatever the deadline left, so shutdown terminates.
 		drained = errors.Join(drained, server.Close())

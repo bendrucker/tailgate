@@ -72,8 +72,8 @@ func upstreamRoute(cfg config.Upstream, logger *slog.Logger, auditor *audit.Logg
 }
 
 // upstreamURL parses an HTTP upstream's endpoint. The config validates only
-// that it is present: an address tailgate cannot dial is a startup failure,
-// never a route that answers 502 forever.
+// that it is present, and construction never dials, so an address no request
+// could ever be built from is the one failure still catchable before serving.
 func upstreamURL(raw string) (*url.URL, error) {
 	target, err := url.Parse(raw)
 	if err != nil {
