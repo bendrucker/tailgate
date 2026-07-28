@@ -1,0 +1,588 @@
+// Package stdiotransport serves streamable HTTP (MCP 2025-11-25) over a child
+// process per MCP session.
+//
+// A stdio MCP server speaks JSON-RPC over its own pipes and has no notion of
+// sessions, so this transport is the server side of the HTTP protocol: it
+// mints the session id, binds it to the authenticated caller, correlates
+// JSON-RPC ids across the child's newline-delimited stream, and reaps children
+// that go idle. Because a request here spawns a process, the caps and
+// lifecycles live per identity: one caller cannot exhaust the host for others.
+//
+// The no-token-passthrough invariant holds by construction here. Nothing from
+// the client's HTTP request reaches the child but the JSON-RPC message itself,
+// so there is no header for a credential to ride on.
+package stdiotransport
+
+import (
+	"context"
+	"crypto/rand"
+	"encoding/base64"
+	"errors"
+	"fmt"
+	"io"
+	"log/slog"
+	"net/http"
+	"os"
+	"sync"
+	"time"
+
+	"github.com/bendrucker/tailgate/internal/audit"
+	"github.com/bendrucker/tailgate/internal/auth"
+	"github.com/bendrucker/tailgate/internal/proxy"
+)
+
+// Defaults applied to zero-valued Options.
+const (
+	// DefaultMaxSessions caps live sessions per identity per upstream.
+	DefaultMaxSessions = 4
+	// DefaultIdleTimeout reaps a session whose caller has gone away without
+	// sending DELETE.
+	DefaultIdleTimeout = 5 * time.Minute
+	// DefaultRequestTimeout bounds one JSON-RPC exchange with a child.
+	DefaultRequestTimeout = time.Minute
+)
+
+// AssumedProtocolVersion is the version a request without an
+// MCP-Protocol-Version header is treated as speaking, per MCP 2025-11-25.
+const AssumedProtocolVersion = "2025-03-26"
+
+// maxBodyBytes bounds a POSTed message. The router applies its own limit; this
+// one keeps the transport safe on its own.
+const maxBodyBytes = 4 << 20
+
+const (
+	sessionHeader         = "Mcp-Session-Id"
+	protocolVersionHeader = "MCP-Protocol-Version"
+	initializeMethod      = "initialize"
+)
+
+// supportedProtocolVersions gates the MCP-Protocol-Version header. An
+// unrecognized version is a 400: proxying it would hand the child a dialect
+// neither end agreed to.
+var supportedProtocolVersions = map[string]bool{
+	"2024-11-05": true,
+	"2025-03-26": true,
+	"2025-06-18": true,
+	"2025-11-25": true,
+}
+
+var (
+	errMissingSessionID    = errors.New("stdiotransport: Mcp-Session-Id is required")
+	errUnsupportedProtocol = errors.New("stdiotransport: unsupported MCP-Protocol-Version")
+	errUnauthenticated     = errors.New("stdiotransport: request carries no authorized identity")
+)
+
+// Reasons recorded on the audit log for refusals this transport makes itself.
+// The router binds sessions only for upstreams whose transport passes the
+// upstream's own session ids through, so a stdio session's own refusals are
+// the only record of them. ReasonSessionBound repeats the router's wording so
+// one query over the audit stream catches a hijack attempt against either kind
+// of upstream.
+const (
+	ReasonSessionBound = "session bound to a different identity"
+	ReasonSessionCap   = "session cap exceeded"
+	ReasonUnauthorized = "request carries no authorized identity"
+)
+
+// Options configures a stdio Transport. Only Command is required.
+type Options struct {
+	// Name is the upstream's configured name, used for log context.
+	Name string
+	// Command is the child executable.
+	Command string
+	Args    []string
+	// Env entries ("KEY=VALUE") are appended to tailgate's own environment.
+	Env []string
+	// Dir is the child's working directory, defaulting to tailgate's.
+	Dir string
+	// MaxSessions caps live sessions per identity per upstream, which is the
+	// config's max_children: a session is a child. The cap is per-identity so
+	// one caller cannot starve the others.
+	MaxSessions int
+	// IdleTimeout terminates a session no request has touched for this long.
+	IdleTimeout time.Duration
+	// RequestTimeout bounds the wait for a child's response to one request.
+	RequestTimeout time.Duration
+	// Logger receives session lifecycle and child diagnostics.
+	Logger *slog.Logger
+	// Audit receives the authorization decisions this transport makes on its
+	// own: the session bindings it owns and the per-identity cap. A nil Audit
+	// still records, through the audit package's default logger.
+	Audit *audit.Logger
+}
+
+func (o Options) withDefaults() Options {
+	if o.MaxSessions <= 0 {
+		o.MaxSessions = DefaultMaxSessions
+	}
+	if o.IdleTimeout <= 0 {
+		o.IdleTimeout = DefaultIdleTimeout
+	}
+	if o.RequestTimeout <= 0 {
+		o.RequestTimeout = DefaultRequestTimeout
+	}
+	if o.Logger == nil {
+		o.Logger = slog.Default()
+	}
+	return o
+}
+
+// Transport serves one stdio upstream. Close must be called to stop its
+// background reaper and its children.
+type Transport struct {
+	options Options
+	logger  *slog.Logger
+	audit   *audit.Logger
+	drain   proxy.Drain
+
+	shutdownGrace time.Duration
+
+	reaperStopped chan struct{}
+	stop          chan struct{}
+	stopOnce      sync.Once
+
+	mu          sync.Mutex
+	closed      bool
+	sessions    map[string]*session
+	perIdentity map[string]int
+}
+
+// shutdownGrace is how long a child has to exit after its stdin closes before
+// its process group is killed.
+const shutdownGrace = 2 * time.Second
+
+// New returns a Transport that spawns opts.Command per MCP session.
+// Construction never spawns: a child that cannot start surfaces per-request as
+// 502.
+func New(opts Options) *Transport {
+	opts = opts.withDefaults()
+	t := &Transport{
+		options:       opts,
+		logger:        opts.Logger.With("upstream", opts.Name),
+		audit:         opts.Audit,
+		shutdownGrace: shutdownGrace,
+		reaperStopped: make(chan struct{}),
+		stop:          make(chan struct{}),
+		sessions:      make(map[string]*session),
+		perIdentity:   make(map[string]int),
+	}
+	go t.reapIdleSessions()
+	return t
+}
+
+// ServeHTTP serves one MCP request against this upstream's children. POST
+// carries every JSON-RPC message, DELETE terminates a session, and the
+// standalone GET stream is refused with 405: a stdio child answers requests
+// and has no server-initiated stream to relay.
+func (t *Transport) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	inflight, err := t.drain.Enter(r.Context())
+	if err != nil {
+		t.writeError(w, err)
+		return
+	}
+	defer inflight.Done()
+
+	identity, ok := auth.IdentityFrom(r.Context())
+	if !ok || identity.Subject == "" {
+		// Reaching a transport unauthenticated is a routing fault, and this
+		// transport spawns processes. Fail closed rather than serve it.
+		t.logger.Error("stdio transport reached without an authorized identity", "method", r.Method)
+		t.audit.Deny(r.Context(), identity, t.options.Name, ReasonUnauthorized)
+		t.writeError(w, errUnauthenticated)
+		return
+	}
+
+	if version := r.Header.Get(protocolVersionHeader); version != "" && !supportedProtocolVersions[version] {
+		t.writeError(w, fmt.Errorf("%w: %q", errUnsupportedProtocol, version))
+		return
+	}
+
+	switch r.Method {
+	case http.MethodPost:
+		t.servePost(w, r, inflight, identity)
+	case http.MethodDelete:
+		t.serveDelete(w, r, identity)
+	default:
+		w.Header().Set("Allow", "POST, DELETE")
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func (t *Transport) servePost(w http.ResponseWriter, r *http.Request, inflight *proxy.InFlight, identity auth.Identity) {
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxBodyBytes))
+	if err != nil {
+		t.writeError(w, errInvalidMessage)
+		return
+	}
+	msg, err := parseMessage(body)
+	if err != nil {
+		t.writeError(w, err)
+		return
+	}
+
+	if msg.Method == initializeMethod {
+		t.serveInitialize(r.Context(), w, inflight, identity, msg)
+		return
+	}
+
+	s, err := t.sessionFor(r.Context(), r.Header.Get(sessionHeader), identity)
+	if err != nil {
+		t.writeError(w, err)
+		return
+	}
+	defer s.finish()
+
+	if !msg.IsRequest() {
+		// Notifications and responses are one-way: the spec answers them with
+		// 202 and an empty body.
+		if err := s.send(msg.Line); err != nil {
+			t.writeError(w, err)
+			return
+		}
+		w.WriteHeader(http.StatusAccepted)
+		return
+	}
+
+	response, err := s.exchange(inflight.Context(), msg, t.options.RequestTimeout)
+	if err != nil {
+		t.writeError(w, err)
+		return
+	}
+	writeJSON(w, response)
+}
+
+// serveInitialize spawns the session's child and mints its session id. The
+// router has already authorized the request, which is what keeps a spawn
+// behind authentication.
+func (t *Transport) serveInitialize(ctx context.Context, w http.ResponseWriter, inflight *proxy.InFlight, identity auth.Identity, msg message) {
+	if !msg.IsRequest() {
+		t.writeError(w, errInvalidMessage)
+		return
+	}
+
+	s, err := t.newSession(identity)
+	if err != nil {
+		if errors.Is(err, proxy.ErrCapExceeded) {
+			t.audit.Deny(ctx, identity, t.options.Name, ReasonSessionCap)
+		}
+		t.logger.Warn("stdio session refused", "sub", identity.Subject, "err", err)
+		t.writeError(w, err)
+		return
+	}
+	defer s.finish()
+
+	response, err := s.exchange(inflight.Context(), msg, t.options.RequestTimeout)
+	if err != nil {
+		// A child that cannot answer initialize has no session to belong to.
+		t.removeSession(s)
+		t.writeError(w, err)
+		return
+	}
+
+	t.logger.Info("stdio session established", "session", s.id, "sub", identity.Subject, "pid", s.cmd.Process.Pid)
+	w.Header().Set(sessionHeader, s.id)
+	writeJSON(w, response)
+}
+
+func (t *Transport) serveDelete(w http.ResponseWriter, r *http.Request, identity auth.Identity) {
+	s, err := t.sessionFor(r.Context(), r.Header.Get(sessionHeader), identity)
+	if err != nil {
+		t.writeError(w, err)
+		return
+	}
+	defer s.finish()
+
+	t.logger.Info("stdio session terminated by client", "session", s.id, "sub", identity.Subject)
+	t.removeSession(s)
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// sessionFor resolves a session id presented by identity and claims it for the
+// request, which the caller releases with finish. A session belonging to
+// another identity is reported as not found, which both refuses the hijack and
+// declines to confirm that the id exists.
+//
+// The claim is taken under the transport's lock, atomically with the lookup:
+// the idle reaper decides under the same lock, so a session either is claimed
+// before the sweep sees it or has already left the table, and a request that
+// loses that race reports a missing session rather than a broken child.
+func (t *Transport) sessionFor(ctx context.Context, id string, identity auth.Identity) (*session, error) {
+	if id == "" {
+		return nil, errMissingSessionID
+	}
+	t.mu.Lock()
+	s, ok := t.sessions[id]
+	owned := ok && s.subject == identity.Subject
+	if owned {
+		s.begin()
+	}
+	t.mu.Unlock()
+
+	switch {
+	case owned:
+		return s, nil
+	case ok:
+		t.logger.Warn("stdio session presented by another identity", "session", id, "sub", identity.Subject)
+		t.audit.Deny(ctx, identity, t.options.Name, ReasonSessionBound)
+	}
+	return nil, proxy.ErrSessionNotFound
+}
+
+// newSession reserves a slot against the caller's cap, spawns the child, and
+// registers the session already claimed for the initialize that created it,
+// which the caller releases with finish. The reservation precedes the spawn so
+// a burst of concurrent initializes cannot overshoot the cap.
+func (t *Transport) newSession(identity auth.Identity) (*session, error) {
+	if err := t.reserveSlot(identity.Subject); err != nil {
+		return nil, err
+	}
+
+	id, err := newSessionID()
+	if err != nil {
+		t.releaseSlot(identity.Subject)
+		return nil, err
+	}
+	s, err := t.spawn(id, identity.Subject)
+	if err != nil {
+		t.releaseSlot(identity.Subject)
+		return nil, fmt.Errorf("%w: start stdio child: %v", proxy.ErrUpstreamUnavailable, err)
+	}
+	go t.supervise(s)
+
+	t.mu.Lock()
+	switch {
+	case s.removed:
+		// The child died before it was ever registered, and supervise has
+		// already released its slot.
+		t.mu.Unlock()
+		return nil, fmt.Errorf("%w: stdio child exited immediately", proxy.ErrUpstreamUnavailable)
+	case t.closed:
+		t.mu.Unlock()
+		t.removeSession(s)
+		return nil, proxy.ErrDraining
+	}
+	t.sessions[id] = s
+	s.begin()
+	t.mu.Unlock()
+	return s, nil
+}
+
+func (t *Transport) reserveSlot(subject string) error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.closed {
+		return proxy.ErrDraining
+	}
+	if t.perIdentity[subject] >= t.options.MaxSessions {
+		return fmt.Errorf("%w: %d sessions", proxy.ErrCapExceeded, t.options.MaxSessions)
+	}
+	t.perIdentity[subject]++
+	return nil
+}
+
+func (t *Transport) releaseSlot(subject string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.releaseSlotLocked(subject)
+}
+
+func (t *Transport) releaseSlotLocked(subject string) {
+	if count := t.perIdentity[subject]; count > 1 {
+		t.perIdentity[subject] = count - 1
+	} else {
+		delete(t.perIdentity, subject)
+	}
+}
+
+// removeSession unregisters a session and ends its child. It is idempotent:
+// client DELETE, the idle reaper, child exit, and shutdown all funnel here.
+func (t *Transport) removeSession(s *session) {
+	t.mu.Lock()
+	t.unregisterLocked(s)
+	t.mu.Unlock()
+
+	s.terminate()
+}
+
+// unregisterLocked drops a session from the transport's tables and frees its
+// cap slot, reporting whether this call is the one that removed it.
+func (t *Transport) unregisterLocked(s *session) bool {
+	if s.removed {
+		return false
+	}
+	s.removed = true
+	delete(t.sessions, s.id)
+	t.releaseSlotLocked(s.subject)
+	return true
+}
+
+// supervise reaps the child and tears its session down when it exits, so a
+// server that dies on its own does not leave a session id that resolves to a
+// dead process.
+func (t *Transport) supervise(s *session) {
+	s.pipes.Wait()
+	err := s.cmd.Wait()
+	// Marking before the broadcast keeps every waiter's view ordered: a
+	// goroutine that observes exited never signals a pid that is no longer the
+	// child's.
+	s.markReaped()
+	close(s.exited)
+	t.removeSession(s)
+	t.logger.Info("stdio child exited", "session", s.id, "sub", s.subject, "err", err)
+}
+
+func (t *Transport) reapIdleSessions() {
+	defer close(t.reaperStopped)
+	ticker := time.NewTicker(reapInterval(t.options.IdleTimeout))
+	defer ticker.Stop()
+	for {
+		select {
+		case <-t.stop:
+			return
+		case now := <-ticker.C:
+			for _, s := range t.takeIdleSessions(now) {
+				t.logger.Info("reaping idle stdio session", "session", s.id, "sub", s.subject)
+				s.terminate()
+			}
+		}
+	}
+}
+
+// takeIdleSessions unregisters every session no request holds and returns them
+// for termination. Testing idleness and unregistering under one hold of the
+// lock is what keeps the sweep from taking a session a request has just
+// claimed.
+func (t *Transport) takeIdleSessions(now time.Time) []*session {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	var idle []*session
+	for _, s := range t.sessions {
+		if s.idleSince(now, t.options.IdleTimeout) && t.unregisterLocked(s) {
+			idle = append(idle, s)
+		}
+	}
+	return idle
+}
+
+// reapInterval keeps the sweep frequent enough that a session is reaped near
+// its deadline, and rare enough that a long idle timeout does not spin.
+func reapInterval(idleTimeout time.Duration) time.Duration {
+	return min(max(idleTimeout/4, 10*time.Millisecond), 30*time.Second)
+}
+
+// Shutdown refuses new requests, lets in-flight exchanges finish, then
+// terminates every child.
+func (t *Transport) Shutdown(ctx context.Context) error {
+	err := t.drain.Shutdown(ctx)
+	t.stopReaper()
+
+	sessions := t.takeSessions()
+	for _, s := range sessions {
+		t.removeSession(s)
+	}
+	if waitErr := waitForExit(ctx, sessions); waitErr != nil && err == nil {
+		err = waitErr
+	}
+	return err
+}
+
+// Close abandons in-flight requests and kills every child immediately. It is
+// safe after Shutdown.
+func (t *Transport) Close() error {
+	t.drain.Close()
+	t.stopReaper()
+
+	sessions := t.takeSessions()
+	for _, s := range sessions {
+		t.removeSession(s)
+		s.kill()
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	return waitForExit(ctx, sessions)
+}
+
+// takeSessions marks the transport closed so no further session is created,
+// and returns the live ones.
+func (t *Transport) takeSessions() []*session {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.closed = true
+	sessions := make([]*session, 0, len(t.sessions))
+	for _, s := range t.sessions {
+		sessions = append(sessions, s)
+	}
+	return sessions
+}
+
+func (t *Transport) stopReaper() {
+	t.stopOnce.Do(func() { close(t.stop) })
+	<-t.reaperStopped
+}
+
+func waitForExit(ctx context.Context, sessions []*session) error {
+	for _, s := range sessions {
+		select {
+		case <-s.exited:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	return nil
+}
+
+// childEnv passes tailgate's environment plus the upstream's additions, so a
+// child inherits PATH and HOME without every upstream restating them.
+func (t *Transport) childEnv() []string {
+	if len(t.options.Env) == 0 {
+		return nil
+	}
+	return append(os.Environ(), t.options.Env...)
+}
+
+// newSessionID mints a session id that is cryptographically random and visible
+// ASCII, per the MCP session requirements.
+func newSessionID() (string, error) {
+	var raw [32]byte
+	if _, err := rand.Read(raw[:]); err != nil {
+		return "", fmt.Errorf("%w: session id: %v", proxy.ErrUpstreamUnavailable, err)
+	}
+	return base64.RawURLEncoding.EncodeToString(raw[:]), nil
+}
+
+func writeJSON(w http.ResponseWriter, response []byte) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(response)
+}
+
+// writeError maps a request-path failure to its status. Malformed input is the
+// transport's own 400 family; everything else is the shared proxy taxonomy. The
+// body is the status text alone: the failure detail names the child command,
+// the caller's cap, and other internals an internet-facing response must not
+// carry, so it goes to the log instead.
+func (t *Transport) writeError(w http.ResponseWriter, err error) {
+	if errors.Is(err, context.Canceled) {
+		// The caller hung up. There is nobody to answer.
+		return
+	}
+	status := statusOf(err)
+	t.logger.Warn("stdio request refused", "status", status, "err", err)
+	http.Error(w, http.StatusText(status), status)
+}
+
+func statusOf(err error) int {
+	switch {
+	case errors.Is(err, errInvalidMessage),
+		errors.Is(err, errMissingSessionID),
+		errors.Is(err, errUnsupportedProtocol),
+		errors.Is(err, errDuplicateRequestID):
+		return http.StatusBadRequest
+	case errors.Is(err, errUnauthenticated):
+		return http.StatusInternalServerError
+	default:
+		return proxy.StatusOf(err)
+	}
+}
+
+var _ proxy.Transport = (*Transport)(nil)

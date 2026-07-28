@@ -1,0 +1,1053 @@
+package stdiotransport
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"log/slog"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"runtime"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/bendrucker/tailgate/internal/audit"
+	"github.com/bendrucker/tailgate/internal/auth"
+	"github.com/google/go-cmp/cmp"
+)
+
+func TestMain(m *testing.M) {
+	if os.Getenv(fakeChildEnv) != "" {
+		runFakeChild()
+		return
+	}
+	os.Exit(m.Run())
+}
+
+// Headers standing in for the router, which is what puts an authorized
+// identity in the request context. blankIdentityHeader covers the routing
+// fault the transport must fail closed on: an identity present but carrying no
+// subject.
+const (
+	subjectHeader       = "X-Test-Subject"
+	blankIdentityHeader = "X-Test-Blank-Identity"
+)
+
+const initializeBody = `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{}}}`
+
+type harness struct {
+	transport *Transport
+	gateway   *httptest.Server
+	audit     *auditCollector
+}
+
+func newHarness(t *testing.T, options Options) *harness {
+	t.Helper()
+	if options.Command == "" {
+		options.Command = os.Args[0]
+	}
+	options.Env = append(options.Env, fakeChildEnv+"=1")
+	if options.Logger == nil {
+		options.Logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+	}
+	decisions := &auditCollector{}
+	options.Audit = audit.New(slog.New(decisions))
+
+	transport := New(options)
+	gateway := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if subject := r.Header.Get(subjectHeader); subject != "" {
+			identity := auth.Identity{Subject: subject, Email: subject + "@example.com"}
+			r = r.WithContext(auth.WithIdentity(r.Context(), identity))
+		} else if r.Header.Get(blankIdentityHeader) != "" {
+			r = r.WithContext(auth.WithIdentity(r.Context(), auth.Identity{}))
+		}
+		transport.ServeHTTP(w, r)
+	}))
+	t.Cleanup(func() {
+		gateway.Close()
+		if err := transport.Close(); err != nil {
+			t.Errorf("close transport: %v", err)
+		}
+	})
+	return &harness{transport: transport, gateway: gateway, audit: decisions}
+}
+
+// auditRecord is one decision as the audit package rendered it.
+type auditRecord struct {
+	Level    string
+	Outcome  string
+	Subject  string
+	Email    string
+	Upstream string
+	Reason   string
+	Rule     string
+}
+
+type auditCollector struct {
+	mu      sync.Mutex
+	records []auditRecord
+}
+
+func (c *auditCollector) Enabled(context.Context, slog.Level) bool { return true }
+
+func (c *auditCollector) Handle(_ context.Context, r slog.Record) error {
+	if r.Message != audit.Message {
+		return nil
+	}
+	record := auditRecord{Level: r.Level.String()}
+	r.Attrs(func(a slog.Attr) bool {
+		switch a.Key {
+		case audit.KeyOutcome:
+			record.Outcome = a.Value.String()
+		case audit.KeySubject:
+			record.Subject = a.Value.String()
+		case audit.KeyEmail:
+			record.Email = a.Value.String()
+		case audit.KeyUpstream:
+			record.Upstream = a.Value.String()
+		case audit.KeyReason:
+			record.Reason = a.Value.String()
+		case audit.KeyRule:
+			record.Rule = a.Value.String()
+		}
+		return true
+	})
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.records = append(c.records, record)
+	return nil
+}
+
+func (c *auditCollector) WithAttrs([]slog.Attr) slog.Handler { return c }
+func (c *auditCollector) WithGroup(string) slog.Handler      { return c }
+
+func (c *auditCollector) decisions() []auditRecord {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]auditRecord(nil), c.records...)
+}
+
+type call struct {
+	method        string
+	subject       string
+	blankIdentity bool
+	session       string
+	protocol      string
+	body          string
+}
+
+func (h *harness) do(t *testing.T, c call) *http.Response {
+	t.Helper()
+	method := c.method
+	if method == "" {
+		method = http.MethodPost
+	}
+	var body io.Reader
+	if c.body != "" {
+		body = strings.NewReader(c.body)
+	}
+	request, err := http.NewRequestWithContext(t.Context(), method, h.gateway.URL, body)
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Accept", "application/json, text/event-stream")
+	if c.subject != "" {
+		request.Header.Set(subjectHeader, c.subject)
+	}
+	if c.blankIdentity {
+		request.Header.Set(blankIdentityHeader, "1")
+	}
+	if c.session != "" {
+		request.Header.Set(sessionHeader, c.session)
+	}
+	if c.protocol != "" {
+		request.Header.Set(protocolVersionHeader, c.protocol)
+	}
+	response, err := h.gateway.Client().Do(request)
+	if err != nil {
+		t.Fatalf("%s: %v", method, err)
+	}
+	return response
+}
+
+// initialize opens a session for subject and returns its minted id.
+func (h *harness) initialize(t *testing.T, subject string) string {
+	t.Helper()
+	response := h.do(t, call{subject: subject, body: initializeBody})
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("initialize: expected 200, got %d", response.StatusCode)
+	}
+	session := response.Header.Get(sessionHeader)
+	if session == "" {
+		t.Fatal("initialize response carried no Mcp-Session-Id")
+	}
+	return session
+}
+
+func requestBody(id int, method, echo string, delay time.Duration) string {
+	return fmt.Sprintf(`{"jsonrpc":"2.0","id":%d,"method":%q,"params":{"echo":%q,"delay_ms":%d}}`, id, method, echo, delay.Milliseconds())
+}
+
+func decodeMessage(t *testing.T, response *http.Response) map[string]any {
+	t.Helper()
+	var message map[string]any
+	if err := json.NewDecoder(response.Body).Decode(&message); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	return message
+}
+
+func waitFor(t *testing.T, what string, condition func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if condition() {
+			return
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %s", what)
+}
+
+func (t *Transport) sessionCount() int {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return len(t.sessions)
+}
+
+// reservedSlots reports the cap slots subject currently holds, which is what a
+// leaked reservation shows up in.
+func (t *Transport) reservedSlots(subject string) int {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.perIdentity[subject]
+}
+
+func TestInitializeMintsBoundSession(t *testing.T) {
+	h := newHarness(t, Options{})
+
+	response := h.do(t, call{subject: "alice", body: initializeBody})
+	defer response.Body.Close()
+
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d", response.StatusCode)
+	}
+	if contentType := response.Header.Get("Content-Type"); contentType != "application/json" {
+		t.Errorf("expected application/json, got %q", contentType)
+	}
+
+	session := response.Header.Get(sessionHeader)
+	if len(session) < 32 {
+		t.Errorf("expected a long random session id, got %q", session)
+	}
+	for _, r := range session {
+		if r < 0x21 || r > 0x7e {
+			t.Fatalf("session id %q contains non-visible-ASCII %q", session, r)
+		}
+	}
+
+	message := decodeMessage(t, response)
+	if message["id"] != float64(1) {
+		t.Errorf("expected the initialize id echoed, got %v", message["id"])
+	}
+	result, _ := message["result"].(map[string]any)
+	if result["protocolVersion"] != "2025-11-25" {
+		t.Errorf("expected the child's initialize result, got %v", message)
+	}
+
+	h.transport.mu.Lock()
+	defer h.transport.mu.Unlock()
+	if bound := h.transport.sessions[session]; bound == nil || bound.subject != "alice" {
+		t.Fatal("session was not registered against the initializing identity")
+	}
+}
+
+func TestSessionBoundToIdentity(t *testing.T) {
+	h := newHarness(t, Options{})
+	session := h.initialize(t, "alice")
+
+	for _, tc := range []struct {
+		name     string
+		subject  string
+		expected int
+	}{
+		{
+			name:     "owner reaches the session",
+			subject:  "alice",
+			expected: http.StatusOK,
+		},
+		{
+			name:     "another identity gets not found",
+			subject:  "mallory",
+			expected: http.StatusNotFound,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			response := h.do(t, call{subject: tc.subject, session: session, body: requestBody(2, "tools/list", "", 0)})
+			defer response.Body.Close()
+			if response.StatusCode != tc.expected {
+				t.Fatalf("expected %d, got %d", tc.expected, response.StatusCode)
+			}
+		})
+	}
+}
+
+func TestSessionLookupFailures(t *testing.T) {
+	h := newHarness(t, Options{})
+	h.initialize(t, "alice")
+
+	for _, tc := range []struct {
+		name     string
+		call     call
+		expected int
+	}{
+		{
+			name:     "missing session header",
+			call:     call{subject: "alice", body: requestBody(2, "tools/list", "", 0)},
+			expected: http.StatusBadRequest,
+		},
+		{
+			name:     "unknown session",
+			call:     call{subject: "alice", session: "not-a-session", body: requestBody(2, "tools/list", "", 0)},
+			expected: http.StatusNotFound,
+		},
+		{
+			name:     "unknown session on delete",
+			call:     call{method: http.MethodDelete, subject: "alice", session: "not-a-session"},
+			expected: http.StatusNotFound,
+		},
+		{
+			name:     "missing session header on delete",
+			call:     call{method: http.MethodDelete, subject: "alice"},
+			expected: http.StatusBadRequest,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			response := h.do(t, tc.call)
+			defer response.Body.Close()
+			if response.StatusCode != tc.expected {
+				t.Fatalf("expected %d, got %d", tc.expected, response.StatusCode)
+			}
+		})
+	}
+}
+
+func TestConcurrentRequestsCorrelateByID(t *testing.T) {
+	h := newHarness(t, Options{})
+	session := h.initialize(t, "alice")
+
+	const requests = 24
+	var wg sync.WaitGroup
+	results := make([]map[string]any, requests)
+	for i := range requests {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			// Later requests answer sooner, so a transport that paired
+			// responses by arrival order would mismatch every one of them.
+			delay := time.Duration(requests-i) * 2 * time.Millisecond
+			id := i + 100
+			response := h.do(t, call{
+				subject: "alice",
+				session: session,
+				body:    requestBody(id, "tools/call", fmt.Sprintf("echo-%d", id), delay),
+			})
+			defer response.Body.Close()
+			if response.StatusCode != http.StatusOK {
+				t.Errorf("request %d: expected 200, got %d", id, response.StatusCode)
+				return
+			}
+			results[i] = decodeMessage(t, response)
+		}()
+	}
+	wg.Wait()
+
+	for i, message := range results {
+		id := i + 100
+		expected := map[string]any{
+			"jsonrpc": "2.0",
+			"id":      float64(id),
+			"result": map[string]any{
+				"method": "tools/call",
+				"echo":   fmt.Sprintf("echo-%d", id),
+			},
+		}
+		if diff := cmp.Diff(expected, message); diff != "" {
+			t.Errorf("request %d got the wrong response (-want +got):\n%s", id, diff)
+		}
+	}
+}
+
+func TestOneWayMessagesAreAccepted(t *testing.T) {
+	h := newHarness(t, Options{})
+	session := h.initialize(t, "alice")
+
+	for _, tc := range []struct {
+		name string
+		body string
+	}{
+		{
+			name: "notification",
+			body: `{"jsonrpc":"2.0","method":"notifications/initialized"}`,
+		},
+		{
+			name: "response to a server request",
+			body: `{"jsonrpc":"2.0","id":"srv-1","result":{"ok":true}}`,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			response := h.do(t, call{subject: "alice", session: session, body: tc.body})
+			defer response.Body.Close()
+			if response.StatusCode != http.StatusAccepted {
+				t.Fatalf("expected 202, got %d", response.StatusCode)
+			}
+			body, err := io.ReadAll(response.Body)
+			if err != nil {
+				t.Fatalf("read body: %v", err)
+			}
+			if len(body) != 0 {
+				t.Fatalf("expected an empty body, got %q", body)
+			}
+		})
+	}
+}
+
+func TestMalformedMessagesAreRejected(t *testing.T) {
+	h := newHarness(t, Options{})
+	session := h.initialize(t, "alice")
+
+	for _, tc := range []struct {
+		name     string
+		body     string
+		expected int
+	}{
+		{
+			name:     "not json",
+			body:     `{`,
+			expected: http.StatusBadRequest,
+		},
+		{
+			name:     "wrong jsonrpc version",
+			body:     `{"jsonrpc":"1.0","id":2,"method":"tools/list"}`,
+			expected: http.StatusBadRequest,
+		},
+		{
+			// Batching was removed in MCP 2025-11-25.
+			name:     "batch",
+			body:     `[{"jsonrpc":"2.0","id":2,"method":"tools/list"}]`,
+			expected: http.StatusBadRequest,
+		},
+		{
+			// A pretty-printed body is one message, not several: compaction
+			// before framing is what keeps its newlines from smuggling a
+			// second message onto the child's stdin.
+			name:     "embedded newlines",
+			body:     "{\"jsonrpc\":\"2.0\",\n\"id\":2,\"method\":\"tools/list\"}",
+			expected: http.StatusOK,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			response := h.do(t, call{subject: "alice", session: session, body: tc.body})
+			defer response.Body.Close()
+			if response.StatusCode != tc.expected {
+				t.Fatalf("expected %d, got %d", tc.expected, response.StatusCode)
+			}
+		})
+	}
+}
+
+func TestProtocolVersionHeader(t *testing.T) {
+	h := newHarness(t, Options{})
+	session := h.initialize(t, "alice")
+
+	for _, tc := range []struct {
+		name     string
+		protocol string
+		expected int
+	}{
+		{
+			name:     "absent assumes the pre-header revision",
+			protocol: "",
+			expected: http.StatusAccepted,
+		},
+		{
+			name:     "current revision",
+			protocol: "2025-11-25",
+			expected: http.StatusAccepted,
+		},
+		{
+			name:     "assumed revision",
+			protocol: AssumedProtocolVersion,
+			expected: http.StatusAccepted,
+		},
+		{
+			name:     "unknown revision",
+			protocol: "2099-01-01",
+			expected: http.StatusBadRequest,
+		},
+		{
+			name:     "garbage",
+			protocol: "not-a-version",
+			expected: http.StatusBadRequest,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			response := h.do(t, call{
+				subject:  "alice",
+				session:  session,
+				protocol: tc.protocol,
+				body:     `{"jsonrpc":"2.0","method":"notifications/initialized"}`,
+			})
+			defer response.Body.Close()
+			if response.StatusCode != tc.expected {
+				t.Fatalf("expected %d, got %d", tc.expected, response.StatusCode)
+			}
+		})
+	}
+}
+
+func TestStandaloneGetIsRefused(t *testing.T) {
+	h := newHarness(t, Options{})
+	session := h.initialize(t, "alice")
+
+	response := h.do(t, call{method: http.MethodGet, subject: "alice", session: session})
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusMethodNotAllowed {
+		t.Fatalf("expected 405, got %d", response.StatusCode)
+	}
+	if allow := response.Header.Get("Allow"); allow == "" {
+		t.Error("405 response carried no Allow header")
+	}
+}
+
+func TestDeleteTerminatesSessionAndChild(t *testing.T) {
+	h := newHarness(t, Options{})
+	session := h.initialize(t, "alice")
+
+	h.transport.mu.Lock()
+	child := h.transport.sessions[session]
+	h.transport.mu.Unlock()
+
+	response := h.do(t, call{method: http.MethodDelete, subject: "alice", session: session})
+	response.Body.Close()
+	if response.StatusCode != http.StatusNoContent {
+		t.Fatalf("expected 204, got %d", response.StatusCode)
+	}
+
+	select {
+	case <-child.exited:
+	case <-time.After(10 * time.Second):
+		t.Fatal("DELETE did not end the child process")
+	}
+
+	after := h.do(t, call{subject: "alice", session: session, body: requestBody(2, "tools/list", "", 0)})
+	after.Body.Close()
+	if after.StatusCode != http.StatusNotFound {
+		t.Fatalf("expected 404 after DELETE, got %d", after.StatusCode)
+	}
+}
+
+func TestSessionCapIsPerIdentity(t *testing.T) {
+	h := newHarness(t, Options{MaxSessions: 2})
+
+	const attempts = 10
+	var wg sync.WaitGroup
+	statuses := make([]int, attempts)
+	for i := range attempts {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			response := h.do(t, call{subject: "alice", body: initializeBody})
+			defer response.Body.Close()
+			statuses[i] = response.StatusCode
+		}()
+	}
+	wg.Wait()
+
+	var allowed, refused int
+	for _, status := range statuses {
+		switch status {
+		case http.StatusOK:
+			allowed++
+		case http.StatusTooManyRequests:
+			refused++
+		default:
+			t.Fatalf("unexpected status %d", status)
+		}
+	}
+	if allowed != 2 || refused != attempts-2 {
+		t.Fatalf("expected the cap to hold at 2 under load, got %d allowed and %d refused", allowed, refused)
+	}
+
+	t.Run("another identity is not starved", func(t *testing.T) {
+		response := h.do(t, call{subject: "bob", body: initializeBody})
+		defer response.Body.Close()
+		if response.StatusCode != http.StatusOK {
+			t.Fatalf("expected 200 for a second identity, got %d", response.StatusCode)
+		}
+	})
+
+	t.Run("a released slot is reusable", func(t *testing.T) {
+		h.transport.mu.Lock()
+		var owned *session
+		for _, s := range h.transport.sessions {
+			if s.subject == "alice" {
+				owned = s
+				break
+			}
+		}
+		h.transport.mu.Unlock()
+
+		response := h.do(t, call{method: http.MethodDelete, subject: "alice", session: owned.id})
+		response.Body.Close()
+
+		reopened := h.do(t, call{subject: "alice", body: initializeBody})
+		defer reopened.Body.Close()
+		if reopened.StatusCode != http.StatusOK {
+			t.Fatalf("expected 200 after freeing a slot, got %d", reopened.StatusCode)
+		}
+	})
+}
+
+func TestIdleSessionsAreReaped(t *testing.T) {
+	h := newHarness(t, Options{IdleTimeout: 60 * time.Millisecond})
+	session := h.initialize(t, "alice")
+
+	h.transport.mu.Lock()
+	child := h.transport.sessions[session]
+	h.transport.mu.Unlock()
+
+	select {
+	case <-child.exited:
+	case <-time.After(10 * time.Second):
+		t.Fatal("idle session's child was never reaped")
+	}
+	waitFor(t, "the reaped session to be unregistered", func() bool { return h.transport.sessionCount() == 0 })
+
+	response := h.do(t, call{subject: "alice", session: session, body: requestBody(2, "tools/list", "", 0)})
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusNotFound {
+		t.Fatalf("expected 404 for a reaped session, got %d", response.StatusCode)
+	}
+}
+
+func TestActiveSessionSurvivesIdleSweep(t *testing.T) {
+	h := newHarness(t, Options{IdleTimeout: 60 * time.Millisecond})
+	session := h.initialize(t, "alice")
+
+	// The exchange outlasts the idle timeout, and an in-flight request must
+	// hold the session open.
+	response := h.do(t, call{subject: "alice", session: session, body: requestBody(2, slowMethod, "held", 200*time.Millisecond)})
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 for a long request, got %d", response.StatusCode)
+	}
+}
+
+func TestChildExitTearsDownSession(t *testing.T) {
+	h := newHarness(t, Options{})
+	session := h.initialize(t, "alice")
+
+	response := h.do(t, call{subject: "alice", session: session, body: requestBody(2, exitMethod, "", 0)})
+	response.Body.Close()
+	if response.StatusCode != http.StatusBadGateway {
+		t.Fatalf("expected 502 when the child dies mid-request, got %d", response.StatusCode)
+	}
+
+	waitFor(t, "the dead session to be unregistered", func() bool { return h.transport.sessionCount() == 0 })
+
+	after := h.do(t, call{subject: "alice", session: session, body: requestBody(3, "tools/list", "", 0)})
+	after.Body.Close()
+	if after.StatusCode != http.StatusNotFound {
+		t.Fatalf("expected 404 after the child exited, got %d", after.StatusCode)
+	}
+}
+
+func TestRequestTimeout(t *testing.T) {
+	h := newHarness(t, Options{RequestTimeout: 50 * time.Millisecond})
+	session := h.initialize(t, "alice")
+
+	response := h.do(t, call{subject: "alice", session: session, body: requestBody(2, silentMethod, "", 0)})
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusGatewayTimeout {
+		t.Fatalf("expected 504, got %d", response.StatusCode)
+	}
+}
+
+func TestDuplicateRequestIDIsRejected(t *testing.T) {
+	h := newHarness(t, Options{})
+	session := h.initialize(t, "alice")
+
+	first := make(chan int, 1)
+	go func() {
+		response := h.do(t, call{subject: "alice", session: session, body: requestBody(7, slowMethod, "first", 300*time.Millisecond)})
+		defer response.Body.Close()
+		first <- response.StatusCode
+	}()
+
+	h.transport.mu.Lock()
+	child := h.transport.sessions[session]
+	h.transport.mu.Unlock()
+	waitFor(t, "the first request to reach the child", func() bool {
+		child.mu.Lock()
+		defer child.mu.Unlock()
+		return len(child.pending) == 1
+	})
+
+	response := h.do(t, call{subject: "alice", session: session, body: requestBody(7, "tools/list", "second", 0)})
+	response.Body.Close()
+	if response.StatusCode != http.StatusBadRequest {
+		t.Fatalf("expected 400 for a reused in-flight id, got %d", response.StatusCode)
+	}
+	if status := <-first; status != http.StatusOK {
+		t.Fatalf("expected the original request to survive, got %d", status)
+	}
+}
+
+func TestUnauthenticatedRequestNeverSpawns(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		call call
+	}{
+		{
+			name: "no identity in context",
+			call: call{body: initializeBody},
+		},
+		{
+			// A blank subject shares one cap bucket and one session namespace
+			// across every caller that presents it, so it must be refused as
+			// hard as an absent identity.
+			name: "identity with a blank subject",
+			call: call{blankIdentity: true, body: initializeBody},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHarness(t, Options{})
+
+			response := h.do(t, tc.call)
+			defer response.Body.Close()
+			if response.StatusCode != http.StatusInternalServerError {
+				t.Fatalf("expected 500, got %d", response.StatusCode)
+			}
+			if count := h.transport.sessionCount(); count != 0 {
+				t.Fatalf("expected no session to be spawned, got %d", count)
+			}
+			if slots := h.transport.reservedSlots(""); slots != 0 {
+				t.Fatalf("an unauthenticated request reserved %d cap slots", slots)
+			}
+		})
+	}
+}
+
+func TestRefusedRequestsAreAudited(t *testing.T) {
+	h := newHarness(t, Options{Name: "docs", MaxSessions: 1})
+	session := h.initialize(t, "alice")
+
+	hijack := h.do(t, call{subject: "mallory", session: session, body: requestBody(2, "tools/list", "", 0)})
+	hijack.Body.Close()
+	if hijack.StatusCode != http.StatusNotFound {
+		t.Fatalf("hijack: expected 404, got %d", hijack.StatusCode)
+	}
+
+	capped := h.do(t, call{subject: "alice", body: initializeBody})
+	capped.Body.Close()
+	if capped.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("cap: expected 429, got %d", capped.StatusCode)
+	}
+
+	blank := h.do(t, call{blankIdentity: true, body: initializeBody})
+	blank.Body.Close()
+	if blank.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("blank identity: expected 500, got %d", blank.StatusCode)
+	}
+
+	// The router binds sessions only for upstreams that mint their own, so
+	// these records are the whole audit trail for a stdio upstream's refusals.
+	want := []auditRecord{
+		{Level: slog.LevelWarn.String(), Outcome: audit.OutcomeDeny, Subject: "mallory", Email: "mallory@example.com", Upstream: "docs", Reason: ReasonSessionBound},
+		{Level: slog.LevelWarn.String(), Outcome: audit.OutcomeDeny, Subject: "alice", Email: "alice@example.com", Upstream: "docs", Reason: ReasonSessionCap},
+		{Level: slog.LevelWarn.String(), Outcome: audit.OutcomeDeny, Upstream: "docs", Reason: ReasonUnauthorized},
+	}
+	if diff := cmp.Diff(want, h.audit.decisions()); diff != "" {
+		t.Errorf("audit mismatch (-want +got):\n%s", diff)
+	}
+}
+
+func TestShutdownRefusesNewWorkAndDrains(t *testing.T) {
+	h := newHarness(t, Options{})
+	session := h.initialize(t, "alice")
+
+	h.transport.mu.Lock()
+	child := h.transport.sessions[session]
+	h.transport.mu.Unlock()
+
+	inflight := make(chan int, 1)
+	go func() {
+		response := h.do(t, call{subject: "alice", session: session, body: requestBody(2, slowMethod, "drain", 300*time.Millisecond)})
+		defer response.Body.Close()
+		inflight <- response.StatusCode
+	}()
+	waitFor(t, "the in-flight request to reach the child", func() bool {
+		child.mu.Lock()
+		defer child.mu.Unlock()
+		return len(child.pending) == 1
+	})
+
+	// An already-expired context makes Shutdown mark the transport draining and
+	// return immediately, so the 503 refusal is one deterministic request away.
+	expired, cancel := context.WithCancel(t.Context())
+	cancel()
+	if err := h.transport.Shutdown(expired); err == nil {
+		t.Fatal("expected the expired drain to report its deadline")
+	}
+
+	refused := h.do(t, call{subject: "alice", session: session, body: requestBody(3, "tools/list", "", 0)})
+	refused.Body.Close()
+	if refused.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503 during drain, got %d", refused.StatusCode)
+	}
+
+	if status := <-inflight; status != http.StatusOK {
+		t.Fatalf("the in-flight request should have completed, got %d", status)
+	}
+	select {
+	case <-child.exited:
+	case <-time.After(10 * time.Second):
+		t.Fatal("shutdown left the child running")
+	}
+}
+
+func TestCloseKillsStubbornChild(t *testing.T) {
+	h := newHarness(t, Options{Env: []string{fakeChildLinger + "=1"}})
+	h.transport.shutdownGrace = 50 * time.Millisecond
+	session := h.initialize(t, "alice")
+
+	h.transport.mu.Lock()
+	child := h.transport.sessions[session]
+	h.transport.mu.Unlock()
+
+	response := h.do(t, call{method: http.MethodDelete, subject: "alice", session: session})
+	response.Body.Close()
+
+	select {
+	case <-child.exited:
+	case <-time.After(10 * time.Second):
+		t.Fatal("a child that ignored its stdin close was never killed")
+	}
+	// A signal death, rather than any exit code, is what shows the child was
+	// killed instead of leaving on its own.
+	if code := child.cmd.ProcessState.ExitCode(); code != -1 {
+		t.Fatalf("expected the child to die by signal, got exit code %d", code)
+	}
+}
+
+func TestCloseReleasesBackgroundWork(t *testing.T) {
+	baseline := runtime.NumGoroutine()
+
+	transport := New(Options{
+		Command: os.Args[0],
+		Env:     []string{fakeChildEnv + "=1"},
+		Logger:  slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+	gateway := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		identity := auth.Identity{Subject: r.Header.Get(subjectHeader)}
+		transport.ServeHTTP(w, r.WithContext(auth.WithIdentity(r.Context(), identity)))
+	}))
+	h := &harness{transport: transport, gateway: gateway}
+	h.initialize(t, "alice")
+	h.initialize(t, "bob")
+
+	gateway.Client().CloseIdleConnections()
+	gateway.CloseClientConnections()
+	gateway.Close()
+	if err := transport.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	if count := transport.sessionCount(); count != 0 {
+		t.Fatalf("expected every session torn down, got %d", count)
+	}
+
+	waitFor(t, "goroutines to return to baseline", func() bool { return runtime.NumGoroutine() <= baseline })
+}
+
+func TestCloseIsIdempotentAfterShutdown(t *testing.T) {
+	h := newHarness(t, Options{})
+	h.initialize(t, "alice")
+
+	if err := h.transport.Shutdown(t.Context()); err != nil {
+		t.Fatalf("shutdown: %v", err)
+	}
+	if err := h.transport.Close(); err != nil {
+		t.Fatalf("close after shutdown: %v", err)
+	}
+
+	response := h.do(t, call{subject: "alice", body: initializeBody})
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503 after shutdown, got %d", response.StatusCode)
+	}
+}
+
+// TestFailedInitializeReleasesItsCapSlot covers the leak direction of the cap.
+// A reservation is taken before the spawn, so an upstream that fails every
+// initialize would otherwise lock its caller out with 429 after MaxSessions
+// attempts and stay that way until tailgate restarted, long after the command
+// was fixed.
+func TestFailedInitializeReleasesItsCapSlot(t *testing.T) {
+	const maxSessions = 2
+
+	for _, tc := range []struct {
+		name     string
+		options  Options
+		expected int
+	}{
+		{
+			name:     "child that cannot start",
+			options:  Options{Command: "/nonexistent/tailgate-mcp-server"},
+			expected: http.StatusBadGateway,
+		},
+		{
+			name:     "child that exits before answering",
+			options:  Options{Env: []string{fakeChildExitOnly + "=1"}},
+			expected: http.StatusBadGateway,
+		},
+		{
+			name:     "child that never answers initialize",
+			options:  Options{Env: []string{fakeChildSilent + "=1"}, RequestTimeout: 50 * time.Millisecond},
+			expected: http.StatusGatewayTimeout,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tc.options.MaxSessions = maxSessions
+			h := newHarness(t, tc.options)
+			h.transport.shutdownGrace = 50 * time.Millisecond
+
+			for attempt := range maxSessions + 1 {
+				response := h.do(t, call{subject: "alice", body: initializeBody})
+				response.Body.Close()
+				if response.StatusCode != tc.expected {
+					t.Fatalf("attempt %d: expected %d, got %d", attempt, tc.expected, response.StatusCode)
+				}
+			}
+
+			if slots := h.transport.reservedSlots("alice"); slots != 0 {
+				t.Errorf("failed spawns leaked %d cap slots", slots)
+			}
+			if count := h.transport.sessionCount(); count != 0 {
+				t.Errorf("expected no session for a child that never served one, got %d", count)
+			}
+		})
+	}
+}
+
+// TestOversizedChildLineEndsTheSession defends the framing limit. A line past
+// maxLineBytes leaves the stream unframed, so the reader stops. If the session
+// outlived it, every later request would stall for the full request timeout
+// instead of the 404 that makes a client re-initialize, and the caller's cap
+// slot would never come back.
+func TestOversizedChildLineEndsTheSession(t *testing.T) {
+	h := newHarness(t, Options{})
+	h.transport.shutdownGrace = 50 * time.Millisecond
+	session := h.initialize(t, "alice")
+
+	h.transport.mu.Lock()
+	child := h.transport.sessions[session]
+	h.transport.mu.Unlock()
+
+	response := h.do(t, call{subject: "alice", session: session, body: requestBody(2, floodMethod, "", 0)})
+	response.Body.Close()
+	if response.StatusCode != http.StatusBadGateway {
+		t.Fatalf("expected 502 for an unframeable response, got %d", response.StatusCode)
+	}
+
+	select {
+	case <-child.exited:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the wedged child was never ended")
+	}
+	waitFor(t, "the wedged session to be unregistered", func() bool { return h.transport.sessionCount() == 0 })
+	if slots := h.transport.reservedSlots("alice"); slots != 0 {
+		t.Errorf("the wedged session held %d cap slots", slots)
+	}
+
+	after := h.do(t, call{subject: "alice", session: session, body: requestBody(3, "tools/list", "", 0)})
+	after.Body.Close()
+	if after.StatusCode != http.StatusNotFound {
+		t.Fatalf("expected 404 after the session ended, got %d", after.StatusCode)
+	}
+}
+
+// TestClaimedSessionSurvivesTheIdleSweep pins the resolve-and-claim to one
+// critical section. A request that has resolved its session but not yet marked
+// it busy used to be invisible to the reaper, which then terminated the child
+// under it: the caller saw 502, and a client reads that as a broken upstream
+// rather than the 404 that tells it to re-initialize.
+func TestClaimedSessionSurvivesTheIdleSweep(t *testing.T) {
+	h := newHarness(t, Options{IdleTimeout: time.Hour})
+	session := h.initialize(t, "alice")
+	future := time.Now().Add(2 * time.Hour)
+
+	claimed, err := h.transport.sessionFor(t.Context(), session, auth.Identity{Subject: "alice"})
+	if err != nil {
+		t.Fatalf("resolve session: %v", err)
+	}
+	if taken := h.transport.takeIdleSessions(future); len(taken) != 0 {
+		t.Fatalf("the sweep took %d sessions a request had already claimed", len(taken))
+	}
+	claimed.finish()
+
+	taken := h.transport.takeIdleSessions(future)
+	if len(taken) != 1 || taken[0] != claimed {
+		t.Fatalf("expected the released session to be swept, got %v", taken)
+	}
+	taken[0].terminate()
+
+	t.Run("a request that loses the race is a missing session", func(t *testing.T) {
+		response := h.do(t, call{subject: "alice", session: session, body: requestBody(2, "tools/list", "", 0)})
+		defer response.Body.Close()
+		if response.StatusCode != http.StatusNotFound {
+			t.Fatalf("expected 404 for a swept session, got %d", response.StatusCode)
+		}
+	})
+}
+
+// TestRequestsRacingTheReaperAreNeverBadGateway runs traffic against an idle
+// timeout short enough that the reaper is always a tick away.
+func TestRequestsRacingTheReaperAreNeverBadGateway(t *testing.T) {
+	h := newHarness(t, Options{IdleTimeout: time.Millisecond, MaxSessions: 8})
+
+	var wg sync.WaitGroup
+	for range 8 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for range 20 {
+				response := h.do(t, call{subject: "alice", body: initializeBody})
+				session := response.Header.Get(sessionHeader)
+				status := response.StatusCode
+				response.Body.Close()
+				if status != http.StatusOK && status != http.StatusTooManyRequests {
+					t.Errorf("initialize: expected 200 or 429, got %d", status)
+					return
+				}
+				if status != http.StatusOK {
+					continue
+				}
+				follow := h.do(t, call{subject: "alice", session: session, body: requestBody(2, "tools/list", "", 0)})
+				status = follow.StatusCode
+				follow.Body.Close()
+				if status != http.StatusOK && status != http.StatusNotFound {
+					t.Errorf("a request racing the reaper got %d, expected 200 or 404", status)
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
+}
