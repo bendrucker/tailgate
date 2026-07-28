@@ -63,11 +63,13 @@ type Rule struct {
 }
 
 // Match is a single allow condition. An identity matches when every non-empty
-// field equals the corresponding token claim.
+// field equals the corresponding claim from token introspection. tsidp's
+// introspection response carries sub, username, email, and scope only, so
+// arbitrary claim matches are limited to those until tsidp exposes extra
+// claims there.
 type Match struct {
 	Subject string            `json:"sub,omitempty"`
 	Email   string            `json:"email,omitempty"`
-	Group   string            `json:"group,omitempty"`
 	Claim   map[string]string `json:"claim,omitempty"`
 }
 
