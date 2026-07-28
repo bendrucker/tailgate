@@ -1,0 +1,27 @@
+{
+  // tailgate configuration (HuJSON: comments and trailing commas allowed)
+  "node": {
+    "hostname": "tailgate",
+    "state_dir": "/var/lib/tailgate",
+    "port": 443, // Funnel: 443, 8443, or 10000
+  },
+  "oidc": {
+    // tsidp issuer for this tailnet
+    "issuer": "https://idp.tail-scale.ts.net",
+  },
+  "upstreams": [
+    {
+      "name": "github",
+      "transport": "http",
+      "url": "http://127.0.0.1:9000/mcp",
+    },
+  ],
+  "policy": [
+    {
+      "upstream": "github",
+      "allow": [
+        { "email": "ben@tail-scale.ts.net" },
+      ],
+    },
+  ],
+}
