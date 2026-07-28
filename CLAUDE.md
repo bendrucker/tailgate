@@ -55,7 +55,7 @@ These facts come from research against pinned sources plus an end-to-end proxy t
 - `internal/config`: schema and loader. Policy `Match` fields are limited to what introspection returns.
 - `internal/resource`: `URLs` is the single canonicalization point, seeded from the tailnet FQDN after join. `ResourceURL(name)` output is the byte-exact string used in the client `resource` param, the tsidp grant, the `aud` check, and each metadata doc. `Handler` serves the RFC 9728 well-known subtree.
 - `internal/auth`: `Identity` and `Decision`, the introspection `Verifier`, the policy `Authorizer`, and identity-in-context helpers for transports and audit.
-- `internal/proxy`: the `Transport` seam is `http.Handler` plus `Shutdown` and `Close`. HTTP semantics are the contract, so the seam carries JSON and SSE responses, session headers, and resumption without a bespoke message layer. Sentinel errors plus `StatusOf` are the shared error taxonomy, and `Drain` is the shared refuse-and-wait choreography. The package doc records the lifecycle and drain contract.
+- `internal/proxy`: the `Transport` seam is `http.Handler` plus `Shutdown` and `Close`. HTTP semantics are the contract. The seam carries JSON and SSE responses, session headers, and resumption without a bespoke message layer. Sentinel errors plus `StatusOf` are the shared error taxonomy, and `Drain` is the shared refuse-and-wait choreography. The package doc records the lifecycle and drain contract.
 - `internal/proxy/httptransport`: the reverse proxy for HTTP upstreams.
 - `internal/proxy/stdiotransport`: the server side of streamable HTTP over a child process per session, with session ids bound to the caller, JSON-RPC correlation, a per-identity-per-upstream cap, and idle reaping.
 - `internal/router`: the public handler. Exact-segment routing, auth ahead of every transport, session binding, `Origin` validation, body limits, header stripping, identity injection, and panic recovery.
@@ -90,4 +90,4 @@ tailgate is an internet-facing boundary where a validation gap is a remote explo
 
 ## Curation
 
-The settled-contracts section is pinned external research, not a description of this code. It stays until tsidp or the MCP revision moves, at which point re-verify it rather than trusting it.
+The settled-contracts section records pinned external research about tsidp and the MCP spec. It describes neither this code nor its intent. It stays until tsidp or the MCP revision moves, at which point re-verify it rather than trusting it.

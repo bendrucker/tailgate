@@ -21,11 +21,12 @@ const (
 	// stays open until its client goes away, so a drain without a deadline is a
 	// hang.
 	drainTimeout = 30 * time.Second
-	// closeTimeout bounds the wait for connections whose handlers have already
-	// returned. It runs on its own clock so a transport that spends the entire
-	// drain budget still leaves the server a window to close cleanly rather
-	// than severing every connection it was about to finish with.
-	closeTimeout = 5 * time.Second
+	// closeTimeout bounds the wait for the connections the transport drain does
+	// not cover: a request still verifying its token has reached no transport,
+	// and introspection is the longest it can be waiting. The clock is separate
+	// so a transport that spends the entire drain budget still leaves those
+	// connections a window to close cleanly rather than being severed.
+	closeTimeout = 10 * time.Second
 )
 
 // serve runs tailgate until ctx is canceled or the listener fails.

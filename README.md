@@ -76,7 +76,7 @@ It needs:
 - **The `funnel` node attribute** granted to tailgate's node in the tailnet policy. Without it, Funnel fails at the public edge.
 - **A tsidp app-capability grant** that authorizes each upstream's resource URI and populates any claims the policy matches on.
 
-`SIGINT` and `SIGTERM` stop the listener, drain in-flight requests and open streams for up to 30 seconds, then leave the tailnet.
+`SIGINT` and `SIGTERM` stop the listener, drain in-flight requests and open streams for up to 30 seconds, close whatever connections remain, then leave the tailnet.
 
 ## Development
 
