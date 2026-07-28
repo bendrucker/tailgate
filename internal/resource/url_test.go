@@ -51,6 +51,38 @@ func TestResourceURL(t *testing.T) {
 	}
 }
 
+func TestOrigin(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		fqdn     string
+		port     int
+		expected string
+	}{
+		{
+			name:     "default port omitted",
+			fqdn:     "tailgate.tail1234.ts.net",
+			port:     443,
+			expected: "https://tailgate.tail1234.ts.net",
+		},
+		{
+			name:     "non default port included",
+			fqdn:     "Tailgate.tail1234.ts.net.",
+			port:     10000,
+			expected: "https://tailgate.tail1234.ts.net:10000",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			urls, err := NewURLs(tc.fqdn, tc.port)
+			if err != nil {
+				t.Fatalf("NewURLs: %v", err)
+			}
+			if got := urls.Origin(); got != tc.expected {
+				t.Errorf("expected %s, got %s", tc.expected, got)
+			}
+		})
+	}
+}
+
 func TestNewURLsRejects(t *testing.T) {
 	for _, tc := range []struct {
 		name string

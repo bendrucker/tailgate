@@ -44,6 +44,14 @@ func NewURLs(fqdn string, port int) (*URLs, error) {
 	return &URLs{base: &url.URL{Scheme: "https", Host: host, Path: "/"}}, nil
 }
 
+// Origin returns the scheme and authority every canonical URL shares, which is
+// the one browser origin entitled to reach tailgate. It comes from here so the
+// origin tailgate accepts and the URIs it advertises cannot name different
+// hosts.
+func (u *URLs) Origin() string {
+	return u.base.Scheme + "://" + u.base.Host
+}
+
 // ResourceURL returns the canonical URI identifying the named upstream as a
 // protected resource: <base>/mcp/<name>, with no trailing slash, query, or
 // fragment.

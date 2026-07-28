@@ -1,0 +1,53 @@
+package main
+
+import (
+	"errors"
+	"log/slog"
+
+	"github.com/bendrucker/tailgate/internal/audit"
+	"github.com/bendrucker/tailgate/internal/auth"
+	"github.com/bendrucker/tailgate/internal/config"
+	"github.com/bendrucker/tailgate/internal/resource"
+	"github.com/bendrucker/tailgate/internal/router"
+)
+
+// handler assembles tailgate's public surface: the RFC 9728 metadata documents
+// and the authorized route to each upstream's transport. It takes urls rather
+// than the FQDN because every canonical URI must come from the one instance the
+// verifier and the metadata documents also read.
+//
+// The returned Router owns the transports. Shut it down to drain them and close
+// it to tear them down.
+func handler(cfg *config.Config, urls *resource.URLs, verifier router.Verifier, logger *slog.Logger, auditor *audit.Logger) (*router.Router, error) {
+	routes, err := upstreams(cfg.Upstreams, logger, auditor)
+	if err != nil {
+		return nil, err
+	}
+
+	names := make([]string, len(routes))
+	for i, route := range routes {
+		names[i] = route.Name
+	}
+
+	metadata, err := resource.NewHandler(urls, cfg.OIDC.Issuer, names)
+	if err != nil {
+		return nil, errors.Join(err, closeUpstreams(routes))
+	}
+
+	rt, err := router.New(router.Options{
+		Upstreams:  routes,
+		Resources:  urls,
+		Metadata:   metadata,
+		Verifier:   verifier,
+		Authorizer: auth.NewAuthorizer(cfg.Policy),
+		Audit:      auditor,
+		// tailgate serves exactly one origin, and only a browser sends the
+		// header at all. Anything else is a rebinding attempt.
+		AllowedOrigins: []string{urls.Origin()},
+		Logger:         logger,
+	})
+	if err != nil {
+		return nil, errors.Join(err, closeUpstreams(routes))
+	}
+	return rt, nil
+}
