@@ -419,7 +419,11 @@ func TestVerifyRechecksAudienceOnCacheHit(t *testing.T) {
 	}
 }
 
-func TestVerifyDoesNotCacheClaimsWithoutExp(t *testing.T) {
+// A token the issuer calls active but describes with no exp is denied, and the
+// denial is what bounds it: caching the claims as an allow has no sound TTL to
+// hold them under, while leaving the token uncached entirely would bill tsidp a
+// round trip for every request that presents it.
+func TestVerifyDeniesClaimsWithoutExpWithoutRepeatingTheRoundTrip(t *testing.T) {
 	issuer := newCountingIssuer(t, func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(t, w, map[string]any{
 			"active": true,
@@ -434,8 +438,11 @@ func TestVerifyDoesNotCacheClaimsWithoutExp(t *testing.T) {
 			t.Fatalf("expected ErrInvalidToken, got %v", err)
 		}
 	}
-	if hits := issuer.hits.Load(); hits != 2 {
-		t.Errorf("claims with no expiry must not be cached, got %d round trips", hits)
+	if size := verifier.active.len(); size != 0 {
+		t.Errorf("claims with no expiry must not be cached as an allow, got %d entries", size)
+	}
+	if hits := issuer.hits.Load(); hits != 1 {
+		t.Errorf("a token denied for a missing exp must not cost a round trip per request, got %d", hits)
 	}
 }
 

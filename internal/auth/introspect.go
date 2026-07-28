@@ -64,13 +64,20 @@ func (v *Verifier) introspectUncached(ctx context.Context, token, key string) (m
 		v.inactive.put(key, struct{}{}, now.Add(v.negativeTTL), now)
 		return nil, fmt.Errorf("%w: not active", ErrInvalidToken)
 	}
+	// An active answer carrying no exp is unusable and has no sound TTL to be
+	// cached under, so it is denied here rather than left to Verify. Denying it
+	// here is what keeps it out of the uncached path, where it would cost tsidp a
+	// round trip on every request that presents it.
+	exp, ok := numericClaim(claims, "exp")
+	if !ok {
+		v.inactive.put(key, struct{}{}, now.Add(v.negativeTTL), now)
+		return nil, fmt.Errorf("%w: missing exp", ErrInvalidToken)
+	}
 	// Claims are cached before the audience and expiry checks because they
 	// describe the token, not the request: one token presented to two upstreams
 	// is one introspection. Every Verify re-runs those checks against the
 	// cached claims, so a cache hit can never widen what the token authorizes.
-	if exp, ok := numericClaim(claims, "exp"); ok {
-		v.active.put(key, claims, cacheUntil(time.Unix(exp, 0), now.Add(v.ttl)), now)
-	}
+	v.active.put(key, claims, cacheUntil(time.Unix(exp, 0), now.Add(v.ttl)), now)
 	return claims, nil
 }
 

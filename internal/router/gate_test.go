@@ -180,6 +180,9 @@ func TestNormalizeOrigin(t *testing.T) {
 		{name: "file scheme", origin: "file:///etc/passwd", want: ""},
 		{name: "with path", origin: "https://host.example/mcp", want: ""},
 		{name: "with query", origin: "https://host.example?a=b", want: ""},
+		{name: "ipv6 literal", origin: "http://[::1]", want: "http://[::1]"},
+		{name: "ipv6 literal with port", origin: "http://[::1]:8080", want: "http://[::1]:8080"},
+		{name: "ipv6 literal on the default port", origin: "https://[2001:db8::1]:443", want: "https://[2001:db8::1]"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := normalizeOrigin(tc.origin); got != tc.want {

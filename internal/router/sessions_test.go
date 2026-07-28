@@ -378,6 +378,31 @@ func TestSessionBindingsEvictAndExpire(t *testing.T) {
 		}
 	})
 
+	// Held bindings are never evicted, so a subject whose sessions are all in
+	// flight cannot be charged for the table growing past its cap. Eviction has
+	// to fall back to another holder or the cap stops bounding anything.
+	t.Run("a fully held widest holder does not stall eviction", func(t *testing.T) {
+		bindings := newSessionBindings(2, time.Hour, clock)
+		for i := range 2 {
+			key := sessionKey("docs", "held-"+strconv.Itoa(i))
+			bindings.bind(key, "42")
+			if allowed, _ := bindings.holds(key, "42"); !allowed {
+				t.Fatalf("holding %q was refused", key)
+			}
+		}
+
+		bindings.bind(sessionKey("docs", "newcomer"), "77")
+
+		if got := bindings.size; got != 2 {
+			t.Errorf("table holds %d bindings, want the 2 it was capped at", got)
+		}
+		for i := range 2 {
+			if allowed, _ := bindings.holds(sessionKey("docs", "held-"+strconv.Itoa(i)), "42"); !allowed {
+				t.Errorf("held-%d was evicted while its request was still running", i)
+			}
+		}
+	})
+
 	t.Run("expiry forfeits a quiet binding", func(t *testing.T) {
 		bindings := newSessionBindings(8, time.Minute, clock)
 		key := sessionKey("docs", "quiet")

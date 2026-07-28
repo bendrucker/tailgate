@@ -205,26 +205,48 @@ func (s *sessionBindings) bind(key, subject string) {
 	}
 }
 
-// evict drops the least recently used unheld binding of the subject holding the
-// most, and reports whether it found one. Charging eviction to the widest
-// holder is what keeps one caller's session churn off every other caller.
+// evict drops one least recently used unheld binding and reports whether it
+// found one. It charges the subject holding the most, which keeps one caller's
+// session churn off every other caller. That subject's bindings can all be in
+// flight, and a cap that stops bounding the table is worse than charging a
+// narrower holder, so eviction then falls back to any subject with an unheld
+// binding.
 func (s *sessionBindings) evict() bool {
-	var widest *list.List
+	if s.evictFrom(s.widest()) {
+		return true
+	}
 	for _, sessions := range s.bySubject {
-		if widest == nil || sessions.Len() > widest.Len() {
-			widest = sessions
+		if s.evictFrom(sessions) {
+			return true
 		}
 	}
-	if widest == nil {
+	return false
+}
+
+// evictFrom drops one subject's least recently used unheld binding. A held
+// binding is never taken: its request is still running, and losing the binding
+// mid-response would strand the session it is streaming.
+func (s *sessionBindings) evictFrom(sessions *list.List) bool {
+	if sessions == nil {
 		return false
 	}
-	for element := widest.Back(); element != nil; element = element.Prev() {
+	for element := sessions.Back(); element != nil; element = element.Prev() {
 		if element.Value.(*binding).holds == 0 {
 			s.remove(element)
 			return true
 		}
 	}
 	return false
+}
+
+func (s *sessionBindings) widest() *list.List {
+	var widest *list.List
+	for _, sessions := range s.bySubject {
+		if widest == nil || sessions.Len() > widest.Len() {
+			widest = sessions
+		}
+	}
+	return widest
 }
 
 // release forgets a binding whose session has ended.

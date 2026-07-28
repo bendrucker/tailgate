@@ -104,8 +104,8 @@ func normalizeOrigin(origin string) string {
 	if err != nil || parsed.Host == "" || parsed.Path != "" || parsed.RawQuery != "" || parsed.Fragment != "" {
 		return ""
 	}
-	scheme, host := strings.ToLower(parsed.Scheme), strings.ToLower(parsed.Hostname())
-	if host == "" {
+	scheme, hostname := strings.ToLower(parsed.Scheme), strings.ToLower(parsed.Hostname())
+	if hostname == "" {
 		return ""
 	}
 	port := parsed.Port()
@@ -116,6 +116,12 @@ func normalizeOrigin(origin string) string {
 	case "http", "https":
 	default:
 		return ""
+	}
+	// Hostname strips the brackets an IPv6 literal needs, and an authority that
+	// cannot be reparsed is not a canonical form.
+	host := hostname
+	if strings.Contains(host, ":") {
+		host = "[" + host + "]"
 	}
 	if port != "" {
 		host += ":" + port
