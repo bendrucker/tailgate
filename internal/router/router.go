@@ -199,7 +199,7 @@ func New(opts Options) (*Router, error) {
 
 	upstreams := make(map[string]*upstream, len(opts.Upstreams))
 	for _, u := range opts.Upstreams {
-		if err := validateName(u.Name); err != nil {
+		if err := resource.ValidateName(u.Name); err != nil {
 			return nil, err
 		}
 		if u.Transport == nil {
@@ -347,9 +347,11 @@ func (rt *Router) serveUpstream(rec *responseRecorder, r *http.Request, up *upst
 		return
 	}
 
-	if !rt.claimSession(rec, r, up, id) {
+	release, ok := rt.claimSession(rec, r, up, id)
+	if !ok {
 		return
 	}
+	defer release()
 	if !rt.limitBody(rec, r) {
 		return
 	}
@@ -397,13 +399,6 @@ func upstreamName(u *url.URL) (string, bool) {
 		return "", false
 	}
 	return name, true
-}
-
-func validateName(name string) error {
-	if name == "" || name == "." || name == ".." || strings.ContainsAny(name, "/%?#") || name != url.PathEscape(name) {
-		return fmt.Errorf("router: upstream name %q is not a single path segment", name)
-	}
-	return nil
 }
 
 var _ http.Handler = (*Router)(nil)

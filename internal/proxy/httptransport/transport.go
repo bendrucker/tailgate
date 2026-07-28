@@ -91,10 +91,15 @@ func New(target *url.URL, logger *slog.Logger) *Transport {
 			case errors.Is(cause, proxy.ErrUpstreamTimeout):
 				logger.Error("upstream exchange timed out", "method", r.Method)
 				w.WriteHeader(proxy.StatusOf(proxy.ErrUpstreamTimeout))
+			case errors.Is(cause, proxy.ErrDraining):
+				// Close abandoned the request. The client is still
+				// connected and would otherwise receive net/http's
+				// implicit 200 with an empty body.
+				logger.Warn("request abandoned by shutdown", "method", r.Method)
+				w.WriteHeader(proxy.StatusOf(proxy.ErrDraining))
 			case r.Context().Err() != nil:
-				// The client went away (or Close abandoned the request):
-				// nothing is wrong with the upstream and there is no one
-				// left to answer.
+				// The client went away: nothing is wrong with the upstream
+				// and there is no one left to answer.
 				logger.Debug("request canceled", "cause", cause)
 			default:
 				logger.Error("upstream proxy error", "err", err, "method", r.Method)
@@ -110,8 +115,14 @@ func New(target *url.URL, logger *slog.Logger) *Transport {
 // than prefix-matched: misreading a stream as a bounded exchange would cut it
 // off at the exchange timeout.
 func isEventStream(h http.Header) bool {
+	// ParseMediaType reports ErrInvalidMediaParameter alongside a media type it
+	// parsed successfully, so a stream is still a stream when its parameters
+	// are malformed.
 	mediaType, _, err := mime.ParseMediaType(h.Get("Content-Type"))
-	return err == nil && strings.EqualFold(mediaType, "text/event-stream")
+	if err != nil && !errors.Is(err, mime.ErrInvalidMediaParameter) {
+		return false
+	}
+	return strings.EqualFold(mediaType, "text/event-stream")
 }
 
 // ServeHTTP proxies one request. After Shutdown begins it refuses new

@@ -299,6 +299,38 @@ func TestServerUpJoinsOnce(t *testing.T) {
 	}
 }
 
+// Up releases the lock across the join so shutdown never waits on control,
+// which lets Close complete while a join is still in flight.
+func TestServerUpAfterConcurrentClose(t *testing.T) {
+	joining := make(chan struct{})
+	closed := make(chan struct{})
+	node := &fakeNode{up: func(context.Context) (*ipnstate.Status, error) {
+		close(joining)
+		<-closed
+		return joinedStatus("tailgate.tail-scale.ts.net."), nil
+	}}
+	srv := newServer(node, 443)
+
+	upErr := make(chan error, 1)
+	go func() {
+		_, err := srv.Up(context.Background())
+		upErr <- err
+	}()
+
+	<-joining
+	if err := srv.Close(); err != nil {
+		t.Fatalf("Close = %v", err)
+	}
+	close(closed)
+
+	if err := <-upErr; !errors.Is(err, ErrClosed) {
+		t.Errorf("Up = %v, want ErrClosed: a join that lands after Close must not report a live node", err)
+	}
+	if got := srv.FQDN(); got != "" {
+		t.Errorf("FQDN = %q, want empty on a closed server", got)
+	}
+}
+
 func TestListenFunnelAccepts(t *testing.T) {
 	node := &fakeNode{}
 	srv := newServer(node, 8443)

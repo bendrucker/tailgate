@@ -2,6 +2,7 @@ package auth
 
 import (
 	"fmt"
+	"net/http"
 	"testing"
 	"time"
 )
@@ -117,5 +118,37 @@ func TestTokenCacheRefreshesAnExistingKey(t *testing.T) {
 	}
 	if value != "new" {
 		t.Errorf("expected value %q, got %q", "new", value)
+	}
+}
+
+// The cache holds the decoded claim set for the token's remaining life and
+// hands it to every caller, so a caller that reaches into a nested container
+// would rewrite what the next request sees.
+func TestVerifiedClaimsAreIsolatedFromTheCache(t *testing.T) {
+	clock := newTestClock()
+	issuer := newCountingIssuer(t, func(w http.ResponseWriter, _ *http.Request) {
+		writeJSON(t, w, activeClaims(clock, time.Minute))
+	})
+	verifier := newTestVerifier(t, issuer, clock)
+
+	first, err := verifier.Verify(t.Context(), "deadbeef", testResource)
+	if err != nil {
+		t.Fatalf("first Verify: %v", err)
+	}
+	first.Claims["aud"].([]any)[0] = "tampered"
+	first.Claims["sub"] = "tampered"
+
+	second, err := verifier.Verify(t.Context(), "deadbeef", testResource)
+	if err != nil {
+		t.Fatalf("second Verify: %v", err)
+	}
+	if got := second.Claims["aud"].([]any)[0]; got != "client-id" {
+		t.Errorf("aud[0] = %q, want %q: one caller's write reached another's claims", got, "client-id")
+	}
+	if got := second.Claims["sub"]; got != "12345" {
+		t.Errorf("sub = %v, want %q", got, "12345")
+	}
+	if second.Subject != "12345" {
+		t.Errorf("Subject = %q, want %q", second.Subject, "12345")
 	}
 }

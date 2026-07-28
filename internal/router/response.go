@@ -24,6 +24,13 @@ func newResponseRecorder(w http.ResponseWriter) *responseRecorder {
 }
 
 func (rec *responseRecorder) WriteHeader(status int) {
+	// ReverseProxy forwards an upstream's 1xx by calling WriteHeader with the
+	// interim status. The real response still follows, so an interim must not
+	// latch the recorder or consume the one-shot header callback.
+	if status < http.StatusOK {
+		rec.ResponseWriter.WriteHeader(status)
+		return
+	}
 	if rec.wroteHeader {
 		return
 	}

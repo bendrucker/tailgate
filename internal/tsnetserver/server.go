@@ -129,6 +129,11 @@ func (s *Server) Up(ctx context.Context) (string, error) {
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	// Close can complete while the join is in flight, since the lock is
+	// released across it so shutdown never waits on control.
+	if s.closed {
+		return "", ErrClosed
+	}
 	s.fqdn = status.Self.DNSName
 	return s.fqdn, nil
 }

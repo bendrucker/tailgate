@@ -484,6 +484,60 @@ func TestCloseAbandonsStream(t *testing.T) {
 	}
 }
 
+// A request Close abandons before the upstream answers has produced no
+// response yet, so leaving it unwritten hands the still-connected client
+// net/http's implicit 200 with an empty body instead of a status it can retry.
+func TestCloseAnswersAnAbandonedRequest(t *testing.T) {
+	reached := make(chan struct{})
+	release := make(chan struct{})
+	origin := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		close(reached)
+		select {
+		case <-r.Context().Done():
+		case <-release:
+		}
+	}))
+	defer origin.Close()
+	defer close(release)
+
+	target, err := url.Parse(origin.URL)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	transport := New(target, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	gateway := httptest.NewServer(transport)
+	defer gateway.Close()
+
+	responses := make(chan *http.Response, 1)
+	go func() {
+		resp, err := gateway.Client().Post(gateway.URL, "application/json", strings.NewReader("{}"))
+		if err != nil {
+			t.Errorf("POST: %v", err)
+			responses <- nil
+			return
+		}
+		responses <- resp
+	}()
+
+	<-reached
+	if err := transport.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	select {
+	case resp := <-responses:
+		if resp == nil {
+			return
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusServiceUnavailable {
+			t.Errorf("status = %d, want 503", resp.StatusCode)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the abandoned request never got a response")
+	}
+}
+
 func TestExchangeTimeout(t *testing.T) {
 	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Drain the body first: the server arms its disconnect watcher only
@@ -533,6 +587,10 @@ func TestSSEExemptFromExchangeTimeout(t *testing.T) {
 		{
 			name:        "charset parameter",
 			contentType: "TEXT/EVENT-STREAM; charset=utf-8",
+		},
+		{
+			name:        "malformed parameter",
+			contentType: "text/event-stream; charset",
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

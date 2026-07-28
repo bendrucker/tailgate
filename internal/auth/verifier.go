@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"maps"
 	"mime"
 	"net/http"
 	"net/url"
@@ -258,8 +257,7 @@ func (v *Verifier) identityFromClaims(claims map[string]any, resource string) (I
 		return Identity{}, fmt.Errorf("%w: missing sub", ErrInvalidToken)
 	}
 	email, _ := claims["email"].(string)
-	// The claim map may be shared with the cache and with concurrent callers.
-	return Identity{Subject: sub, Email: email, Claims: maps.Clone(claims)}, nil
+	return Identity{Subject: sub, Email: email, Claims: cloneClaims(claims)}, nil
 }
 
 // fetchJSON runs the request and decodes a 200 JSON response into v, holding
@@ -290,6 +288,33 @@ func fetchJSON(client *http.Client, req *http.Request, v any) error {
 
 func isJSONMediaType(mediaType string) bool {
 	return mediaType == "application/json" || strings.HasSuffix(mediaType, "+json")
+}
+
+// cloneClaims deep-copies a decoded claim set. The cache holds the original for
+// the token's remaining life and hands it to every concurrent caller, so a
+// shallow copy would leave the nested containers JSON decoding produces, such
+// as the aud slice, shared across requests.
+func cloneClaims(claims map[string]any) map[string]any {
+	cloned := make(map[string]any, len(claims))
+	for name, value := range claims {
+		cloned[name] = cloneClaimValue(value)
+	}
+	return cloned
+}
+
+func cloneClaimValue(value any) any {
+	switch v := value.(type) {
+	case map[string]any:
+		return cloneClaims(v)
+	case []any:
+		cloned := make([]any, len(v))
+		for i, element := range v {
+			cloned[i] = cloneClaimValue(element)
+		}
+		return cloned
+	default:
+		return v
+	}
 }
 
 // numericClaim reads a JSON number claim, which decodes as float64 from an

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"os"
 	"os/exec"
 	"sync"
 	"sync/atomic"
@@ -25,6 +26,12 @@ const maxLineBytes = 4 << 20
 // request steal another's response.
 var errDuplicateRequestID = errors.New("stdiotransport: duplicate in-flight JSON-RPC id")
 
+// errStdinBlocked reports a child that is alive but has stopped reading its
+// stdin, so the pipe buffer filled and the write hit its deadline. It ends the
+// session: the child cannot serve anything later either, and the framing of
+// whatever partially reached it is already broken.
+var errStdinBlocked = fmt.Errorf("%w: stdio child stopped reading stdin", proxy.ErrUpstreamTimeout)
+
 // session is one MCP session and the child process serving it. The session id
 // is bound to the identity that created it: the child is that caller's, and no
 // other caller can reach it.
@@ -34,8 +41,11 @@ type session struct {
 	grace   time.Duration
 	logger  *slog.Logger
 
-	cmd    *exec.Cmd
-	stdin  io.WriteCloser
+	cmd *exec.Cmd
+	// stdin is the write end of a pipe this package creates itself, rather
+	// than exec.Cmd.StdinPipe, because only an *os.File exposes the write
+	// deadline that bounds send.
+	stdin  *os.File
 	pipes  sync.WaitGroup
 	exited chan struct{}
 
@@ -63,16 +73,26 @@ type session struct {
 
 // spawn starts the child and its pipe readers. The caller owns supervision:
 // nothing reaps the process until the transport starts it.
-func (t *Transport) spawn(id string, subject string) (*session, error) {
+func (t *Transport) spawn(id string, subject string) (_ *session, err error) {
 	cmd := exec.Command(t.options.Command, t.options.Args...)
 	cmd.Dir = t.options.Dir
 	cmd.Env = t.childEnv()
 	isolateProcessGroup(cmd)
 
-	stdin, err := cmd.StdinPipe()
+	stdinRead, stdin, err := os.Pipe()
 	if err != nil {
 		return nil, err
 	}
+	cmd.Stdin = stdinRead
+	defer func() {
+		// The parent's copy of the read end goes once the child holds its own,
+		// or closing stdin never reaches the child as EOF.
+		stdinRead.Close()
+		if err != nil {
+			stdin.Close()
+		}
+	}()
+
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return nil, err
@@ -193,7 +213,7 @@ func (s *session) exchange(ctx context.Context, msg message, timeout time.Durati
 	}
 	s.mu.Unlock()
 
-	if err := s.send(msg.Line); err != nil {
+	if err := s.send(msg.Line, timeout); err != nil {
 		return abandon(err)
 	}
 
@@ -211,11 +231,20 @@ func (s *session) exchange(ctx context.Context, msg message, timeout time.Durati
 	}
 }
 
-// send frames one message onto the child's stdin.
-func (s *session) send(line []byte) error {
+// send frames one message onto the child's stdin, bounded by timeout. A child
+// that stops reading fills the pipe buffer, and an unbounded write there would
+// hold the request, the caller's cap slot, and shutdown behind a process that
+// is never coming back.
+func (s *session) send(line []byte, timeout time.Duration) error {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
+	if err := s.stdin.SetWriteDeadline(time.Now().Add(timeout)); err != nil {
+		return fmt.Errorf("%w: bound write to stdio child: %v", proxy.ErrUpstreamUnavailable, err)
+	}
 	if _, err := s.stdin.Write(append(line, '\n')); err != nil {
+		if errors.Is(err, os.ErrDeadlineExceeded) {
+			return errStdinBlocked
+		}
 		return fmt.Errorf("%w: write to stdio child: %v", proxy.ErrUpstreamUnavailable, err)
 	}
 	return nil

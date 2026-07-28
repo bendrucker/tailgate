@@ -23,6 +23,8 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -46,8 +48,9 @@ const (
 // MCP-Protocol-Version header is treated as speaking, per MCP 2025-11-25.
 const AssumedProtocolVersion = "2025-03-26"
 
-// maxBodyBytes bounds a POSTed message. The router applies its own limit; this
-// one keeps the transport safe on its own.
+// maxBodyBytes bounds a POSTed message. The router applies its own limit;
+// this one and the read deadline servePost sets keep the transport safe on its
+// own, in size and in duration.
 const maxBodyBytes = 4 << 20
 
 const (
@@ -70,6 +73,8 @@ var (
 	errMissingSessionID    = errors.New("stdiotransport: Mcp-Session-Id is required")
 	errUnsupportedProtocol = errors.New("stdiotransport: unsupported MCP-Protocol-Version")
 	errUnauthenticated     = errors.New("stdiotransport: request carries no authorized identity")
+	errBodyTooLarge        = errors.New("stdiotransport: request body exceeds the message limit")
+	errBodyTimeout         = errors.New("stdiotransport: request body was not sent in time")
 )
 
 // Reasons recorded on the audit log for refusals this transport makes itself.
@@ -209,9 +214,9 @@ func (t *Transport) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (t *Transport) servePost(w http.ResponseWriter, r *http.Request, inflight *proxy.InFlight, identity auth.Identity) {
-	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxBodyBytes))
+	body, err := t.readMessage(w, r, inflight)
 	if err != nil {
-		t.writeError(w, errInvalidMessage)
+		t.writeError(w, err)
 		return
 	}
 	msg, err := parseMessage(body)
@@ -235,8 +240,8 @@ func (t *Transport) servePost(w http.ResponseWriter, r *http.Request, inflight *
 	if !msg.IsRequest() {
 		// Notifications and responses are one-way: the spec answers them with
 		// 202 and an empty body.
-		if err := s.send(msg.Line); err != nil {
-			t.writeError(w, err)
+		if err := s.send(msg.Line, t.options.RequestTimeout); err != nil {
+			t.refuse(w, s, err)
 			return
 		}
 		w.WriteHeader(http.StatusAccepted)
@@ -245,10 +250,80 @@ func (t *Transport) servePost(w http.ResponseWriter, r *http.Request, inflight *
 
 	response, err := s.exchange(inflight.Context(), msg, t.options.RequestTimeout)
 	if err != nil {
-		t.writeError(w, err)
+		t.refuse(w, s, err)
 		return
 	}
 	writeJSON(w, response)
+}
+
+// readMessage buffers the POSTed JSON-RPC message. The read is bounded in both
+// directions: maxBodyBytes caps its size, and a read deadline caps how long a
+// client that stalls mid-body can hold the request in flight, which is what
+// keeps such a client from stalling Shutdown and Close along with it.
+func (t *Transport) readMessage(w http.ResponseWriter, r *http.Request, inflight *proxy.InFlight) ([]byte, error) {
+	release := boundBodyRead(w, inflight, t.options.RequestTimeout)
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxBodyBytes))
+	if err != nil {
+		// net/http withholds the response until the unread remainder of the
+		// body is drained, and it drains on Close, which a stalled client would
+		// leave hanging as surely as the read itself. Closing while the expired
+		// deadline still stands is what ends that drain at once, so the refusal
+		// reaches the client.
+		r.Body.Close()
+	}
+	release()
+	if err != nil {
+		var tooLarge *http.MaxBytesError
+		switch {
+		case errors.As(err, &tooLarge):
+			return nil, errBodyTooLarge
+		case errors.Is(err, os.ErrDeadlineExceeded):
+			return nil, errBodyTimeout
+		}
+		t.logger.Debug("read request body", "err", err)
+		return nil, errInvalidMessage
+	}
+	return body, nil
+}
+
+// boundBodyRead puts a deadline on reading the request body and cancels it
+// early if the request is abandoned, so Close does not wait out the deadline.
+// The returned func clears the deadline and joins the watcher before the
+// handler can return, since the connection is the server's again after that.
+// A ResponseWriter that cannot carry a read deadline (a recorder, or a router
+// that has already buffered the body) leaves the read as it found it.
+func boundBodyRead(w http.ResponseWriter, inflight *proxy.InFlight, timeout time.Duration) func() {
+	control := http.NewResponseController(w)
+	if err := control.SetReadDeadline(time.Now().Add(timeout)); err != nil {
+		return func() {}
+	}
+
+	stop := make(chan struct{})
+	watching := make(chan struct{})
+	go func() {
+		defer close(watching)
+		select {
+		case <-inflight.Context().Done():
+			_ = control.SetReadDeadline(time.Now())
+		case <-stop:
+		}
+	}()
+	return func() {
+		close(stop)
+		<-watching
+		_ = control.SetReadDeadline(time.Time{})
+	}
+}
+
+// refuse answers a message the session could not carry, ending that session
+// first when its child stopped reading stdin: nothing later can reach such a
+// child, and leaving it registered holds the caller's cap slot until the idle
+// sweep.
+func (t *Transport) refuse(w http.ResponseWriter, s *session, err error) {
+	if errors.Is(err, errStdinBlocked) {
+		t.removeSession(s)
+	}
+	t.writeError(w, err)
 }
 
 // serveInitialize spawns the session's child and mints its session id. The
@@ -331,7 +406,9 @@ func (t *Transport) sessionFor(ctx context.Context, id string, identity auth.Ide
 // newSession reserves a slot against the caller's cap, spawns the child, and
 // registers the session already claimed for the initialize that created it,
 // which the caller releases with finish. The reservation precedes the spawn so
-// a burst of concurrent initializes cannot overshoot the cap.
+// a burst of concurrent initializes cannot overshoot the cap. It is released
+// here only while no child exists to hold it. Once one is started, supervise
+// owns the release.
 func (t *Transport) newSession(identity auth.Identity) (*session, error) {
 	if err := t.reserveSlot(identity.Subject); err != nil {
 		return nil, err
@@ -352,8 +429,8 @@ func (t *Transport) newSession(identity auth.Identity) (*session, error) {
 	t.mu.Lock()
 	switch {
 	case s.removed:
-		// The child died before it was ever registered, and supervise has
-		// already released its slot.
+		// The child died before it was ever registered, so supervise has taken
+		// it over, down to its cap slot.
 		t.mu.Unlock()
 		return nil, fmt.Errorf("%w: stdio child exited immediately", proxy.ErrUpstreamUnavailable)
 	case t.closed:
@@ -404,24 +481,30 @@ func (t *Transport) removeSession(s *session) {
 	s.terminate()
 }
 
-// unregisterLocked drops a session from the transport's tables and frees its
-// cap slot, reporting whether this call is the one that removed it.
+// unregisterLocked drops a session from the transport's tables, reporting
+// whether this call is the one that removed it. The cap slot outlives it: the
+// slot stands for a live child, and termination is asynchronous.
 func (t *Transport) unregisterLocked(s *session) bool {
 	if s.removed {
 		return false
 	}
 	s.removed = true
 	delete(t.sessions, s.id)
-	t.releaseSlotLocked(s.subject)
 	return true
 }
 
 // supervise reaps the child and tears its session down when it exits, so a
 // server that dies on its own does not leave a session id that resolves to a
 // dead process.
+//
+// The cap slot is released here, once the child is known to be gone. Releasing
+// it at unregister instead would count registrations rather than processes, and
+// a caller looping initialize and DELETE could then hold live children well
+// past MaxSessions, since a terminated child has shutdownGrace to exit.
 func (t *Transport) supervise(s *session) {
 	s.pipes.Wait()
 	err := s.cmd.Wait()
+	t.releaseSlot(s.subject)
 	// Marking before the broadcast keeps every waiter's view ordered: a
 	// goroutine that observes exited never signals a pid that is no longer the
 	// child's.
@@ -488,15 +571,20 @@ func (t *Transport) Shutdown(ctx context.Context) error {
 
 // Close abandons in-flight requests and kills every child immediately. It is
 // safe after Shutdown.
+//
+// Killing the children comes first because a request blocked on a child is
+// released by that child's death, so a drain waited on beforehand would be
+// waiting on processes Close has yet to kill.
 func (t *Transport) Close() error {
-	t.drain.Close()
-	t.stopReaper()
-
 	sessions := t.takeSessions()
 	for _, s := range sessions {
 		t.removeSession(s)
 		s.kill()
 	}
+
+	t.drain.Close()
+	t.stopReaper()
+
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	return waitForExit(ctx, sessions)
@@ -531,13 +619,33 @@ func waitForExit(ctx context.Context, sessions []*session) error {
 	return nil
 }
 
+// scrubbedEnv names the environment variables tailgate itself consumes as
+// credentials. tsnet reads both spellings of its node auth key, and a key that
+// can join nodes to the tailnet is exactly what a hostile MCP server wants.
+var scrubbedEnv = []string{"TS_AUTHKEY", "TS_AUTH_KEY"}
+
 // childEnv passes tailgate's environment plus the upstream's additions, so a
 // child inherits PATH and HOME without every upstream restating them.
+//
+// A stdio upstream is third-party code (commonly an npx or uv wrapper) running
+// as tailgate, so tailgate's own credentials never reach it: scrubbedEnv is
+// removed. The scrub is a denylist because a child still needs the ordinary
+// environment to run at all. An upstream's own Env is applied afterwards, since
+// that is the operator deliberately handing the child a value.
 func (t *Transport) childEnv() []string {
-	if len(t.options.Env) == 0 {
-		return nil
+	parent := os.Environ()
+	env := make([]string, 0, len(parent)+len(t.options.Env))
+	for _, entry := range parent {
+		if !isScrubbed(entry) {
+			env = append(env, entry)
+		}
 	}
-	return append(os.Environ(), t.options.Env...)
+	return append(env, t.options.Env...)
+}
+
+func isScrubbed(entry string) bool {
+	name, _, ok := strings.Cut(entry, "=")
+	return ok && slices.Contains(scrubbedEnv, name)
 }
 
 // newSessionID mints a session id that is cryptographically random and visible
@@ -578,6 +686,10 @@ func statusOf(err error) int {
 		errors.Is(err, errUnsupportedProtocol),
 		errors.Is(err, errDuplicateRequestID):
 		return http.StatusBadRequest
+	case errors.Is(err, errBodyTooLarge):
+		return http.StatusRequestEntityTooLarge
+	case errors.Is(err, errBodyTimeout):
+		return http.StatusRequestTimeout
 	case errors.Is(err, errUnauthenticated):
 		return http.StatusInternalServerError
 	default:

@@ -115,6 +115,60 @@ func TestPresentedSessionsCannotEvictABinding(t *testing.T) {
 	}
 }
 
+// A caller cannot choose a key in the table, but asking an upstream to
+// initialize makes it mint one, so unbounded initialize is the other way to
+// drive eviction toward someone else's live session.
+func TestMintedSessionsCannotEvictAnotherCallersBinding(t *testing.T) {
+	h := newHarness(t, func(o *Options) { o.MaxSessions = 4 })
+	h.grant("token-a", "42", "a@example.com", httpUpstream)
+	h.grant("token-b", "77", "b@example.com", httpUpstream)
+
+	mintSession(h, "session-a")
+	if resp := h.serve(post("/mcp/"+httpUpstream, "token-a")); resp.StatusCode != http.StatusOK {
+		t.Fatalf("initialize status = %d, want 200", resp.StatusCode)
+	}
+
+	for i := range 64 {
+		mintSession(h, "flood-"+strconv.Itoa(i))
+		if resp := h.serve(post("/mcp/"+httpUpstream, "token-b")); resp.StatusCode != http.StatusOK {
+			t.Fatalf("flood %d status = %d, want 200", i, resp.StatusCode)
+		}
+	}
+
+	mintSession(h, "session-a")
+	if resp := h.serve(withSession(post("/mcp/"+httpUpstream, "token-a"), "session-a")); resp.StatusCode != http.StatusOK {
+		t.Errorf("owner status = %d, want 200: another caller's session churn evicted a live binding", resp.StatusCode)
+	}
+	if resp := h.serve(withSession(post("/mcp/"+httpUpstream, "token-b"), "session-a")); resp.StatusCode != http.StatusNotFound {
+		t.Errorf("hijack after flood status = %d, want 404", resp.StatusCode)
+	}
+}
+
+// ReverseProxy forwards an upstream's interim response by calling WriteHeader
+// with the 1xx status. A recorder that latched on it would record no binding
+// for the initialize response that follows, leaving the client to re-initialize
+// on every request.
+func TestInterimResponseDoesNotPreventBinding(t *testing.T) {
+	h := newHarness(t)
+	h.grant("token-a", "42", "a@example.com", httpUpstream)
+	h.grant("token-b", "77", "b@example.com", httpUpstream)
+
+	h.httpUp.handler = func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusEarlyHints)
+		w.Header().Set(SessionHeader, "session-a")
+		w.WriteHeader(http.StatusOK)
+	}
+	h.serve(post("/mcp/"+httpUpstream, "token-a"))
+
+	h.httpUp.handler = nil
+	if resp := h.serve(withSession(post("/mcp/"+httpUpstream, "token-a"), "session-a")); resp.StatusCode != http.StatusOK {
+		t.Errorf("owner status = %d, want 200: the interim response cost the session its binding", resp.StatusCode)
+	}
+	if resp := h.serve(withSession(post("/mcp/"+httpUpstream, "token-b"), "session-a")); resp.StatusCode != http.StatusNotFound {
+		t.Errorf("hijack status = %d, want 404", resp.StatusCode)
+	}
+}
+
 func TestSessionsAreScopedPerUpstream(t *testing.T) {
 	h := newHarness(t)
 	h.grant("token-a", "42", "a@example.com", httpUpstream)
@@ -296,7 +350,7 @@ func TestSessionBindingsEvictAndExpire(t *testing.T) {
 		for i := range 3 {
 			bindings.bind(sessionKey("docs", strconv.Itoa(i)), "42")
 		}
-		if got := bindings.order.Len(); got != 2 {
+		if got := bindings.size; got != 2 {
 			t.Errorf("table holds %d bindings, want the 2 it was capped at", got)
 		}
 		if _, bound := bindings.holds(sessionKey("docs", "0"), "42"); bound {
@@ -316,7 +370,7 @@ func TestSessionBindingsEvictAndExpire(t *testing.T) {
 				t.Fatalf("flood %d: allowed = %v, bound = %v, want both false", i, allowed, bound)
 			}
 		}
-		if got := bindings.order.Len(); got != 1 {
+		if got := bindings.size; got != 1 {
 			t.Errorf("table holds %d bindings, want only the one the upstream minted", got)
 		}
 		if allowed, _ := bindings.holds(sessionKey("docs", "live"), "42"); !allowed {
@@ -326,18 +380,44 @@ func TestSessionBindingsEvictAndExpire(t *testing.T) {
 
 	t.Run("expiry forfeits a quiet binding", func(t *testing.T) {
 		bindings := newSessionBindings(8, time.Minute, clock)
-		bindings.bind(sessionKey("docs", "quiet"), "42")
+		key := sessionKey("docs", "quiet")
+		bindings.bind(key, "42")
 		advance(30 * time.Second)
-		if allowed, _ := bindings.holds(sessionKey("docs", "quiet"), "42"); !allowed {
+		if allowed, _ := bindings.holds(key, "42"); !allowed {
 			t.Fatal("the holder was refused before the ttl elapsed")
 		}
+		bindings.releaseHold(key)
 		advance(30 * time.Second)
-		if allowed, _ := bindings.holds(sessionKey("docs", "quiet"), "42"); !allowed {
+		if allowed, _ := bindings.holds(key, "42"); !allowed {
 			t.Fatal("use did not refresh the binding")
 		}
+		bindings.releaseHold(key)
 		advance(2 * time.Minute)
-		if _, bound := bindings.holds(sessionKey("docs", "quiet"), "42"); bound {
+		if _, bound := bindings.holds(key, "42"); bound {
 			t.Error("an expired binding still holds its session")
+		}
+	})
+
+	t.Run("a held binding outlives the ttl", func(t *testing.T) {
+		bindings := newSessionBindings(8, time.Minute, clock)
+		key := sessionKey("docs", "streaming")
+		bindings.bind(key, "42")
+		if allowed, _ := bindings.holds(key, "42"); !allowed {
+			t.Fatal("the holder was refused while the binding was live")
+		}
+
+		// A stream can run for hours without a request to refresh the
+		// binding, and losing it mid-stream would 404 the client's next call.
+		advance(time.Hour)
+		if allowed, _ := bindings.holds(key, "42"); !allowed {
+			t.Error("a binding expired while a request still held it")
+		}
+		bindings.releaseHold(key)
+		bindings.releaseHold(key)
+
+		advance(2 * time.Minute)
+		if _, bound := bindings.holds(key, "42"); bound {
+			t.Error("the binding survived the ttl after its last hold ended")
 		}
 	})
 

@@ -3,9 +3,11 @@
 package stdiotransport
 
 import (
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
+	"os"
 	"os/exec"
 	"syscall"
 	"testing"
@@ -49,10 +51,45 @@ func TestKillReachesGrandchildren(t *testing.T) {
 	})
 }
 
-type discardPipe struct{}
+// TestChildGetsAnOrdinaryStdin covers the pipe the transport builds itself so
+// that send can carry a write deadline. What the child gets must still be an
+// ordinary blocking stdin that reaches EOF when the session ends, and a POSIX
+// shell shows both: its read fails outright on a non-blocking descriptor, and
+// it exits on EOF rather than waiting out the kill.
+func TestChildGetsAnOrdinaryStdin(t *testing.T) {
+	h := newHarness(t, Options{
+		Command: "/bin/sh",
+		Args: []string{"-c", `read line
+printf '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-11-25"}}\n'
+while read line; do :; done`},
+	})
+	// Long enough that a killed child is unmistakable next to one that exited
+	// on EOF.
+	h.transport.shutdownGrace = 30 * time.Second
+	session := h.initialize(t, "alice")
 
-func (discardPipe) Write(p []byte) (int, error) { return len(p), nil }
-func (discardPipe) Close() error                { return nil }
+	h.transport.mu.Lock()
+	child := h.transport.sessions[session]
+	h.transport.mu.Unlock()
+
+	// The read end is the child's once it is started, and a copy left open in
+	// the parent is a descriptor leaked per session.
+	if _, err := child.cmd.Stdin.(*os.File).Stat(); !errors.Is(err, os.ErrClosed) {
+		t.Errorf("the parent kept its copy of the child's stdin: %v", err)
+	}
+
+	deleted := h.do(t, call{method: http.MethodDelete, subject: "alice", session: session})
+	deleted.Body.Close()
+
+	select {
+	case <-child.exited:
+	case <-time.After(10 * time.Second):
+		t.Fatal("closing stdin never reached the child as EOF")
+	}
+	if code := child.cmd.ProcessState.ExitCode(); code != 0 {
+		t.Fatalf("expected the child to exit on EOF, got exit code %d", code)
+	}
+}
 
 // TestKillSkipsAReapedChild covers the pid-reuse hazard in the kill path. The
 // group kill is a raw signal on cmd.Process.Pid, which bypasses the
@@ -92,9 +129,15 @@ func TestKillSkipsAReapedChild(t *testing.T) {
 				<-exited
 			})
 
+			stdinRead, stdin, err := os.Pipe()
+			if err != nil {
+				t.Fatalf("pipe: %v", err)
+			}
+			t.Cleanup(func() { stdinRead.Close() })
+
 			s := &session{
 				cmd:    bystander,
-				stdin:  discardPipe{},
+				stdin:  stdin,
 				logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
 				exited: make(chan struct{}),
 			}

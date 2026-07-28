@@ -1,11 +1,13 @@
 package stdiotransport
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -606,6 +608,11 @@ func TestSessionCapIsPerIdentity(t *testing.T) {
 
 		response := h.do(t, call{method: http.MethodDelete, subject: "alice", session: owned.id})
 		response.Body.Close()
+		// The slot belongs to the child until it exits, which DELETE starts
+		// rather than waits for.
+		waitFor(t, "the terminated child to release its slot", func() bool {
+			return h.transport.reservedSlots("alice") == 1
+		})
 
 		reopened := h.do(t, call{subject: "alice", body: initializeBody})
 		defer reopened.Body.Close()
@@ -934,10 +941,11 @@ func TestFailedInitializeReleasesItsCapSlot(t *testing.T) {
 				if response.StatusCode != tc.expected {
 					t.Fatalf("attempt %d: expected %d, got %d", attempt, tc.expected, response.StatusCode)
 				}
-			}
-
-			if slots := h.transport.reservedSlots("alice"); slots != 0 {
-				t.Errorf("failed spawns leaked %d cap slots", slots)
+				// A slot outlives the request that failed, since it is the
+				// child's until the child is reaped.
+				waitFor(t, "the failed attempt to release its cap slot", func() bool {
+					return h.transport.reservedSlots("alice") == 0
+				})
 			}
 			if count := h.transport.sessionCount(); count != 0 {
 				t.Errorf("expected no session for a child that never served one, got %d", count)
@@ -980,6 +988,254 @@ func TestOversizedChildLineEndsTheSession(t *testing.T) {
 	after.Body.Close()
 	if after.StatusCode != http.StatusNotFound {
 		t.Fatalf("expected 404 after the session ended, got %d", after.StatusCode)
+	}
+}
+
+// TestWedgedStdinIsBounded defends the write to the child. A child that stays
+// alive but stops reading its stdin fills the pipe buffer, and an unbounded
+// write there wedges far more than the one request: the idle sweep skips a
+// session with a request still active, so the session and its caller's cap slot
+// are held for as long as the process lives.
+func TestWedgedStdinIsBounded(t *testing.T) {
+	// Comfortably past any pipe buffer, so the write cannot complete.
+	oversized := strings.Repeat("x", 1<<20)
+
+	for _, tc := range []struct {
+		name string
+		body string
+	}{
+		{
+			name: "request",
+			body: requestBody(3, "tools/call", oversized, 0),
+		},
+		{
+			name: "notification",
+			body: fmt.Sprintf(`{"jsonrpc":"2.0","method":"notifications/progress","params":{"echo":%q}}`, oversized),
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHarness(t, Options{RequestTimeout: 200 * time.Millisecond})
+			h.transport.shutdownGrace = 50 * time.Millisecond
+			session := h.initialize(t, "alice")
+
+			deaf := h.do(t, call{subject: "alice", session: session, body: requestBody(2, deafMethod, "", 0)})
+			deaf.Body.Close()
+			if deaf.StatusCode != http.StatusOK {
+				t.Fatalf("expected 200 from the child before it went deaf, got %d", deaf.StatusCode)
+			}
+
+			statuses := make(chan int, 1)
+			go func() {
+				response := h.do(t, call{subject: "alice", session: session, body: tc.body})
+				defer response.Body.Close()
+				statuses <- response.StatusCode
+			}()
+
+			select {
+			case status := <-statuses:
+				if status != http.StatusGatewayTimeout {
+					t.Fatalf("expected 504 for a child that stopped reading stdin, got %d", status)
+				}
+			case <-time.After(10 * time.Second):
+				t.Fatal("the write to a wedged child never returned")
+			}
+
+			waitFor(t, "the wedged session to be unregistered", func() bool { return h.transport.sessionCount() == 0 })
+			waitFor(t, "the wedged session to release its cap slot", func() bool {
+				return h.transport.reservedSlots("alice") == 0
+			})
+
+			after := h.do(t, call{subject: "alice", session: session, body: requestBody(4, "tools/list", "", 0)})
+			after.Body.Close()
+			if after.StatusCode != http.StatusNotFound {
+				t.Fatalf("expected 404 after the wedged session ended, got %d", after.StatusCode)
+			}
+		})
+	}
+}
+
+// TestCloseOutlivesAWedgedChild is the shutdown half of the same hazard: Close
+// must not wait on a drain that only the child it has yet to kill can release.
+func TestCloseOutlivesAWedgedChild(t *testing.T) {
+	h := newHarness(t, Options{RequestTimeout: time.Hour})
+	session := h.initialize(t, "alice")
+
+	deaf := h.do(t, call{subject: "alice", session: session, body: requestBody(2, deafMethod, "", 0)})
+	deaf.Body.Close()
+
+	h.transport.mu.Lock()
+	child := h.transport.sessions[session]
+	h.transport.mu.Unlock()
+
+	blocked := make(chan struct{})
+	go func() {
+		defer close(blocked)
+		response := h.do(t, call{subject: "alice", session: session, body: requestBody(3, "tools/call", strings.Repeat("x", 1<<20), 0)})
+		response.Body.Close()
+	}()
+	waitFor(t, "the request to reach the wedged write", func() bool {
+		child.mu.Lock()
+		defer child.mu.Unlock()
+		return len(child.pending) == 1
+	})
+
+	closed := make(chan error, 1)
+	go func() { closed <- h.transport.Close() }()
+	select {
+	case err := <-closed:
+		if err != nil {
+			t.Fatalf("close: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("close blocked on a request wedged against a child it had not killed")
+	}
+	<-blocked
+}
+
+// TestBodyLimits covers the two ways a POSTed message fails to arrive: too
+// large, and never finished. The router pre-buffers bodies in the wired
+// deployment, so these limits are what the transport holds when it is served
+// directly, as any http.Handler can be.
+func TestBodyLimits(t *testing.T) {
+	t.Run("oversized body is too large", func(t *testing.T) {
+		h := newHarness(t, Options{})
+
+		body := strings.NewReader(requestBody(2, "tools/call", strings.Repeat("x", maxBodyBytes), 0))
+		request := httptest.NewRequest(http.MethodPost, "/", body)
+		request = request.WithContext(auth.WithIdentity(request.Context(), auth.Identity{Subject: "alice"}))
+		recorder := httptest.NewRecorder()
+		h.transport.ServeHTTP(recorder, request)
+
+		if recorder.Code != http.StatusRequestEntityTooLarge {
+			t.Fatalf("expected 413, got %d", recorder.Code)
+		}
+	})
+
+	t.Run("stalled body times out", func(t *testing.T) {
+		h := newHarness(t, Options{RequestTimeout: 200 * time.Millisecond})
+
+		conn, err := net.Dial("tcp", h.gateway.Listener.Addr().String())
+		if err != nil {
+			t.Fatalf("dial: %v", err)
+		}
+		defer conn.Close()
+
+		// Content-Length promises a body this client never finishes sending.
+		request := fmt.Sprintf("POST / HTTP/1.1\r\nHost: %s\r\n%s: alice\r\nContent-Type: application/json\r\nContent-Length: 4096\r\n\r\n{\"jsonrpc\":\"2.0\"", h.gateway.Listener.Addr(), subjectHeader)
+		if _, err := io.WriteString(conn, request); err != nil {
+			t.Fatalf("write request: %v", err)
+		}
+
+		if err := conn.SetReadDeadline(time.Now().Add(10 * time.Second)); err != nil {
+			t.Fatalf("set deadline: %v", err)
+		}
+		response, err := http.ReadResponse(bufio.NewReader(conn), nil)
+		if err != nil {
+			t.Fatalf("read response: %v", err)
+		}
+		defer response.Body.Close()
+		if response.StatusCode != http.StatusRequestTimeout {
+			t.Fatalf("expected 408 for a stalled body, got %d", response.StatusCode)
+		}
+	})
+}
+
+// TestCapSlotHoldsUntilTheChildExits pins the cap to live processes. Counting
+// registrations instead lets a caller loop initialize and DELETE to hold
+// children well past MaxSessions, since a terminated child has the full
+// shutdown grace to exit and the loop can outrun it.
+func TestCapSlotHoldsUntilTheChildExits(t *testing.T) {
+	h := newHarness(t, Options{MaxSessions: 1, Env: []string{fakeChildLinger + "=1"}})
+	h.transport.shutdownGrace = 500 * time.Millisecond
+	session := h.initialize(t, "alice")
+
+	h.transport.mu.Lock()
+	child := h.transport.sessions[session]
+	h.transport.mu.Unlock()
+
+	deleted := h.do(t, call{method: http.MethodDelete, subject: "alice", session: session})
+	deleted.Body.Close()
+	if deleted.StatusCode != http.StatusNoContent {
+		t.Fatalf("expected 204, got %d", deleted.StatusCode)
+	}
+
+	// The child ignores its stdin close, so it is still running here.
+	refused := h.do(t, call{subject: "alice", body: initializeBody})
+	refused.Body.Close()
+	if refused.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("expected 429 while the deleted child was still alive, got %d", refused.StatusCode)
+	}
+
+	select {
+	case <-child.exited:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the deleted child was never killed")
+	}
+	waitFor(t, "the exited child to release its slot", func() bool {
+		return h.transport.reservedSlots("alice") == 0
+	})
+
+	reopened := h.do(t, call{subject: "alice", body: initializeBody})
+	reopened.Body.Close()
+	if reopened.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 once the child exited, got %d", reopened.StatusCode)
+	}
+}
+
+// TestChildEnvironmentScrubsTailgateCredentials covers the child's view of
+// tailgate's own secrets. A stdio upstream is third-party code running as
+// tailgate, and TS_AUTHKEY in that environment would let it join nodes of its
+// own to the tailnet.
+func TestChildEnvironmentScrubsTailgateCredentials(t *testing.T) {
+	const inherited = "TAILGATE_STDIO_TEST_INHERITED"
+	t.Setenv(inherited, "visible")
+	for _, name := range scrubbedEnv {
+		t.Setenv(name, "tskey-auth-secret")
+	}
+
+	h := newHarness(t, Options{})
+	session := h.initialize(t, "alice")
+
+	read := func(t *testing.T, name string) string {
+		t.Helper()
+		response := h.do(t, call{subject: "alice", session: session, body: requestBody(2, envMethod, name, 0)})
+		defer response.Body.Close()
+		if response.StatusCode != http.StatusOK {
+			t.Fatalf("expected 200, got %d", response.StatusCode)
+		}
+		result, _ := decodeMessage(t, response)["result"].(map[string]any)
+		value, _ := result["value"].(string)
+		return value
+	}
+
+	for _, tc := range []struct {
+		name     string
+		variable string
+		expected string
+	}{
+		{
+			name:     "auth key",
+			variable: "TS_AUTHKEY",
+			expected: "",
+		},
+		{
+			name:     "auth key alternate spelling",
+			variable: "TS_AUTH_KEY",
+			expected: "",
+		},
+		{
+			// The scrub is a denylist: a child still needs the environment it
+			// takes to run at all.
+			name:     "ordinary variable",
+			variable: inherited,
+			expected: "visible",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if value := read(t, tc.variable); value != tc.expected {
+				t.Fatalf("child saw %s=%q, expected %q", tc.variable, value, tc.expected)
+			}
+		})
 	}
 }
 

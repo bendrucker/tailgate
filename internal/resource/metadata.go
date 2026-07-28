@@ -60,7 +60,7 @@ func NewHandler(urls *URLs, issuer string, upstreams []string) (*Handler, error)
 
 	documents := make(map[string][]byte, len(upstreams))
 	for _, name := range upstreams {
-		if err := validateUpstreamName(name); err != nil {
+		if err := ValidateName(name); err != nil {
 			return nil, err
 		}
 		if _, ok := documents[name]; ok {
@@ -136,7 +136,12 @@ func canonicalIssuer(issuer string) (string, error) {
 	return trimmed, nil
 }
 
-func validateUpstreamName(name string) error {
+// ValidateName reports whether an upstream name is a single path segment that
+// survives URL construction unescaped. The name is the segment in every
+// canonical URI this package builds, and the router matches the same segment on
+// the way in, so both must hold one grammar or a name could route to an
+// upstream whose metadata document it can never address.
+func ValidateName(name string) error {
 	if name == "" || name == "." || name == ".." || strings.ContainsAny(name, "/%?#") || name != url.PathEscape(name) {
 		return fmt.Errorf("resource: upstream name %q is not a single path segment", name)
 	}

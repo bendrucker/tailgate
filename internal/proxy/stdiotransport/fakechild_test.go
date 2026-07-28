@@ -27,6 +27,8 @@ const (
 	silentMethod = "test/silent"
 	exitMethod   = "test/exit"
 	floodMethod  = "test/flood"
+	deafMethod   = "test/deaf"
+	envMethod    = "test/env"
 )
 
 // runFakeChild is a minimal stdio MCP server: one JSON-RPC message per line,
@@ -66,6 +68,12 @@ func runFakeChild() {
 		if len(request.ID) == 0 {
 			continue
 		}
+		if request.Method == deafMethod {
+			// Answering and then never reading stdin again, while staying
+			// alive, is what fills the parent's pipe buffer.
+			respond(fmt.Sprintf(`{"jsonrpc":"2.0","id":%s,"result":{"deaf":true}}`, request.ID))
+			time.Sleep(time.Hour)
+		}
 		handlers.Add(1)
 		go func() {
 			defer handlers.Done()
@@ -78,6 +86,9 @@ func runFakeChild() {
 				os.Exit(3)
 			case request.Method == initializeMethod:
 				respond(fmt.Sprintf(`{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2025-11-25","capabilities":{"tools":{}},"grandchildPid":%d,"serverInfo":{"name":"fake-stdio-server","version":"0.0.1"}}}`, request.ID, grandchildPid))
+			case request.Method == envMethod:
+				// The echo param names the variable to report.
+				respond(fmt.Sprintf(`{"jsonrpc":"2.0","id":%s,"result":{"value":%q}}`, request.ID, os.Getenv(request.Params.Echo)))
 			case request.Method == floodMethod:
 				// One line past what the reader will frame, standing in for a
 				// tools/call result too large to parse.
