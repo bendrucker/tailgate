@@ -1,0 +1,126 @@
+package stdiotransport
+
+import (
+	"bufio"
+	"encoding/json"
+	"fmt"
+	"os"
+	"os/exec"
+	"strings"
+	"sync"
+	"time"
+)
+
+// The tests use the test binary itself as the stdio child, re-entered through
+// TestMain when these variables are set.
+const (
+	fakeChildEnv        = "TAILGATE_STDIO_FAKE_CHILD"
+	fakeChildLinger     = "TAILGATE_STDIO_FAKE_CHILD_LINGER"
+	fakeChildGrandchild = "TAILGATE_STDIO_FAKE_CHILD_GRANDCHILD"
+	fakeChildExitOnly   = "TAILGATE_STDIO_FAKE_CHILD_EXIT_ON_START"
+	fakeChildSilent     = "TAILGATE_STDIO_FAKE_CHILD_SILENT"
+)
+
+// Methods the fake child answers specially. Every other method echoes back.
+const (
+	slowMethod   = "test/slow"
+	silentMethod = "test/silent"
+	exitMethod   = "test/exit"
+	floodMethod  = "test/flood"
+	deafMethod   = "test/deaf"
+	envMethod    = "test/env"
+)
+
+// runFakeChild is a minimal stdio MCP server: one JSON-RPC message per line,
+// each handled on its own goroutine so responses come back out of request
+// order and correlation cannot pass by luck of sequencing.
+func runFakeChild() {
+	if os.Getenv(fakeChildExitOnly) != "" {
+		os.Exit(1)
+	}
+	silent := os.Getenv(fakeChildSilent) != ""
+	grandchildPid := startGrandchild()
+
+	var writes sync.Mutex
+	var handlers sync.WaitGroup
+	out := bufio.NewWriter(os.Stdout)
+	respond := func(line string) {
+		writes.Lock()
+		defer writes.Unlock()
+		fmt.Fprintln(out, line)
+		out.Flush()
+	}
+
+	scanner := bufio.NewScanner(os.Stdin)
+	scanner.Buffer(make([]byte, 0, 64<<10), maxLineBytes)
+	for scanner.Scan() {
+		var request struct {
+			ID     json.RawMessage `json:"id"`
+			Method string          `json:"method"`
+			Params struct {
+				DelayMS int    `json:"delay_ms"`
+				Echo    string `json:"echo"`
+			} `json:"params"`
+		}
+		if err := json.Unmarshal(scanner.Bytes(), &request); err != nil {
+			continue
+		}
+		if len(request.ID) == 0 {
+			continue
+		}
+		if request.Method == deafMethod {
+			// Answering and then never reading stdin again, while staying
+			// alive, is what fills the parent's pipe buffer.
+			respond(fmt.Sprintf(`{"jsonrpc":"2.0","id":%s,"result":{"deaf":true}}`, request.ID))
+			time.Sleep(time.Hour)
+		}
+		handlers.Add(1)
+		go func() {
+			defer handlers.Done()
+			if request.Params.DelayMS > 0 {
+				time.Sleep(time.Duration(request.Params.DelayMS) * time.Millisecond)
+			}
+			switch {
+			case silent, request.Method == silentMethod:
+			case request.Method == exitMethod:
+				os.Exit(3)
+			case request.Method == initializeMethod:
+				respond(fmt.Sprintf(`{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2025-11-25","capabilities":{"tools":{}},"grandchildPid":%d,"serverInfo":{"name":"fake-stdio-server","version":"0.0.1"}}}`, request.ID, grandchildPid))
+			case request.Method == envMethod:
+				// The echo param names the variable to report.
+				respond(fmt.Sprintf(`{"jsonrpc":"2.0","id":%s,"result":{"value":%q}}`, request.ID, os.Getenv(request.Params.Echo)))
+			case request.Method == floodMethod:
+				// One line past what the reader will frame, standing in for a
+				// tools/call result too large to parse.
+				respond(fmt.Sprintf(`{"jsonrpc":"2.0","id":%s,"result":{"blob":%q}}`, request.ID, strings.Repeat("x", maxLineBytes)))
+			default:
+				respond(fmt.Sprintf(`{"jsonrpc":"2.0","id":%s,"result":{"method":%q,"echo":%q}}`, request.ID, request.Method, request.Params.Echo))
+			}
+		}()
+	}
+	handlers.Wait()
+	lingerAfterStdinClose()
+}
+
+// startGrandchild stands in for the wrapper case, where the configured command
+// is a launcher and the real MCP server is its child.
+func startGrandchild() int {
+	if os.Getenv(fakeChildGrandchild) == "" {
+		return 0
+	}
+	grandchild := exec.Command("sleep", "300")
+	if err := grandchild.Start(); err != nil {
+		return 0
+	}
+	return grandchild.Process.Pid
+}
+
+func lingerAfterStdinClose() {
+	if os.Getenv(fakeChildLinger) != "" {
+		// Ignoring the stdin close forces the kill path. Sleeping rather than
+		// blocking forever keeps the runtime's deadlock detector from ending
+		// the process on its own, which would fake the very exit under test.
+		time.Sleep(time.Hour)
+	}
+	os.Exit(0)
+}

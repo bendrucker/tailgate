@@ -10,6 +10,11 @@ import (
 	"strings"
 )
 
+// MetadataPathPrefix is the RFC 9728 section 3 well-known prefix inserted
+// ahead of a resource's path to locate its metadata document. Mount Handler on
+// this subtree ahead of the /mcp/ routes.
+const MetadataPathPrefix = "/.well-known/oauth-protected-resource"
+
 // URLs mints the canonical resource URI for each upstream. The same string must
 // match byte-for-byte across the client's resource parameter, the token's aud
 // claim, the verifier's expected audience, and the protected-resource metadata
@@ -46,9 +51,21 @@ func (u *URLs) ResourceURL(name string) string {
 	return u.base.JoinPath("mcp", name).String()
 }
 
-// Metadata returns the path serving the RFC 9728 protected-resource metadata
-// for the named upstream: the well-known prefix inserted ahead of the resource
-// path, per RFC 9728 section 3.
-func (u *URLs) Metadata(name string) string {
-	return u.base.JoinPath(".well-known", "oauth-protected-resource", "mcp", name).Path
+// MetadataPath returns the path serving the RFC 9728 protected-resource
+// metadata for the named upstream: the well-known prefix inserted ahead of the
+// resource path.
+func (u *URLs) MetadataPath(name string) string {
+	return u.metadata(name).Path
+}
+
+// MetadataURL returns the absolute URL of the named upstream's metadata
+// document, which is the resource_metadata value clients are sent to in the
+// WWW-Authenticate challenge. It shares MetadataPath's construction so the URL
+// tailgate advertises and the path it serves cannot drift.
+func (u *URLs) MetadataURL(name string) string {
+	return u.metadata(name).String()
+}
+
+func (u *URLs) metadata(name string) *url.URL {
+	return u.base.JoinPath(MetadataPathPrefix, "mcp", name)
 }

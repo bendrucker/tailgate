@@ -17,4 +17,8 @@ type Decision struct {
 	Upstream string
 	Allow    bool
 	Reason   string
+	// Rule names the allow condition that matched, as "policy[i].allow[j]"
+	// against the configured policy. It is empty on a denial, where Reason
+	// carries why no rule applied.
+	Rule string
 }

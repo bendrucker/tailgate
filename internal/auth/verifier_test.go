@@ -233,6 +233,29 @@ func TestVerify(t *testing.T) {
 	}
 }
 
+// An empty resource is a wiring bug in tailgate, not a bad bearer: the RFC 8707
+// audience binding has nothing to compare against. Verify must refuse before
+// introspecting rather than reach audienceContains, where the check would then
+// rest entirely on no aud entry ever being the empty string.
+func TestVerifyWithoutAResourceIsUnavailable(t *testing.T) {
+	clock := newTestClock()
+	issuer := newCountingIssuer(t, func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(t, w, activeClaims(clock, 5*time.Minute))
+	})
+	verifier := newTestVerifier(t, issuer, clock)
+
+	_, err := verifier.Verify(t.Context(), "deadbeef", "")
+	if !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("expected ErrUnavailable, got %v", err)
+	}
+	if errors.Is(err, ErrInvalidToken) {
+		t.Fatalf("a missing resource must not classify the token as invalid: %v", err)
+	}
+	if hits := issuer.hits.Load(); hits != 0 {
+		t.Errorf("expected 0 introspection round trips, got %d", hits)
+	}
+}
+
 func TestVerifyIntrospectionUnavailable(t *testing.T) {
 	issuer := fakeIssuer(t, nil)
 	verifier, err := NewVerifier(t.Context(), issuer.Client(), issuer.URL)

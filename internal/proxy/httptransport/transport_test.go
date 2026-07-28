@@ -15,6 +15,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/bendrucker/tailgate/internal/proxy"
 )
 
 type jsonrpcMessage struct {
@@ -165,6 +167,10 @@ func postMessage(t *testing.T, client *http.Client, endpoint, session, body stri
 	req.Header.Set("Authorization", "Bearer super-secret-access-token")
 	req.Header.Set("X-Forwarded-For", "203.0.113.7")
 	req.Header.Set("X-Forwarded-Host", "evil.example.com")
+	// ReverseProxy drops only the forwarding headers it can re-set, so these
+	// two reach the upstream unless the transport strips them itself.
+	req.Header.Set("X-Forwarded-Port", "8443")
+	req.Header.Set(proxy.IdentityHeaderPrefix+"Subject", "999")
 	if session != "" {
 		req.Header.Set("Mcp-Session-Id", session)
 	}
@@ -314,7 +320,14 @@ func TestEndToEnd(t *testing.T) {
 			t.Fatal("upstream saw no requests")
 		}
 		for _, h := range upstream.seenHeaders {
-			for _, banned := range []string{"Authorization", "X-Forwarded-For", "X-Forwarded-Host", "X-Forwarded-Proto"} {
+			for _, banned := range []string{
+				"Authorization",
+				"X-Forwarded-For",
+				"X-Forwarded-Host",
+				"X-Forwarded-Proto",
+				"X-Forwarded-Port",
+				proxy.IdentityHeaderPrefix + "Subject",
+			} {
 				if v := h.Get(banned); v != "" {
 					t.Errorf("upstream saw %s: %q", banned, v)
 				}
@@ -471,6 +484,60 @@ func TestCloseAbandonsStream(t *testing.T) {
 	}
 }
 
+// A request Close abandons before the upstream answers has produced no
+// response yet, so leaving it unwritten hands the still-connected client
+// net/http's implicit 200 with an empty body instead of a status it can retry.
+func TestCloseAnswersAnAbandonedRequest(t *testing.T) {
+	reached := make(chan struct{})
+	release := make(chan struct{})
+	origin := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		close(reached)
+		select {
+		case <-r.Context().Done():
+		case <-release:
+		}
+	}))
+	defer origin.Close()
+	defer close(release)
+
+	target, err := url.Parse(origin.URL)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	transport := New(target, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	gateway := httptest.NewServer(transport)
+	defer gateway.Close()
+
+	responses := make(chan *http.Response, 1)
+	go func() {
+		resp, err := gateway.Client().Post(gateway.URL, "application/json", strings.NewReader("{}"))
+		if err != nil {
+			t.Errorf("POST: %v", err)
+			responses <- nil
+			return
+		}
+		responses <- resp
+	}()
+
+	<-reached
+	if err := transport.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	select {
+	case resp := <-responses:
+		if resp == nil {
+			return
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusServiceUnavailable {
+			t.Errorf("status = %d, want 503", resp.StatusCode)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the abandoned request never got a response")
+	}
+}
+
 func TestExchangeTimeout(t *testing.T) {
 	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Drain the body first: the server arms its disconnect watcher only
@@ -503,47 +570,73 @@ func TestExchangeTimeout(t *testing.T) {
 }
 
 func TestSSEExemptFromExchangeTimeout(t *testing.T) {
-	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "text/event-stream")
-		w.WriteHeader(http.StatusOK)
-		fl := w.(http.Flusher)
-		fmt.Fprint(w, "id: ev-1\ndata: {}\n\n")
-		fl.Flush()
-		time.Sleep(300 * time.Millisecond)
-		fmt.Fprint(w, "id: ev-2\ndata: {}\n\n")
-		fl.Flush()
-	}))
-	defer origin.Close()
+	// Media types are case-insensitive and may carry parameters, so every
+	// spelling of text/event-stream must survive past the exchange timeout.
+	for _, tc := range []struct {
+		name        string
+		contentType string
+	}{
+		{
+			name:        "canonical spelling",
+			contentType: "text/event-stream",
+		},
+		{
+			name:        "mixed case",
+			contentType: "Text/Event-Stream",
+		},
+		{
+			name:        "charset parameter",
+			contentType: "TEXT/EVENT-STREAM; charset=utf-8",
+		},
+		{
+			name:        "malformed parameter",
+			contentType: "text/event-stream; charset",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", tc.contentType)
+				w.WriteHeader(http.StatusOK)
+				fl := w.(http.Flusher)
+				fmt.Fprint(w, "id: ev-1\ndata: {}\n\n")
+				fl.Flush()
+				time.Sleep(300 * time.Millisecond)
+				fmt.Fprint(w, "id: ev-2\ndata: {}\n\n")
+				fl.Flush()
+			}))
+			defer origin.Close()
 
-	target, err := url.Parse(origin.URL)
-	if err != nil {
-		t.Fatalf("parse: %v", err)
-	}
-	transport := New(target, slog.New(slog.NewTextHandler(io.Discard, nil)))
-	defer transport.Close()
-	transport.exchangeTimeout = 75 * time.Millisecond
-	gateway := httptest.NewServer(transport)
-	defer gateway.Close()
+			target, err := url.Parse(origin.URL)
+			if err != nil {
+				t.Fatalf("parse: %v", err)
+			}
+			transport := New(target, slog.New(slog.NewTextHandler(io.Discard, nil)))
+			defer transport.Close()
+			transport.exchangeTimeout = 75 * time.Millisecond
+			gateway := httptest.NewServer(transport)
+			defer gateway.Close()
 
-	req, err := http.NewRequest(http.MethodGet, gateway.URL, nil)
-	if err != nil {
-		t.Fatalf("new request: %v", err)
-	}
-	req.Header.Set("Accept", "text/event-stream")
-	resp, err := gateway.Client().Do(req)
-	if err != nil {
-		t.Fatalf("GET: %v", err)
-	}
-	defer resp.Body.Close()
+			req, err := http.NewRequest(http.MethodGet, gateway.URL, nil)
+			if err != nil {
+				t.Fatalf("new request: %v", err)
+			}
+			req.Header.Set("Accept", "text/event-stream")
+			resp, err := gateway.Client().Do(req)
+			if err != nil {
+				t.Fatalf("GET: %v", err)
+			}
+			defer resp.Body.Close()
 
-	reader := bufio.NewReader(resp.Body)
-	if ev := readSSEEvent(t, reader); ev.id != "ev-1" {
-		t.Fatalf("expected ev-1, got %q", ev.id)
-	}
-	// The stream outlives the exchange timeout because ModifyResponse stops
-	// the timer for SSE responses.
-	if ev := readSSEEvent(t, reader); ev.id != "ev-2" {
-		t.Fatalf("expected ev-2 after the timeout window, got %q", ev.id)
+			reader := bufio.NewReader(resp.Body)
+			if ev := readSSEEvent(t, reader); ev.id != "ev-1" {
+				t.Fatalf("expected ev-1, got %q", ev.id)
+			}
+			// The stream outlives the exchange timeout because ModifyResponse
+			// stops the timer for SSE responses.
+			if ev := readSSEEvent(t, reader); ev.id != "ev-2" {
+				t.Fatalf("expected ev-2 after the timeout window, got %q", ev.id)
+			}
+		})
 	}
 }
 

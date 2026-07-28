@@ -5,12 +5,12 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"mime"
 	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/bendrucker/tailgate/internal/proxy"
@@ -30,12 +30,7 @@ type Transport struct {
 	proxy           *httputil.ReverseProxy
 	dialer          *http.Transport
 	exchangeTimeout time.Duration
-	inflight        sync.WaitGroup
-
-	mu       sync.Mutex
-	draining bool
-	cancels  map[uint64]context.CancelCauseFunc
-	nextID   uint64
+	drain           proxy.Drain
 }
 
 type exchangeTimerKey struct{}
@@ -62,7 +57,6 @@ func New(target *url.URL, logger *slog.Logger) *Transport {
 	t := &Transport{
 		dialer:          dialer,
 		exchangeTimeout: defaultExchangeTimeout,
-		cancels:         make(map[uint64]context.CancelCauseFunc),
 	}
 	t.proxy = &httputil.ReverseProxy{
 		Rewrite: func(r *httputil.ProxyRequest) {
@@ -73,10 +67,10 @@ func New(target *url.URL, logger *slog.Logger) *Transport {
 			// root, so the outbound path is exactly the target's.
 			r.Out.URL.Path = target.Path
 			r.Out.URL.RawPath = target.RawPath
-			// The router already strips these, and Rewrite drops inbound
-			// X-Forwarded-*, but the no-token-passthrough invariant is
-			// enforced here too so it cannot depend on caller discipline.
-			r.Out.Header.Del("Authorization")
+			// Rewrite drops only the four X-Forwarded headers it knows how to
+			// re-set, so the full strip runs here as well as in the router: the
+			// no-token-passthrough invariant cannot depend on caller discipline.
+			proxy.StripCredentials(r.Out.Header)
 			r.Out.Host = target.Host
 		},
 		// Flush every write immediately so each SSE event reaches the client
@@ -84,7 +78,7 @@ func New(target *url.URL, logger *slog.Logger) *Transport {
 		FlushInterval: -1,
 		Transport:     dialer,
 		ModifyResponse: func(resp *http.Response) error {
-			if strings.HasPrefix(resp.Header.Get("Content-Type"), "text/event-stream") {
+			if isEventStream(resp.Header) {
 				if timer, ok := resp.Request.Context().Value(exchangeTimerKey{}).(*time.Timer); ok {
 					timer.Stop()
 				}
@@ -97,10 +91,15 @@ func New(target *url.URL, logger *slog.Logger) *Transport {
 			case errors.Is(cause, proxy.ErrUpstreamTimeout):
 				logger.Error("upstream exchange timed out", "method", r.Method)
 				w.WriteHeader(proxy.StatusOf(proxy.ErrUpstreamTimeout))
+			case errors.Is(cause, proxy.ErrDraining):
+				// Close abandoned the request. The client is still
+				// connected and would otherwise receive net/http's
+				// implicit 200 with an empty body.
+				logger.Warn("request abandoned by shutdown", "method", r.Method)
+				w.WriteHeader(proxy.StatusOf(proxy.ErrDraining))
 			case r.Context().Err() != nil:
-				// The client went away (or Close abandoned the request):
-				// nothing is wrong with the upstream and there is no one
-				// left to answer.
+				// The client went away: nothing is wrong with the upstream
+				// and there is no one left to answer.
 				logger.Debug("request canceled", "cause", cause)
 			default:
 				logger.Error("upstream proxy error", "err", err, "method", r.Method)
@@ -111,37 +110,38 @@ func New(target *url.URL, logger *slog.Logger) *Transport {
 	return t
 }
 
+// isEventStream reports whether the response is an SSE stream. Media types are
+// case-insensitive and may carry parameters, so the header is parsed rather
+// than prefix-matched: misreading a stream as a bounded exchange would cut it
+// off at the exchange timeout.
+func isEventStream(h http.Header) bool {
+	// ParseMediaType reports ErrInvalidMediaParameter alongside a media type it
+	// parsed successfully, so a stream is still a stream when its parameters
+	// are malformed.
+	mediaType, _, err := mime.ParseMediaType(h.Get("Content-Type"))
+	if err != nil && !errors.Is(err, mime.ErrInvalidMediaParameter) {
+		return false
+	}
+	return strings.EqualFold(mediaType, "text/event-stream")
+}
+
 // ServeHTTP proxies one request. After Shutdown begins it refuses new
 // requests with 503 so the listener can drain. Every non-SSE exchange is
 // bounded by the exchange timeout; a response identified as SSE runs
 // unbounded, per the seam's timeout contract.
 func (t *Transport) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	ctx, cancel := context.WithCancelCause(r.Context())
-	t.mu.Lock()
-	if t.draining {
-		t.mu.Unlock()
-		cancel(nil)
-		http.Error(w, proxy.ErrDraining.Error(), proxy.StatusOf(proxy.ErrDraining))
+	inflight, err := t.drain.Enter(r.Context())
+	if err != nil {
+		status := proxy.StatusOf(err)
+		http.Error(w, http.StatusText(status), status)
 		return
 	}
-	t.inflight.Add(1)
-	id := t.nextID
-	t.nextID++
-	t.cancels[id] = cancel
-	t.mu.Unlock()
+	defer inflight.Done()
 
-	timer := time.AfterFunc(t.exchangeTimeout, func() { cancel(proxy.ErrUpstreamTimeout) })
+	timer := time.AfterFunc(t.exchangeTimeout, func() { inflight.Cancel(proxy.ErrUpstreamTimeout) })
+	defer timer.Stop()
 
-	defer func() {
-		timer.Stop()
-		cancel(nil)
-		t.mu.Lock()
-		delete(t.cancels, id)
-		t.mu.Unlock()
-		t.inflight.Done()
-	}()
-
-	ctx = context.WithValue(ctx, exchangeTimerKey{}, timer)
+	ctx := context.WithValue(inflight.Context(), exchangeTimerKey{}, timer)
 	t.proxy.ServeHTTP(w, r.WithContext(ctx))
 }
 
@@ -149,39 +149,14 @@ func (t *Transport) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // open SSE streams, to finish or ctx to expire. On expiry the remaining
 // streams are abandoned to Close.
 func (t *Transport) Shutdown(ctx context.Context) error {
-	t.mu.Lock()
-	t.draining = true
-	t.mu.Unlock()
-
-	done := make(chan struct{})
-	go func() {
-		t.inflight.Wait()
-		close(done)
-	}()
-	select {
-	case <-done:
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
-	}
+	return t.drain.Shutdown(ctx)
 }
 
 // Close tears down immediately: every in-flight request's context is
 // canceled, which aborts active SSE copies and releases their connections,
 // and idle upstream connections are closed.
 func (t *Transport) Close() error {
-	t.mu.Lock()
-	t.draining = true
-	cancels := make([]context.CancelCauseFunc, 0, len(t.cancels))
-	for _, cancel := range t.cancels {
-		cancels = append(cancels, cancel)
-	}
-	t.mu.Unlock()
-
-	for _, cancel := range cancels {
-		cancel(proxy.ErrDraining)
-	}
-	t.inflight.Wait()
+	t.drain.Close()
 	t.dialer.CloseIdleConnections()
 	return nil
 }
