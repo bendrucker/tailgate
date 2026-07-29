@@ -1,12 +1,33 @@
-// Package stdiotransport serves streamable HTTP (MCP 2025-11-25) over a child
-// process per MCP session.
+// Package stdiotransport serves streamable HTTP over a child process.
 //
 // A stdio MCP server speaks JSON-RPC over its own pipes and has no notion of
-// sessions, so this transport is the server side of the HTTP protocol: it
-// mints the session id, binds it to the authenticated caller, correlates
-// JSON-RPC ids across the child's newline-delimited stream, and reaps children
-// that go idle. Because a request here spawns a process, the caps and
-// lifecycles live per identity: one caller cannot exhaust the host for others.
+// HTTP, sessions, or protocol revisions, so this transport is the server side
+// of the HTTP protocol: it correlates JSON-RPC ids across the child's
+// newline-delimited stream and reaps children that go idle. Because a request
+// here spawns a process, the caps and lifecycles live per identity: one caller
+// cannot exhaust the host for others.
+//
+// # Two eras of caller
+//
+// What a child is addressed by depends on the revision the request declares.
+// Through 2025-11-25 a caller opens a session with initialize, gets a minted
+// Mcp-Session-Id bound to its identity, and reaches one child per session. A
+// 2026-07-28 caller has neither, so it reaches one child per identity, started
+// on first use.
+//
+// That child is the same kind of program either way, and it holds state across
+// messages whatever HTTP has decided. So the stateless path supplies what the
+// caller no longer does: it settles the child's own era with the revision's
+// server/discover probe, runs the initialize handshake itself for a child that
+// predates the revision, and substitutes its own JSON-RPC ids, since
+// independent POSTs from one caller may all call themselves id 1.
+//
+// # Notifications
+//
+// A child's notifications reach a client only on the response stream of a
+// subscriptions/listen request, which is the one response this transport holds
+// open and therefore the one exempt from the exchange timeout. With no such
+// stream open, a notification has nowhere to go and is dropped.
 //
 // The no-token-passthrough invariant holds by construction here. Nothing from
 // the client's HTTP request reaches the child but the JSON-RPC message itself,
@@ -30,6 +51,7 @@ import (
 
 	"github.com/bendrucker/tailgate/internal/audit"
 	"github.com/bendrucker/tailgate/internal/auth"
+	"github.com/bendrucker/tailgate/internal/protocol"
 	"github.com/bendrucker/tailgate/internal/proxy"
 )
 
@@ -45,8 +67,8 @@ const (
 )
 
 // AssumedProtocolVersion is the version a request without an
-// MCP-Protocol-Version header is treated as speaking, per MCP 2025-11-25.
-const AssumedProtocolVersion = "2025-03-26"
+// MCP-Protocol-Version header is treated as speaking.
+const AssumedProtocolVersion = protocol.Assumed
 
 // maxBodyBytes bounds a POSTed message. The router applies its own limit;
 // this one and the read deadline servePost sets keep the transport safe on its
@@ -54,27 +76,16 @@ const AssumedProtocolVersion = "2025-03-26"
 const maxBodyBytes = 4 << 20
 
 const (
-	sessionHeader         = "Mcp-Session-Id"
-	protocolVersionHeader = "MCP-Protocol-Version"
+	sessionHeader         = protocol.SessionHeader
+	protocolVersionHeader = protocol.VersionHeader
 	initializeMethod      = "initialize"
 )
 
-// supportedProtocolVersions gates the MCP-Protocol-Version header. An
-// unrecognized version is a 400: proxying it would hand the child a dialect
-// neither end agreed to.
-var supportedProtocolVersions = map[string]bool{
-	"2024-11-05": true,
-	"2025-03-26": true,
-	"2025-06-18": true,
-	"2025-11-25": true,
-}
-
 var (
-	errMissingSessionID    = errors.New("stdiotransport: Mcp-Session-Id is required")
-	errUnsupportedProtocol = errors.New("stdiotransport: unsupported MCP-Protocol-Version")
-	errUnauthenticated     = errors.New("stdiotransport: request carries no authorized identity")
-	errBodyTooLarge        = errors.New("stdiotransport: request body exceeds the message limit")
-	errBodyTimeout         = errors.New("stdiotransport: request body was not sent in time")
+	errMissingSessionID = errors.New("stdiotransport: Mcp-Session-Id is required")
+	errUnauthenticated  = errors.New("stdiotransport: request carries no authorized identity")
+	errBodyTooLarge     = errors.New("stdiotransport: request body exceeds the message limit")
+	errBodyTimeout      = errors.New("stdiotransport: request body was not sent in time")
 )
 
 // Reasons recorded on the audit log for refusals this transport makes itself.
@@ -146,9 +157,14 @@ type Transport struct {
 	stop          chan struct{}
 	stopOnce      sync.Once
 
-	mu          sync.Mutex
-	closed      bool
-	sessions    map[string]*session
+	mu     sync.Mutex
+	closed bool
+	// sessions holds every live child by the id that addresses it, whether a
+	// caller named that id or only tailgate ever sees it.
+	sessions map[string]*session
+	// stateless holds the child each identity reaches when its requests carry
+	// no session, which is every request under a stateless revision.
+	stateless   map[string]*statelessChild
 	perIdentity map[string]int
 }
 
@@ -169,16 +185,20 @@ func New(opts Options) *Transport {
 		reaperStopped: make(chan struct{}),
 		stop:          make(chan struct{}),
 		sessions:      make(map[string]*session),
+		stateless:     make(map[string]*statelessChild),
 		perIdentity:   make(map[string]int),
 	}
 	go t.reapIdleSessions()
 	return t
 }
 
-// ServeHTTP serves one MCP request against this upstream's children. POST
-// carries every JSON-RPC message, DELETE terminates a session, and the
-// standalone GET stream is refused with 405: a stdio child answers requests
-// and has no server-initiated stream to relay.
+// ServeHTTP serves one MCP request against this upstream's children.
+//
+// POST carries every JSON-RPC message. What else is allowed depends on the
+// revision the request declares: through 2025-11-25, DELETE terminates a
+// session, while a stateless revision has no session to terminate and no
+// standalone stream to open, so both DELETE and GET are refused with 405 as
+// that revision directs.
 func (t *Transport) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	inflight, err := t.drain.Enter(r.Context())
 	if err != nil {
@@ -197,23 +217,34 @@ func (t *Transport) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if version := r.Header.Get(protocolVersionHeader); version != "" && !supportedProtocolVersions[version] {
-		t.writeError(w, fmt.Errorf("%w: %q", errUnsupportedProtocol, version))
+	requested := r.Header.Get(protocolVersionHeader)
+	revision, err := protocol.Parse(requested)
+	if err != nil {
+		t.logger.Warn("stdio request declared an unsupported revision", "err", err)
+		protocol.WriteUnsupportedVersion(w, requested)
 		return
 	}
 
-	switch r.Method {
-	case http.MethodPost:
-		t.servePost(w, r, inflight, identity)
-	case http.MethodDelete:
+	switch {
+	case r.Method == http.MethodPost:
+		t.servePost(w, r, inflight, identity, revision)
+	case r.Method == http.MethodDelete && !revision.Stateless():
 		t.serveDelete(w, r, identity)
 	default:
-		w.Header().Set("Allow", "POST, DELETE")
+		w.Header().Set("Allow", allowedMethods(revision))
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 	}
 }
 
-func (t *Transport) servePost(w http.ResponseWriter, r *http.Request, inflight *proxy.InFlight, identity auth.Identity) {
+// allowedMethods reports what the revision permits at the MCP endpoint.
+func allowedMethods(revision protocol.Revision) string {
+	if revision.Stateless() {
+		return "POST"
+	}
+	return "POST, DELETE"
+}
+
+func (t *Transport) servePost(w http.ResponseWriter, r *http.Request, inflight *proxy.InFlight, identity auth.Identity, revision protocol.Revision) {
 	body, err := t.readMessage(w, r, inflight)
 	if err != nil {
 		t.writeError(w, err)
@@ -222,6 +253,15 @@ func (t *Transport) servePost(w http.ResponseWriter, r *http.Request, inflight *
 	msg, err := parseMessage(body)
 	if err != nil {
 		t.writeError(w, err)
+		return
+	}
+
+	if revision.Stateless() {
+		if !t.ownsPresentedSession(r, identity) {
+			t.writeError(w, proxy.ErrSessionNotFound)
+			return
+		}
+		t.serveStateless(w, r, inflight, identity, msg)
 		return
 	}
 
@@ -381,6 +421,31 @@ func (t *Transport) serveDelete(w http.ResponseWriter, r *http.Request, identity
 // the idle reaper decides under the same lock, so a session either is claimed
 // before the sweep sees it or has already left the table, and a request that
 // loses that race reports a missing session rather than a broken child.
+// ownsPresentedSession reports whether a caller may proceed with whatever
+// session id it presented, and records a denial when it may not.
+//
+// The stateless revision ignores the session header, but the binding follows
+// the header rather than the declared revision: letting a caller shed the check
+// by naming the revision that dropped the header would make a stdio session
+// probe invisible, and this transport's own refusal is the only record of one.
+// A caller presenting nothing, or its own id, proceeds.
+func (t *Transport) ownsPresentedSession(r *http.Request, identity auth.Identity) bool {
+	id := r.Header.Get(sessionHeader)
+	if id == "" {
+		return true
+	}
+	t.mu.Lock()
+	s, ok := t.sessions[id]
+	foreign := ok && s.subject != identity.Subject
+	t.mu.Unlock()
+	if !foreign {
+		return true
+	}
+	t.logger.Warn("stdio session presented by another identity", "session", id, "sub", identity.Subject)
+	t.audit.Deny(r.Context(), identity, t.options.Name, ReasonSessionBound)
+	return false
+}
+
 func (t *Transport) sessionFor(ctx context.Context, id string, identity auth.Identity) (*session, error) {
 	if id == "" {
 		return nil, errMissingSessionID
@@ -490,6 +555,11 @@ func (t *Transport) unregisterLocked(s *session) bool {
 	}
 	s.removed = true
 	delete(t.sessions, s.id)
+	// A stateless caller reaches its child by identity rather than by id, so
+	// that name must go too, or the next request adopts a dead process.
+	if entry, ok := t.stateless[s.subject]; ok && entry.s == s {
+		delete(t.stateless, s.subject)
+	}
 	return true
 }
 
@@ -676,6 +746,14 @@ func (t *Transport) writeError(w http.ResponseWriter, err error) {
 	}
 	status := statusOf(err)
 	t.logger.Warn("stdio request refused", "status", status, "err", err)
+	if status == http.StatusBadRequest {
+		// A 400 whose body is not a recognized JSON-RPC error is what tells a
+		// client probing for the server's era that it predates the stateless
+		// revision, so a refusal in bare text would talk the caller into
+		// retrying with the handshake this transport no longer offers it.
+		protocol.WriteError(w, status, protocol.CodeInvalidRequest, http.StatusText(status), nil)
+		return
+	}
 	http.Error(w, http.StatusText(status), status)
 }
 
@@ -683,7 +761,6 @@ func statusOf(err error) int {
 	switch {
 	case errors.Is(err, errInvalidMessage),
 		errors.Is(err, errMissingSessionID),
-		errors.Is(err, errUnsupportedProtocol),
 		errors.Is(err, errDuplicateRequestID):
 		return http.StatusBadRequest
 	case errors.Is(err, errBodyTooLarge):

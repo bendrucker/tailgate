@@ -20,7 +20,7 @@ func TestMissingCredentialGetsBareChallenge(t *testing.T) {
 	if resp.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("status = %d, want 401", resp.StatusCode)
 	}
-	want := `Bearer resource_metadata="https://` + testFQDN + `/.well-known/oauth-protected-resource/mcp/` + httpUpstream + `"`
+	want := `Bearer resource_metadata="https://` + testFQDN + `/.well-known/oauth-protected-resource/mcp/` + httpUpstream + `", scope="openid email"`
 	if got := resp.Header.Get("WWW-Authenticate"); got != want {
 		t.Errorf("WWW-Authenticate = %q, want %q", got, want)
 	}
@@ -42,7 +42,7 @@ func TestMissingCredentialGetsBareChallenge(t *testing.T) {
 }
 
 func TestAuthorizationHeaderParsing(t *testing.T) {
-	metadata := `https://` + testFQDN + `/.well-known/oauth-protected-resource/mcp/` + httpUpstream
+	bearer := `Bearer resource_metadata="https://` + testFQDN + `/.well-known/oauth-protected-resource/mcp/` + httpUpstream + `", scope="openid email"`
 
 	for _, tc := range []struct {
 		name      string
@@ -59,31 +59,31 @@ func TestAuthorizationHeaderParsing(t *testing.T) {
 			name:      "basic scheme",
 			headers:   []string{"Basic dXNlcjpwYXNz"},
 			status:    http.StatusUnauthorized,
-			challenge: `Bearer resource_metadata="` + metadata + `", error="invalid_request"`,
+			challenge: bearer + `, error="invalid_request"`,
 		},
 		{
 			name:      "scheme without a credential",
 			headers:   []string{"Bearer"},
 			status:    http.StatusUnauthorized,
-			challenge: `Bearer resource_metadata="` + metadata + `", error="invalid_request"`,
+			challenge: bearer + `, error="invalid_request"`,
 		},
 		{
 			name:      "blank credential",
 			headers:   []string{"Bearer    "},
 			status:    http.StatusUnauthorized,
-			challenge: `Bearer resource_metadata="` + metadata + `", error="invalid_request"`,
+			challenge: bearer + `, error="invalid_request"`,
 		},
 		{
 			name:      "repeated authorization headers",
 			headers:   []string{"Bearer good", "Bearer other"},
 			status:    http.StatusUnauthorized,
-			challenge: `Bearer resource_metadata="` + metadata + `", error="invalid_request"`,
+			challenge: bearer + `, error="invalid_request"`,
 		},
 		{
 			name:      "unknown token",
 			headers:   []string{"Bearer nope"},
 			status:    http.StatusUnauthorized,
-			challenge: `Bearer resource_metadata="` + metadata + `", error="invalid_token"`,
+			challenge: bearer + `, error="invalid_token"`,
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

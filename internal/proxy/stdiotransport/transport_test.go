@@ -485,7 +485,7 @@ func TestProtocolVersionHeader(t *testing.T) {
 		},
 		{
 			name:     "assumed revision",
-			protocol: AssumedProtocolVersion,
+			protocol: string(AssumedProtocolVersion),
 			expected: http.StatusAccepted,
 		},
 		{

@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/bendrucker/tailgate/internal/auth"
+	"github.com/bendrucker/tailgate/internal/protocol"
 	"github.com/bendrucker/tailgate/internal/resource"
 )
 
@@ -129,18 +130,19 @@ func normalizeOrigin(origin string) string {
 	return scheme + "://" + host
 }
 
-// limitBody caps the request body, answering 413 when the caller exceeds it.
-// The body is read here rather than wrapped, because a limit discovered while
-// the transport is already streaming to the upstream cannot be reported as a
-// status: an MCP client request is one JSON-RPC message, so buffering it costs
-// the cap at most.
-func (rt *Router) limitBody(rec *responseRecorder, r *http.Request) bool {
+// limitBody caps the request body, answering 413 when the caller exceeds it,
+// and returns the buffered bytes so later steps can inspect what will be
+// forwarded. The body is read here rather than wrapped, because a limit
+// discovered while the transport is already streaming to the upstream cannot
+// be reported as a status: an MCP client request is one JSON-RPC message, so
+// buffering it costs the cap at most.
+func (rt *Router) limitBody(rec *responseRecorder, r *http.Request) ([]byte, bool) {
 	if r.Body == nil || r.Body == http.NoBody {
-		return true
+		return nil, true
 	}
 	if r.ContentLength > rt.maxBody {
 		rt.tooLarge(rec, r)
-		return false
+		return nil, false
 	}
 
 	body, err := io.ReadAll(http.MaxBytesReader(rec, r.Body, rt.maxBody))
@@ -148,15 +150,15 @@ func (rt *Router) limitBody(rec *responseRecorder, r *http.Request) bool {
 		var tooLarge *http.MaxBytesError
 		if errors.As(err, &tooLarge) {
 			rt.tooLarge(rec, r)
-			return false
+			return nil, false
 		}
 		rt.logger.Debug("read request body", "err", err)
-		http.Error(rec, "bad request", http.StatusBadRequest)
-		return false
+		protocol.WriteError(rec, http.StatusBadRequest, protocol.CodeParseError, "Could not read the request body", nil)
+		return nil, false
 	}
 	r.Body = io.NopCloser(bytes.NewReader(body))
 	r.ContentLength = int64(len(body))
-	return true
+	return body, true
 }
 
 func (rt *Router) tooLarge(rec *responseRecorder, r *http.Request) {
