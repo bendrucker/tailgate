@@ -173,6 +173,11 @@ func (t *Transport) startStateless(entry *statelessChild, identity auth.Identity
 // method unknown predates the revision and still expects initialize. tailgate
 // runs that handshake on the caller's behalf, because a stateless client will
 // never send one.
+//
+// Any other error code is a child that recognizes a method the revision makes
+// mandatory and failed at it, which says nothing about its era. Running the
+// pre-stateless handshake against it would pick an era from a failure, so the
+// upstream is reported unavailable instead.
 func (t *Transport) handshake(s *session) error {
 	ctx, cancel := context.WithTimeout(context.Background(), t.options.RequestTimeout)
 	defer cancel()
@@ -181,12 +186,15 @@ func (t *Transport) handshake(s *session) error {
 	if err != nil {
 		return err
 	}
-	if code, isError := errorCode(response); !isError {
+	code, isError := errorCode(response)
+	switch {
+	case !isError:
 		s.logger.Debug("stdio child answered server/discover")
 		return nil
-	} else if code != codeMethodNotFound {
-		s.logger.Debug("stdio child refused server/discover, assuming it predates the stateless era", "code", code)
+	case code != codeMethodNotFound:
+		return fmt.Errorf("%w: stdio child failed server/discover with code %d", proxy.ErrUpstreamUnavailable, code)
 	}
+	s.logger.Debug("stdio child does not know server/discover, so it predates the stateless era")
 	return t.initialize(ctx, s)
 }
 

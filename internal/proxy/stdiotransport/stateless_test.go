@@ -223,6 +223,19 @@ func TestStatelessHandshakeAcrossEras(t *testing.T) {
 	}
 }
 
+// Only the method-unknown code says a child predates the revision. Any other
+// failure of a method the revision makes mandatory says nothing about its era,
+// so the child is reported unavailable rather than handshaken as a guess.
+func TestStatelessHandshakeRefusesABrokenDiscover(t *testing.T) {
+	h := newHarness(t, Options{Env: []string{fakeChildDiscoverBroken + "=1"}})
+	response := h.do(t, call{subject: "alice", protocol: stateless, body: statelessBody(1, "tools/list", "")})
+	defer response.Body.Close()
+
+	if response.StatusCode != http.StatusBadGateway {
+		t.Fatalf("expected 502, got %d", response.StatusCode)
+	}
+}
+
 // subscriptions/listen is the one response held open, so it must escape the
 // exchange timeout and carry the child's notifications as they arrive.
 func TestStatelessSubscriptionStream(t *testing.T) {

@@ -23,7 +23,15 @@ const (
 	// for a server written against the stateless revision. Unset, it reports
 	// the method unknown, which is what every server written before it does.
 	fakeChildDiscovers = "TAILGATE_STDIO_FAKE_CHILD_DISCOVERS"
+	// fakeChildDiscoverBroken makes the child fail server/discover with an
+	// internal error, standing in for a server that knows the method and is
+	// broken at it rather than one that predates it.
+	fakeChildDiscoverBroken = "TAILGATE_STDIO_FAKE_CHILD_DISCOVER_BROKEN"
 )
+
+// codeInternalError is what a child returns when it recognizes a method and
+// fails at it.
+const codeInternalError = -32603
 
 // Methods the fake child answers specially. Every other method echoes back.
 const (
@@ -93,6 +101,8 @@ func runFakeChild() {
 				os.Exit(3)
 			case request.Method == initializeMethod:
 				respond(fmt.Sprintf(`{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2025-11-25","capabilities":{"tools":{}},"grandchildPid":%d,"serverInfo":{"name":"fake-stdio-server","version":"0.0.1"}}}`, request.ID, grandchildPid))
+			case request.Method == discoverMethod && os.Getenv(fakeChildDiscoverBroken) != "":
+				respond(fmt.Sprintf(`{"jsonrpc":"2.0","id":%s,"error":{"code":%d,"message":"Internal error"}}`, request.ID, codeInternalError))
 			case request.Method == discoverMethod && os.Getenv(fakeChildDiscovers) == "":
 				respond(fmt.Sprintf(`{"jsonrpc":"2.0","id":%s,"error":{"code":%d,"message":"Method not found"}}`, request.ID, codeMethodNotFound))
 			case request.Method == discoverMethod:
