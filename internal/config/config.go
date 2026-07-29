@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"regexp"
+	"strings"
 	"time"
 
 	"github.com/tailscale/hujson"
@@ -34,6 +35,23 @@ type Node struct {
 	Hostname string `json:"hostname"`
 	StateDir string `json:"state_dir"`
 	Port     int    `json:"port"`
+	// Tailnet is the MagicDNS suffix the node joins under, such as
+	// "example-name.ts.net". Setting it makes every canonical resource URI
+	// derivable without contacting the control server, which is what lets the
+	// tsidp grant be generated and reviewed before tailgate ever runs. It is
+	// also checked against the name the join actually reports, so a node that
+	// lands on a different name than the grant was written for fails to serve
+	// rather than serving URIs no grant covers.
+	Tailnet string `json:"tailnet,omitempty"`
+}
+
+// FQDN reports the tailnet DNS name the node is expected to join under, or the
+// empty string when the config does not name a tailnet.
+func (n Node) FQDN() string {
+	if n.Tailnet == "" {
+		return ""
+	}
+	return n.Hostname + "." + n.Tailnet
 }
 
 // OIDC configures the tsidp issuer whose tokens tailgate validates.
@@ -124,6 +142,12 @@ func (c *Config) Validate() error {
 	}
 	if c.OIDC.Issuer == "" {
 		return fmt.Errorf("config: oidc.issuer is required")
+	}
+	// The suffix joins the hostname to form a bare host, so anything that
+	// would make the result something other than one host would mint resource
+	// URIs no grant could match.
+	if c.Node.Tailnet != "" && strings.ContainsAny(c.Node.Tailnet, "/:?# ") {
+		return fmt.Errorf("config: node.tailnet %q must be a bare DNS suffix", c.Node.Tailnet)
 	}
 
 	names := make(map[string]bool, len(c.Upstreams))

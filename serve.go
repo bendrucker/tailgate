@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/bendrucker/tailgate/internal/audit"
@@ -29,6 +30,15 @@ const (
 	closeTimeout = 10 * time.Second
 )
 
+// options carries the invocation's run-mode choices, which are the caller's
+// rather than the deployment's and so live on the command line instead of in
+// the config file.
+type options struct {
+	// OpenLoginURL opens the interactive login URL in the default browser when
+	// the node joins without an auth key.
+	OpenLoginURL bool
+}
+
 // serve runs tailgate until ctx is canceled or the listener fails.
 //
 // The order is forced by what each step learns from the one before it: the
@@ -36,12 +46,13 @@ const (
 // client that dials the tailnet, and the router needs both. Nothing serves
 // until every one of them succeeds, so a startup failure is downtime rather
 // than an unauthenticated window.
-func serve(ctx context.Context, logger *slog.Logger, cfg *config.Config) error {
+func serve(ctx context.Context, logger *slog.Logger, cfg *config.Config, opts options) error {
 	node, err := tsnetserver.New(tsnetserver.Config{
-		Hostname: cfg.Node.Hostname,
-		StateDir: cfg.Node.StateDir,
-		Port:     cfg.Node.Port,
-		Logger:   logger,
+		Hostname:     cfg.Node.Hostname,
+		StateDir:     cfg.Node.StateDir,
+		Port:         cfg.Node.Port,
+		Logger:       logger,
+		OpenLoginURL: opts.OpenLoginURL,
 	})
 	if err != nil {
 		return err
@@ -53,6 +64,10 @@ func serve(ctx context.Context, logger *slog.Logger, cfg *config.Config) error {
 		return err
 	}
 	logger.Info("joined tailnet", "fqdn", fqdn)
+
+	if err := expectedFQDN(cfg.Node, fqdn); err != nil {
+		return err
+	}
 
 	urls, err := resource.NewURLs(fqdn, cfg.Node.Port)
 	if err != nil {
@@ -94,6 +109,26 @@ func serve(ctx context.Context, logger *slog.Logger, cfg *config.Config) error {
 	case <-ctx.Done():
 		return drain(logger, node, server, rt)
 	}
+}
+
+// expectedFQDN checks the name the join reported against the one the config
+// names, when it names one.
+//
+// The control server decides the node's name: a hostname already taken comes
+// back with a suffix appended. Every canonical resource URI is built
+// from that name, so an unexpected one silently shifts every audience away from
+// what the tsidp grant authorizes, and each request fails at the audience check
+// with nothing pointing at the cause. Refusing to serve reports it once, at
+// startup, against the name a reviewer can compare to the policy.
+func expectedFQDN(node config.Node, joined string) error {
+	expected := node.FQDN()
+	if expected == "" {
+		return nil
+	}
+	if actual := strings.ToLower(strings.TrimSuffix(joined, ".")); actual != strings.ToLower(expected) {
+		return fmt.Errorf("joined the tailnet as %q, but the config expects %q: every resource URI would differ from the one the tsidp grant authorizes", actual, expected)
+	}
+	return nil
 }
 
 // stopper closes the public listener. *tsnetserver.Server implements it.
