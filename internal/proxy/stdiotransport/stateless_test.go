@@ -4,13 +4,17 @@ import (
 	"bufio"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/bendrucker/tailgate/internal/audit"
 	"github.com/bendrucker/tailgate/internal/protocol"
+	"github.com/google/go-cmp/cmp"
 )
 
 const stateless = string(protocol.Rev20260728)
@@ -121,6 +125,79 @@ func TestStatelessChildIsPerIdentity(t *testing.T) {
 	}
 }
 
+// A message carrying a correlation key and no method is neither request nor
+// notification. Forwarding it verbatim would put a caller-chosen id into the
+// namespace the transport mints from, where the child's answer to it satisfies
+// another request's pending wait.
+func TestStatelessRefusesAMessageWithNoMethod(t *testing.T) {
+	h := newHarness(t, Options{})
+
+	body := fmt.Sprintf(`{"jsonrpc":"2.0","id":"tailgate-3","params":{%s},"result":{}}`,
+		fmt.Sprintf(`%q:%q`, protocol.MetaProtocolVersion, stateless))
+	response := h.do(t, call{subject: "alice", protocol: stateless, body: body})
+	defer response.Body.Close()
+
+	if response.StatusCode != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d", response.StatusCode)
+	}
+}
+
+// The binding follows the header rather than the declared revision. Naming the
+// revision that dropped the header would otherwise shed the check, and this
+// transport's own refusal is the only record of a stdio session probe.
+func TestStatelessSessionBindingIsAudited(t *testing.T) {
+	h := newHarness(t, Options{Name: "docs"})
+	session := h.initialize(t, "alice")
+
+	response := h.do(t, call{
+		subject:  "mallory",
+		protocol: stateless,
+		session:  session,
+		body:     statelessBody(1, "tools/list", ""),
+	})
+	defer response.Body.Close()
+
+	if response.StatusCode != http.StatusNotFound {
+		t.Fatalf("expected 404 for another identity's session, got %d", response.StatusCode)
+	}
+	want := []auditRecord{{
+		Level:    slog.LevelWarn.String(),
+		Outcome:  audit.OutcomeDeny,
+		Subject:  "mallory",
+		Email:    "mallory@example.com",
+		Upstream: "docs",
+		Reason:   ReasonSessionBound,
+	}}
+	if diff := cmp.Diff(want, h.audit.decisions()); diff != "" {
+		t.Errorf("audit mismatch (-want +got):\n%s", diff)
+	}
+}
+
+// A 400 whose body is not a recognized JSON-RPC error tells a client probing
+// for the server's era that it predates the stateless revision, so a refusal in
+// bare text talks the caller into a handshake this transport does not offer.
+func TestStatelessRefusalsAreJSONRPC(t *testing.T) {
+	h := newHarness(t, Options{})
+
+	response := h.do(t, call{subject: "alice", protocol: stateless, body: `{"id":1,"method":"tools/list"}`})
+	defer response.Body.Close()
+
+	if response.StatusCode != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d", response.StatusCode)
+	}
+	if contentType := response.Header.Get("Content-Type"); contentType != "application/json" {
+		t.Fatalf("expected a JSON-RPC body, got %q", contentType)
+	}
+	message := decodeMessage(t, response)
+	if version, _ := message["jsonrpc"].(string); version != "2.0" {
+		t.Errorf("expected a JSON-RPC error, got %v", message)
+	}
+	failure, _ := message["error"].(map[string]any)
+	if code, ok := failure["code"].(float64); !ok || int(code) != protocol.CodeInvalidRequest {
+		t.Errorf("expected code %d, got %v", protocol.CodeInvalidRequest, failure["code"])
+	}
+}
+
 // The stateless revision removed both the session header and the standalone
 // GET stream, so the endpoint answers only POST.
 func TestStatelessRefusesSessionMethods(t *testing.T) {
@@ -193,26 +270,54 @@ func TestUnsupportedRevisionAnswersInJSONRPC(t *testing.T) {
 
 // A child that predates the stateless revision still needs the handshake that
 // revision removed, and tailgate runs it so the caller does not have to.
+//
+// The revision forbids keying that fallback to one error code, and the SDKs
+// bear the reason out: a server with no notion of server/discover refuses it
+// with whatever code its runtime uses. Only a code from the range the revision
+// reserves for itself identifies a child that implements the method and
+// declined anyway.
 func TestStatelessHandshakeAcrossEras(t *testing.T) {
 	for _, tc := range []struct {
-		name string
-		env  []string
+		name    string
+		refusal string
+		status  int
 	}{
 		{
-			name: "child that reports server/discover unknown gets initialize",
-			env:  nil,
+			name:    "child that answers the probe is left alone",
+			refusal: fakeChildDiscoverAnswers,
+			status:  http.StatusOK,
 		},
 		{
-			name: "child that answers server/discover is left alone",
-			env:  []string{fakeChildDiscovers + "=1"},
+			name:    "child that reports the method unknown gets initialize",
+			refusal: strconv.Itoa(codeMethodNotFound),
+			status:  http.StatusOK,
+		},
+		{
+			name:    "child that reports invalid params gets initialize",
+			refusal: strconv.Itoa(codeInvalidParams),
+			status:  http.StatusOK,
+		},
+		{
+			name:    "child that reports a code JSON-RPC does not define gets initialize",
+			refusal: strconv.Itoa(codeUndefined),
+			status:  http.StatusOK,
+		},
+		{
+			name:    "child that refuses with a revision code is unavailable",
+			refusal: strconv.Itoa(protocol.CodeUnsupportedProtocolVersion),
+			status:  http.StatusBadGateway,
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			h := newHarness(t, Options{Env: tc.env})
+			h := newHarness(t, Options{Env: []string{fakeChildDiscover + "=" + tc.refusal}})
 			response := h.do(t, call{subject: "alice", protocol: stateless, body: statelessBody(1, "tools/list", "")})
 			defer response.Body.Close()
-			if response.StatusCode != http.StatusOK {
-				t.Fatalf("expected 200, got %d", response.StatusCode)
+
+			if response.StatusCode != tc.status {
+				t.Fatalf("expected %d, got %d", tc.status, response.StatusCode)
+			}
+			if tc.status != http.StatusOK {
+				return
 			}
 			message := decodeMessage(t, response)
 			result, _ := message["result"].(map[string]any)
@@ -223,21 +328,31 @@ func TestStatelessHandshakeAcrossEras(t *testing.T) {
 	}
 }
 
-// Only the method-unknown code says a child predates the revision. Any other
-// failure of a method the revision makes mandatory says nothing about its era,
-// so the child is reported unavailable rather than handshaken as a guess.
-func TestStatelessHandshakeRefusesABrokenDiscover(t *testing.T) {
-	h := newHarness(t, Options{Env: []string{fakeChildDiscoverBroken + "=1"}})
-	response := h.do(t, call{subject: "alice", protocol: stateless, body: statelessBody(1, "tools/list", "")})
-	defer response.Body.Close()
-
-	if response.StatusCode != http.StatusBadGateway {
-		t.Fatalf("expected 502, got %d", response.StatusCode)
+// The probe carries the caller's version and capabilities in _meta. A server
+// that implements server/discover reads them, and answers a probe without them
+// as though the method itself were unknown, which reads back as the legacy
+// answer and misclassifies the era.
+func TestStatelessProbeCarriesMeta(t *testing.T) {
+	params := discoverParams()
+	meta, ok := params["_meta"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected _meta on the probe, got %v", params)
+	}
+	if version := meta[protocol.MetaProtocolVersion]; version != string(protocol.Rev20260728) {
+		t.Errorf("expected the probe to declare %q, got %v", protocol.Rev20260728, version)
+	}
+	if _, ok := meta[protocol.MetaClientCapabilities]; !ok {
+		t.Errorf("expected the probe to declare client capabilities, got %v", meta)
 	}
 }
 
 // subscriptions/listen is the one response held open, so it must escape the
 // exchange timeout and carry the child's notifications as they arrive.
+//
+// The child acknowledges with a notification and answers the request only to
+// end the subscription, so a transport that waited for that answer before
+// writing any headers would hold every conforming child past the deadline and
+// then refuse it. The timeout here is far shorter than the stream lives.
 func TestStatelessSubscriptionStream(t *testing.T) {
 	h := newHarness(t, Options{RequestTimeout: 500 * time.Millisecond})
 
@@ -256,8 +371,8 @@ func TestStatelessSubscriptionStream(t *testing.T) {
 	}
 
 	events := readEvents(t, response, 4)
-	if id, _ := events[0]["id"].(string); id != "listen-1" {
-		t.Errorf("expected the acknowledgement to carry the caller's id, got %v", events[0]["id"])
+	if method, _ := events[0]["method"].(string); method != "notifications/subscriptions/acknowledged" {
+		t.Errorf("expected the acknowledgement first, got %v", events[0])
 	}
 	for i, event := range events[1:] {
 		if method, _ := event["method"].(string); method != "notifications/message" {
@@ -267,6 +382,27 @@ func TestStatelessSubscriptionStream(t *testing.T) {
 		if seq, ok := params["seq"].(float64); !ok || int(seq) != i {
 			t.Errorf("expected notification %d, got %v", i, params["seq"])
 		}
+	}
+}
+
+// The child answers the listen request to end the subscription, and that answer
+// closes the stream carrying the caller's own id rather than the minted one it
+// was correlated on.
+func TestStatelessSubscriptionEnds(t *testing.T) {
+	h := newHarness(t, Options{RequestTimeout: 500 * time.Millisecond})
+
+	body := statelessBody("listen-1", listenMethod, `{"echo":"tick","notify":1,"end":true}`)
+	response := h.do(t, call{subject: "alice", protocol: stateless, body: body})
+	defer response.Body.Close()
+
+	events := readEvents(t, response, 3)
+	final := events[2]
+	if id, _ := final["id"].(string); id != "listen-1" {
+		t.Errorf("expected the final result to carry the caller's id, got %v", final["id"])
+	}
+	result, _ := final["result"].(map[string]any)
+	if ended, _ := result["ended"].(bool); !ended {
+		t.Errorf("expected the child's closing result, got %v", final)
 	}
 }
 

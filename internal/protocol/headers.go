@@ -19,11 +19,6 @@ const (
 	// NameHeader mirrors params.name or params.uri, whichever names the thing
 	// the method acts on.
 	NameHeader = "Mcp-Name"
-	// ParamHeaderPrefix begins the headers a server may ask clients to mirror
-	// individual tool arguments into. tailgate never sees the tool's
-	// inputSchema, so it cannot tell which argument a given one came from and
-	// forwards them untouched, per the RFC 9110 rule for unrecognized fields.
-	ParamHeaderPrefix = "Mcp-Param-"
 	// SessionHeader carried the session identifier through 2025-11-25.
 	SessionHeader = "Mcp-Session-Id"
 )
@@ -70,6 +65,13 @@ const (
 	base64Suffix = "?="
 )
 
+// The params._meta keys this revision carries per-request, in place of the
+// initialize handshake that used to negotiate them once per session.
+const (
+	MetaProtocolVersion    = "io.modelcontextprotocol/protocolVersion"
+	MetaClientCapabilities = "io.modelcontextprotocol/clientCapabilities"
+)
+
 // namedMethods maps each method that must carry Mcp-Name to the params field
 // the header mirrors.
 var namedMethods = map[string]string{
@@ -83,6 +85,11 @@ var namedMethods = map[string]string{
 // forwards both the headers and the body, so it must not pass on a pair that
 // disagree even though the upstream is obliged to check them again.
 //
+// The Mcp-Param-* headers a server may ask clients to mirror tool arguments
+// into are deliberately not checked. tailgate never sees a tool's inputSchema,
+// so it cannot tell which argument a given one restates, and RFC 9110 has it
+// forward an unrecognized field untouched.
+//
 // body must be the complete request body. Callers that have not buffered it
 // cannot run this check, and must not claim to have run it.
 func ValidateMirrored(header http.Header, body []byte) error {
@@ -91,26 +98,33 @@ func ValidateMirrored(header http.Header, body []byte) error {
 		return err
 	}
 
+	method, err := singleHeader(header, MethodHeader)
+	if err != nil {
+		return err
+	}
+	switch {
+	case msg.method == "":
+		// A body carrying an id and no method is neither request nor
+		// notification. Passing it on would hand the upstream a message no
+		// mirrored header describes, which downstream reads as one the
+		// intermediary vouched for.
+		return mismatch(MethodHeader, "body carries no method")
+	case method == "" && !msg.isRequest:
+		// The revision requires the mirrored headers and the per-request
+		// _meta on requests. It states neither for notifications, so an
+		// unmirrored one is left alone rather than refused, and the version
+		// check below does not apply to it either.
+		return nil
+	case method != msg.method:
+		return mismatch(MethodHeader, "header is %q, body method is %q", method, msg.method)
+	}
+
 	version, err := singleHeader(header, VersionHeader)
 	if err != nil {
 		return err
 	}
 	if msg.protocolVersion != version {
 		return mismatch(VersionHeader, "header is %q, body _meta declares %q", version, msg.protocolVersion)
-	}
-
-	method, err := singleHeader(header, MethodHeader)
-	if err != nil {
-		return err
-	}
-	switch {
-	case method == "" && !msg.isRequest:
-		// This revision defines no client-to-server notifications over
-		// streamable HTTP and states no header requirements for them, so an
-		// unmirrored notification is left alone rather than refused.
-		return nil
-	case method != msg.method:
-		return mismatch(MethodHeader, "header is %q, body method is %q", method, msg.method)
 	}
 
 	field, named := namedMethods[msg.method]

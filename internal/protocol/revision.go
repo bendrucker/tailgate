@@ -21,6 +21,7 @@ package protocol
 import (
 	"errors"
 	"fmt"
+	"slices"
 )
 
 // Revision is an MCP protocol revision, spelled as the dated string that
@@ -48,26 +49,24 @@ const Assumed = Rev20250326
 // Proxying it would hand an upstream a dialect neither end agreed to.
 var ErrUnsupportedRevision = errors.New("protocol: unsupported MCP revision")
 
-var supported = map[Revision]bool{
-	Rev20241105: true,
-	Rev20250326: true,
-	Rev20250618: true,
-	Rev20251125: true,
-	Rev20260728: true,
-}
-
-// Supported lists the recognized revisions oldest first. It is the set an
-// UnsupportedProtocolVersionError reports back to a client.
+// Supported lists the recognized revisions oldest first. It is the single
+// enumeration: [Parse] accepts a value only if it appears here, so what
+// tailgate advertises and what it accepts cannot drift apart.
 var Supported = []Revision{Rev20241105, Rev20250326, Rev20250618, Rev20251125, Rev20260728}
 
+// LastHandshake is the newest revision that still opened with an initialize
+// handshake. It is the version tailgate offers a stdio child that predates
+// [Rev20260728] and therefore expects one.
+const LastHandshake = Rev20251125
+
 // Parse resolves an MCP-Protocol-Version header value. An empty value is
-// [Assumed]; anything unrecognized is an error rather than a passthrough.
+// [Assumed]. Anything unrecognized is an error rather than a passthrough.
 func Parse(value string) (Revision, error) {
 	if value == "" {
 		return Assumed, nil
 	}
 	revision := Revision(value)
-	if !supported[revision] {
+	if !slices.Contains(Supported, revision) {
 		return "", fmt.Errorf("%w: %q", ErrUnsupportedRevision, value)
 	}
 	return revision, nil

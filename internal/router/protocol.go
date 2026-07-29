@@ -2,6 +2,7 @@ package router
 
 import (
 	"net/http"
+	"strings"
 
 	"github.com/bendrucker/tailgate/internal/protocol"
 )
@@ -20,17 +21,29 @@ import (
 // caller learns nothing about the upstream's protocol from the shape of the
 // refusal.
 func (rt *Router) checkProtocol(rec *responseRecorder, r *http.Request, up *upstream, body []byte) bool {
+	declared := r.Header.Values(protocol.VersionHeader)
+	if len(declared) > 1 {
+		// Which copy an intermediary downstream reads is not decidable here,
+		// and resolving the revision from the first would let a caller name a
+		// revision with no mirroring rules while the upstream reads the last
+		// one and executes under them.
+		rt.logger.Warn("request declares more than one protocol revision", "upstream", up.name)
+		protocol.WriteUnsupportedVersion(rec, strings.Join(declared, ", "))
+		return false
+	}
+
 	revision, err := protocol.Parse(r.Header.Get(protocol.VersionHeader))
 	if err != nil {
 		rt.logger.Debug("unsupported protocol revision", "upstream", up.name, "err", err)
 		protocol.WriteUnsupportedVersion(rec, r.Header.Get(protocol.VersionHeader))
 		return false
 	}
-	if !revision.MirrorsHeaders() || len(body) == 0 {
+	if !revision.MirrorsHeaders() || r.Method != http.MethodPost {
 		// The mirroring contract is about a POST body. A request without one
 		// carries no pair that can disagree, and refusing it here would answer
 		// a stateless GET or DELETE with a mismatch instead of the 405 the
-		// transport owes it.
+		// transport owes it. A POST is held to the contract whether or not it
+		// carried a body, since an empty one backs no header either.
 		return true
 	}
 	if err := protocol.ValidateMirrored(r.Header, body); err != nil {

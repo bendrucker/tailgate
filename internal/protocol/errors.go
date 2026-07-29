@@ -6,13 +6,36 @@ import (
 	"net/http"
 )
 
-// JSON-RPC error codes this revision defines, allocated from the -32020 to
-// -32099 sub-range the MCP specification reserves for itself.
+// The sub-range the MCP specification reserves for the codes it defines,
+// allocated sequentially from the top.
+const (
+	revisionCodeFirst = -32020
+	revisionCodeLast  = -32099
+)
+
+// JSON-RPC error codes this revision defines, allocated from the reserved
+// sub-range above.
 const (
 	// CodeUnsupportedProtocolVersion reports a revision the server does not
 	// implement. Its data carries the revisions it does.
 	CodeUnsupportedProtocolVersion = -32022
 )
+
+// The codes JSON-RPC 2.0 itself defines, for refusals that are not about a
+// revision. A client probing for the server's era recognizes these too, so a
+// refusal carrying one reads as a refusal rather than as an older server.
+const (
+	CodeParseError     = -32700
+	CodeInvalidRequest = -32600
+)
+
+// IsRevisionError reports whether a JSON-RPC error code is one the MCP
+// specification defines, which only a server implementing the revision can
+// produce. Everything outside the reserved range is a generic JSON-RPC error
+// that says nothing about which revision the peer speaks.
+func IsRevisionError(code int) bool {
+	return code <= revisionCodeFirst && code >= revisionCodeLast
+}
 
 // errorResponse is a JSON-RPC error response. The id is always null: every
 // error tailgate originates is a refusal of a message it declined to act on,

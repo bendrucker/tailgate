@@ -2,11 +2,13 @@ package stdiotransport
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"time"
 
 	"github.com/bendrucker/tailgate/internal/auth"
+	"github.com/bendrucker/tailgate/internal/protocol"
 	"github.com/bendrucker/tailgate/internal/proxy"
 )
 
@@ -23,21 +25,22 @@ const (
 	discoverMethod = "server/discover"
 )
 
-// handshakeVersion is the revision tailgate opens with toward a child that
-// turns out to predate the stateless era. It is the newest revision that had
-// an initialize handshake at all, and the child answers with whichever version
-// it actually chose.
-const handshakeVersion = "2025-11-25"
-
-// codeMethodNotFound is the JSON-RPC code a child returns for a method it does
-// not implement, which is what tells the era probe it is talking to a
-// pre-2026-07-28 server.
-const codeMethodNotFound = -32601
-
 // clientInfo identifies tailgate to a child that expects an initialize
-// handshake. The child is talking to tailgate, not to the caller: nothing
-// about the caller crosses this boundary.
+// handshake. The child is talking to tailgate rather than to the caller.
 var clientInfo = map[string]any{"name": "tailgate", "version": "0"}
+
+// discoverParams carries what the revision expects on the era probe. A server
+// that does implement server/discover reads its caller's version and
+// capabilities out of _meta, and answers a probe that omits them as though the
+// method itself were unknown, which reads back as the legacy answer.
+func discoverParams() map[string]any {
+	return map[string]any{
+		"_meta": map[string]any{
+			protocol.MetaProtocolVersion:    string(protocol.Rev20260728),
+			protocol.MetaClientCapabilities: map[string]any{},
+		},
+	}
+}
 
 // statelessChild is one identity's child, and the in-progress attempt to start
 // it. Concurrent first requests from one caller wait on the same attempt
@@ -59,7 +62,7 @@ type statelessChild struct {
 func (t *Transport) serveStateless(w http.ResponseWriter, r *http.Request, inflight *proxy.InFlight, identity auth.Identity, msg message) {
 	s, err := t.statelessSession(r.Context(), identity)
 	if err != nil {
-		if err == proxy.ErrCapExceeded {
+		if errors.Is(err, proxy.ErrCapExceeded) {
 			t.audit.Deny(r.Context(), identity, t.options.Name, ReasonSessionCap)
 		}
 		t.writeError(w, err)
@@ -68,6 +71,15 @@ func (t *Transport) serveStateless(w http.ResponseWriter, r *http.Request, infli
 	defer s.finish()
 
 	if !msg.IsRequest() {
+		// Only a notification reaches the child unmodified. A message carrying
+		// a correlation key but no method is neither request nor notification,
+		// and forwarding it verbatim would put a caller-chosen id into the
+		// namespace s.request mints from, where the child's answer to it would
+		// satisfy another request's pending wait.
+		if msg.Key != "" {
+			t.writeError(w, errInvalidMessage)
+			return
+		}
 		if err := s.send(msg.Line, t.options.RequestTimeout); err != nil {
 			t.refuse(w, s, err)
 			return
@@ -87,6 +99,24 @@ func (t *Transport) serveStateless(w http.ResponseWriter, r *http.Request, infli
 		return
 	}
 	writeJSON(w, response)
+}
+
+// drainNotifications writes whatever the stream has already buffered, and
+// reports whether it may carry anything further.
+func drainNotifications(stream *eventStream, l *listener) bool {
+	for {
+		select {
+		case notification, open := <-l.notifications:
+			if !open {
+				return false
+			}
+			if err := stream.send(notification); err != nil {
+				return false
+			}
+		default:
+			return true
+		}
+	}
 }
 
 // statelessSession resolves the caller's child, starting it on first use.
@@ -147,9 +177,9 @@ func (t *Transport) startStateless(entry *statelessChild, identity auth.Identity
 		}
 	}
 
-	// Publishing before the failed entry is retired would let a waiter adopt a
-	// child that never started, so the map is settled first and the fields the
-	// waiters read are written before ready closes.
+	// A failed entry leaves the map before ready closes, and the fields the
+	// waiters read are written before it too, so no waiter can wake onto a
+	// child that never started.
 	t.mu.Lock()
 	if err != nil && t.stateless[identity.Subject] == entry {
 		delete(t.stateless, identity.Subject)
@@ -168,21 +198,22 @@ func (t *Transport) startStateless(entry *statelessChild, identity auth.Identity
 
 // handshake settles which era the child speaks and leaves it ready to serve.
 //
-// The probe is server/discover, which the revision defines for exactly this:
-// a child that answers it needs nothing further, and one that reports the
-// method unknown predates the revision and still expects initialize. tailgate
-// runs that handshake on the caller's behalf, because a stateless client will
-// never send one.
+// The probe is server/discover, which the revision defines for exactly this.
+// A child that answers it needs nothing further. tailgate runs the older
+// handshake on the caller's behalf for one that does not, because a stateless
+// client will never send one.
 //
-// Any other error code is a child that recognizes a method the revision makes
-// mandatory and failed at it, which says nothing about its era. Running the
-// pre-stateless handshake against it would pick an era from a failure, so the
-// upstream is reported unavailable instead.
+// The fallback turns on whether the refusal is a code the revision itself
+// defines, never on one specific code. A legacy child has no notion of the
+// method and refuses however its runtime happens to: the SDKs answer -32601,
+// -32602, or a code JSON-RPC does not define at all, and the revision forbids
+// keying the fallback to any single one of them. Only a code from the reserved
+// range identifies a child that implements the revision and declined anyway.
 func (t *Transport) handshake(s *session) error {
 	ctx, cancel := context.WithTimeout(context.Background(), t.options.RequestTimeout)
 	defer cancel()
 
-	response, err := s.call(ctx, discoverMethod, map[string]any{}, t.options.RequestTimeout)
+	response, err := s.call(ctx, discoverMethod, discoverParams(), t.options.RequestTimeout)
 	if err != nil {
 		return err
 	}
@@ -191,10 +222,10 @@ func (t *Transport) handshake(s *session) error {
 	case !isError:
 		s.logger.Debug("stdio child answered server/discover")
 		return nil
-	case code != codeMethodNotFound:
-		return fmt.Errorf("%w: stdio child failed server/discover with code %d", proxy.ErrUpstreamUnavailable, code)
+	case protocol.IsRevisionError(code):
+		return fmt.Errorf("%w: stdio child refused server/discover with revision error %d", proxy.ErrUpstreamUnavailable, code)
 	}
-	s.logger.Debug("stdio child does not know server/discover, so it predates the stateless era")
+	s.logger.Debug("stdio child refused server/discover, so it predates the stateless era", "code", code)
 	return t.initialize(ctx, s)
 }
 
@@ -202,7 +233,7 @@ func (t *Transport) handshake(s *session) error {
 // it will answer anything.
 func (t *Transport) initialize(ctx context.Context, s *session) error {
 	response, err := s.call(ctx, initializeMethod, map[string]any{
-		"protocolVersion": handshakeVersion,
+		"protocolVersion": string(protocol.LastHandshake),
 		"capabilities":    map[string]any{},
 		"clientInfo":      clientInfo,
 	}, t.options.RequestTimeout)
@@ -220,34 +251,46 @@ func (t *Transport) initialize(ctx context.Context, s *session) error {
 }
 
 // serveListen answers subscriptions/listen with the SSE stream that carries
-// the child's notifications until the caller goes away.
+// the child's notifications until the subscription ends.
 //
 // This is the one response the transport holds open, so it is the one exempt
-// from the request timeout: the timeout bounds an exchange, and a subscription
-// has no end to wait for. The stream is unbuffered all the way out, since a
-// notification held back is a notification that arrived late for no reason.
+// from the request timeout. The acknowledgement the child sends first is a
+// notification and rides the stream like any other, and the JSON-RPC response
+// is what ends the subscription rather than what opens it. Waiting for that
+// response before writing any headers would hold every conforming child past
+// the exchange deadline and then refuse it. Registering the stream before the
+// request goes out is what keeps a notification the child emits immediately
+// after from falling between the two.
 func (t *Transport) serveListen(w http.ResponseWriter, inflight *proxy.InFlight, s *session, msg message) {
-	l, release := s.listen()
-	defer release()
+	l, unlisten := s.listen()
+	defer unlisten()
 
-	// The acknowledgement is an ordinary exchange, and registering the stream
-	// before it goes out is what keeps a notification the child emits
-	// immediately after from falling between the two.
-	ack, err := s.request(inflight.Context(), msg, t.options.RequestTimeout)
+	ended, release, err := s.subscribe(msg, t.options.RequestTimeout)
 	if err != nil {
 		t.refuse(w, s, err)
 		return
 	}
+	defer release()
 
 	stream := newEventStream(w)
-	if err := stream.send(ack); err != nil {
-		return
-	}
-
 	keepAlive := time.NewTicker(keepAliveInterval)
 	defer keepAlive.Stop()
 	for {
 		select {
+		case final := <-ended:
+			// The child wrote the closing result after whatever it had already
+			// emitted, but both arrive here on separate channels, so the queued
+			// notifications go out first rather than losing a select race to
+			// the message that ends the stream.
+			if !drainNotifications(stream, l) {
+				return
+			}
+			restored, err := setID(final, msg.ID)
+			if err != nil {
+				return
+			}
+			_ = stream.send(restored)
+			return
 		case notification, open := <-l.notifications:
 			if !open {
 				if s.overflowedStream(l) {

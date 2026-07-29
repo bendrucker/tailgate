@@ -257,6 +257,10 @@ func (t *Transport) servePost(w http.ResponseWriter, r *http.Request, inflight *
 	}
 
 	if revision.Stateless() {
+		if !t.ownsPresentedSession(r, identity) {
+			t.writeError(w, proxy.ErrSessionNotFound)
+			return
+		}
 		t.serveStateless(w, r, inflight, identity, msg)
 		return
 	}
@@ -417,6 +421,31 @@ func (t *Transport) serveDelete(w http.ResponseWriter, r *http.Request, identity
 // the idle reaper decides under the same lock, so a session either is claimed
 // before the sweep sees it or has already left the table, and a request that
 // loses that race reports a missing session rather than a broken child.
+// ownsPresentedSession reports whether a caller may proceed with whatever
+// session id it presented, and records a denial when it may not.
+//
+// The stateless revision ignores the session header, but the binding follows
+// the header rather than the declared revision: letting a caller shed the check
+// by naming the revision that dropped the header would make a stdio session
+// probe invisible, and this transport's own refusal is the only record of one.
+// A caller presenting nothing, or its own id, proceeds.
+func (t *Transport) ownsPresentedSession(r *http.Request, identity auth.Identity) bool {
+	id := r.Header.Get(sessionHeader)
+	if id == "" {
+		return true
+	}
+	t.mu.Lock()
+	s, ok := t.sessions[id]
+	foreign := ok && s.subject != identity.Subject
+	t.mu.Unlock()
+	if !foreign {
+		return true
+	}
+	t.logger.Warn("stdio session presented by another identity", "session", id, "sub", identity.Subject)
+	t.audit.Deny(r.Context(), identity, t.options.Name, ReasonSessionBound)
+	return false
+}
+
 func (t *Transport) sessionFor(ctx context.Context, id string, identity auth.Identity) (*session, error) {
 	if id == "" {
 		return nil, errMissingSessionID
@@ -717,6 +746,14 @@ func (t *Transport) writeError(w http.ResponseWriter, err error) {
 	}
 	status := statusOf(err)
 	t.logger.Warn("stdio request refused", "status", status, "err", err)
+	if status == http.StatusBadRequest {
+		// A 400 whose body is not a recognized JSON-RPC error is what tells a
+		// client probing for the server's era that it predates the stateless
+		// revision, so a refusal in bare text would talk the caller into
+		// retrying with the handshake this transport no longer offers it.
+		protocol.WriteError(w, status, protocol.CodeInvalidRequest, http.StatusText(status), nil)
+		return
+	}
 	http.Error(w, http.StatusText(status), status)
 }
 

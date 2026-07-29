@@ -57,11 +57,11 @@ func TestRevisionEras(t *testing.T) {
 		stateless bool
 		mirrors   bool
 	}{
-		{name: "2024-11-05", revision: Rev20241105},
-		{name: "2025-03-26", revision: Rev20250326},
-		{name: "2025-06-18", revision: Rev20250618},
-		{name: "2025-11-25", revision: Rev20251125},
-		{name: "2026-07-28", revision: Rev20260728, stateless: true, mirrors: true},
+		{name: "first revision predates the session header", revision: Rev20241105},
+		{name: "streamable http arrives stateful", revision: Rev20250326},
+		{name: "version header arrives stateful", revision: Rev20250618},
+		{name: "last stateful revision", revision: Rev20251125},
+		{name: "sessions and handshake removed", revision: Rev20260728, stateless: true, mirrors: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := tc.revision.Stateless(); got != tc.stateless {

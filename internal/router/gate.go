@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/bendrucker/tailgate/internal/auth"
+	"github.com/bendrucker/tailgate/internal/protocol"
 	"github.com/bendrucker/tailgate/internal/resource"
 )
 
@@ -152,7 +153,7 @@ func (rt *Router) limitBody(rec *responseRecorder, r *http.Request) ([]byte, boo
 			return nil, false
 		}
 		rt.logger.Debug("read request body", "err", err)
-		http.Error(rec, "bad request", http.StatusBadRequest)
+		protocol.WriteError(rec, http.StatusBadRequest, protocol.CodeParseError, "Could not read the request body", nil)
 		return nil, false
 	}
 	r.Body = io.NopCloser(bytes.NewReader(body))

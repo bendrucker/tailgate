@@ -57,7 +57,7 @@ const (
 	// PathPrefix is the path prefix every upstream is addressed under.
 	PathPrefix = "/mcp/"
 	// SessionHeader carries the MCP session identifier in both directions. It
-	// belongs to the revisions through 2025-11-25; 2026-07-28 removed it.
+	// belongs to the revisions through 2025-11-25. 2026-07-28 removed it.
 	SessionHeader = protocol.SessionHeader
 	// IdentityHeaderPrefix is proxy.IdentityHeaderPrefix, the prefix reserved
 	// for headers tailgate sets about the caller.

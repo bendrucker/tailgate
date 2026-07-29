@@ -2,12 +2,15 @@ package protocol
 
 import (
 	"errors"
+	"fmt"
 	"net/http"
 	"testing"
 )
 
 // meta is the _meta block every 2026-07-28 request body carries.
-const meta = `"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28"}`
+// Built from the exported key rather than a literal, so the constant callers
+// declare the version with and the tag the parser reads it from cannot drift.
+var meta = fmt.Sprintf(`"_meta":{%q:%q}`, MetaProtocolVersion, Rev20260728)
 
 func TestValidateMirrored(t *testing.T) {
 	for _, tc := range []struct {
@@ -140,6 +143,28 @@ func TestValidateMirrored(t *testing.T) {
 				VersionHeader: {"2026-07-28"},
 			},
 			body: `{"jsonrpc":"2.0","method":"notifications/cancelled","params":{` + meta + `}}`,
+		},
+		{
+			name: "notification carries no protocol version to mirror",
+			headers: map[string][]string{
+				VersionHeader: {"2026-07-28"},
+			},
+			body: `{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":"x"}}`,
+		},
+		{
+			name: "notification with no params at all",
+			headers: map[string][]string{
+				VersionHeader: {"2026-07-28"},
+			},
+			body: `{"jsonrpc":"2.0","method":"notifications/cancelled"}`,
+		},
+		{
+			name: "body carries an id and no method",
+			headers: map[string][]string{
+				VersionHeader: {"2026-07-28"},
+			},
+			body: `{"jsonrpc":"2.0","id":"tailgate-3","params":{` + meta + `},"result":{}}`,
+			err:  ErrHeaderMismatch,
 		},
 		{
 			name: "malformed base64 sentinel",

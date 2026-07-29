@@ -218,29 +218,46 @@ func (s *session) logStderr(stderr io.Reader) {
 // POSTs may both call themselves id 1, and correlating on the caller's id
 // would let either take the other's answer.
 func (s *session) request(ctx context.Context, msg message, timeout time.Duration) ([]byte, error) {
-	minted := s.mintID()
-	line, err := setID(msg.Line, json.RawMessage(strconv.Quote(minted)))
+	line, key, err := s.substitute(msg.Line)
 	if err != nil {
 		return nil, err
 	}
-	response, err := s.exchange(ctx, message{Line: line, Method: msg.Method, Key: "s:" + minted}, timeout)
+	response, err := s.exchange(ctx, message{Line: line, Method: msg.Method, Key: key}, timeout)
 	if err != nil {
 		return nil, err
 	}
 	return setID(response, msg.ID)
 }
 
-// mintID returns an id no caller can collide with, since a caller's id reaches
-// the child only after this substitution.
-func (s *session) mintID() string {
-	return "tailgate-" + strconv.FormatUint(s.ids.Add(1), 10)
+// mintID returns an id no caller can collide with, and the correlation key for
+// it, so the two are always derived together.
+//
+// A caller's id reaches the child only after substitution, which is what makes
+// a stateless revision safe to serve: without the session that used to give one
+// caller a single id space, two independent POSTs may both call themselves id
+// 1, and correlating on the caller's id would let either take the other's
+// answer.
+func (s *session) mintID() (json.RawMessage, string) {
+	id := json.RawMessage(strconv.Quote("tailgate-" + strconv.FormatUint(s.ids.Add(1), 10)))
+	return id, correlationKey(id)
+}
+
+// substitute rewrites a caller's message under a minted id and reports the key
+// its answer will correlate on.
+func (s *session) substitute(line []byte) ([]byte, string, error) {
+	minted, key := s.mintID()
+	rewritten, err := setID(line, minted)
+	if err != nil {
+		return nil, "", err
+	}
+	return rewritten, key, nil
 }
 
 // call issues a request tailgate originates on its own behalf rather than one
 // it carries for a caller, which is how the child's era is settled before any
 // caller's message reaches it.
 func (s *session) call(ctx context.Context, method string, params any, timeout time.Duration) ([]byte, error) {
-	minted := s.mintID()
+	minted, key := s.mintID()
 	line, err := json.Marshal(map[string]any{
 		"jsonrpc": jsonrpcVersion,
 		"id":      minted,
@@ -250,7 +267,42 @@ func (s *session) call(ctx context.Context, method string, params any, timeout t
 	if err != nil {
 		return nil, errInvalidMessage
 	}
-	return s.exchange(ctx, message{Line: line, Method: method, Key: "s:" + minted}, timeout)
+	return s.exchange(ctx, message{Line: line, Method: method, Key: key}, timeout)
+}
+
+// subscribe carries a caller's request to the child without waiting for its
+// answer, and reports the channel that answer will arrive on.
+//
+// It exists for the one method whose response completes the stream rather than
+// the request: the send is bounded by timeout, but the answer may not come for
+// as long as the subscription lasts, so the wait belongs to the handler
+// relaying the stream rather than to an exchange deadline. release must run
+// when that handler returns.
+func (s *session) subscribe(msg message, timeout time.Duration) (<-chan []byte, func(), error) {
+	line, key, err := s.substitute(msg.Line)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	waiter := make(chan []byte, 1)
+	s.mu.Lock()
+	if _, duplicate := s.pending[key]; duplicate {
+		s.mu.Unlock()
+		return nil, nil, errDuplicateRequestID
+	}
+	s.pending[key] = waiter
+	s.mu.Unlock()
+
+	release := func() {
+		s.mu.Lock()
+		delete(s.pending, key)
+		s.mu.Unlock()
+	}
+	if err := s.send(line, timeout); err != nil {
+		release()
+		return nil, nil, err
+	}
+	return waiter, release, nil
 }
 
 // notify sends a one-way message tailgate originates.

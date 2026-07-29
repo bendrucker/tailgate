@@ -143,15 +143,87 @@ func TestProtocolRefusalsAreJSONRPC(t *testing.T) {
 	}
 }
 
+// Resolving the revision from the first of several version headers would let a
+// caller name one with no mirroring rules while the upstream reads the last and
+// executes under them, so the request is refused rather than raced.
+func TestRepeatedVersionHeaderIsRefused(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		declared []string
+	}{
+		{
+			name:     "legacy revision shadows the modern one",
+			declared: []string{"2025-06-18", string(protocol.Rev20260728)},
+		},
+		{
+			name:     "modern revision shadows the legacy one",
+			declared: []string{string(protocol.Rev20260728), "2025-06-18"},
+		},
+		{
+			name:     "same revision twice",
+			declared: []string{string(protocol.Rev20260728), string(protocol.Rev20260728)},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHarness(t)
+			h.grant("good", "42", "user@example.com", httpUpstream)
+
+			body := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"real-tool",` + statelessMeta + `}}`
+			req := statelessPost("/mcp/"+httpUpstream, "good", body)
+			req.Header.Del(protocol.VersionHeader)
+			for _, declared := range tc.declared {
+				req.Header.Add(protocol.VersionHeader, declared)
+			}
+			req.Header.Set(protocol.MethodHeader, "tools/list")
+			req.Header.Set(protocol.NameHeader, "other-tool")
+
+			resp := h.serve(req)
+			if resp.StatusCode != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400", resp.StatusCode)
+			}
+			if h.httpUp.count() > 0 {
+				t.Error("request reached the upstream")
+			}
+		})
+	}
+}
+
+// An empty POST body backs no mirrored header, so the pair is still held to the
+// contract rather than waved through for carrying nothing.
+func TestEmptyPostBodyIsValidated(t *testing.T) {
+	h := newHarness(t)
+	h.grant("good", "42", "user@example.com", httpUpstream)
+
+	req := httptest.NewRequest(http.MethodPost, "/mcp/"+httpUpstream, nil)
+	req.Header.Set("Authorization", "Bearer good")
+	req.Header.Set(protocol.VersionHeader, string(protocol.Rev20260728))
+	req.Header.Set(protocol.MethodHeader, "tools/call")
+	req.Header.Set(protocol.NameHeader, "anything")
+
+	resp := h.serve(req)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", resp.StatusCode)
+	}
+	if h.httpUp.count() > 0 {
+		t.Error("request reached the upstream")
+	}
+}
+
 // A bodyless request has no pair that can disagree, so it reaches the
 // transport that owes it a 405 rather than being refused as a mismatch.
 func TestBodylessRequestSkipsHeaderValidation(t *testing.T) {
-	for _, method := range []string{http.MethodGet, http.MethodDelete} {
-		t.Run(method, func(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		method string
+	}{
+		{name: "standalone stream request", method: http.MethodGet},
+		{name: "session termination request", method: http.MethodDelete},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
 			h := newHarness(t)
 			h.grant("good", "42", "user@example.com", stdioUpstream)
 
-			req := httptest.NewRequest(method, "/mcp/"+stdioUpstream, nil)
+			req := httptest.NewRequest(tc.method, "/mcp/"+stdioUpstream, nil)
 			req.Header.Set("Authorization", "Bearer good")
 			req.Header.Set(protocol.VersionHeader, string(protocol.Rev20260728))
 
