@@ -9,7 +9,7 @@
 //
 // # Eras
 //
-// Revisions 2025-03-26 through 2025-11-25 are stateful: the client opens with
+// Revisions 2024-11-05 through 2025-11-25 are stateful: the client opens with
 // initialize, the server mints an Mcp-Session-Id, and every later request
 // carries it. Revision 2026-07-28 removed both. Each request stands alone,
 // carrying its own protocol version and client capabilities in the body's
