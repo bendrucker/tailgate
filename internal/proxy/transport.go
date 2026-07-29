@@ -2,15 +2,19 @@
 //
 // # Seam
 //
-// A Transport serves one upstream's MCP endpoint over streamable HTTP
-// (MCP 2025-11-25). The seam is HTTP itself. Expressing the transport as a
-// handler carries every protocol obligation without re-encoding it in a
-// bespoke interface: a POST answered with a single JSON object or an SSE
-// stream, the standalone GET stream, DELETE termination, Last-Event-ID
-// resumption, and Mcp-Session-Id. The HTTP adapter reverse-proxies and
-// preserves the upstream's session and SSE bytes verbatim. The stdio adapter implements the
-// server side of streamable HTTP over a child process, synthesizing session IDs
-// and correlating JSON-RPC messages itself.
+// A Transport serves one upstream's MCP endpoint over streamable HTTP. The
+// seam is HTTP itself. Expressing the transport as a handler carries every
+// protocol obligation without re-encoding it in a bespoke interface, and it is
+// what lets one seam span revisions that disagree about the shape of a
+// session: a POST answered with a single JSON object or an SSE stream, plus
+// whichever of Mcp-Session-Id, DELETE termination, the standalone GET stream,
+// and Last-Event-ID resumption the revision in use still has.
+//
+// The HTTP adapter reverse-proxies and preserves the upstream's session and
+// SSE bytes verbatim, so it carries any revision the upstream itself speaks.
+// The stdio adapter implements the server side of streamable HTTP over a child
+// process, correlating JSON-RPC messages itself and supplying whatever the
+// revision expects of a server that the child has no notion of.
 //
 // # Error taxonomy
 //

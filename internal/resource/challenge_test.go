@@ -22,49 +22,49 @@ func TestChallenge(t *testing.T) {
 		{
 			name:     "bare challenge",
 			upstream: "github",
-			expected: `Bearer resource_metadata="https://tailgate.tail1234.ts.net/.well-known/oauth-protected-resource/mcp/github"`,
+			expected: `Bearer resource_metadata="https://tailgate.tail1234.ts.net/.well-known/oauth-protected-resource/mcp/github", scope="openid email"`,
 		},
 		{
 			name:     "invalid token",
 			upstream: "github",
 			opts:     ChallengeOptions{Error: "invalid_token"},
-			expected: `Bearer resource_metadata="https://tailgate.tail1234.ts.net/.well-known/oauth-protected-resource/mcp/github", error="invalid_token"`,
+			expected: `Bearer resource_metadata="https://tailgate.tail1234.ts.net/.well-known/oauth-protected-resource/mcp/github", scope="openid email", error="invalid_token"`,
 		},
 		{
 			name:     "error with description",
 			upstream: "linear",
 			opts:     ChallengeOptions{Error: "invalid_token", ErrorDescription: "token audience does not include this resource"},
-			expected: `Bearer resource_metadata="https://tailgate.tail1234.ts.net/.well-known/oauth-protected-resource/mcp/linear", error="invalid_token", error_description="token audience does not include this resource"`,
+			expected: `Bearer resource_metadata="https://tailgate.tail1234.ts.net/.well-known/oauth-protected-resource/mcp/linear", scope="openid email", error="invalid_token", error_description="token audience does not include this resource"`,
 		},
 		{
 			name:     "description only",
 			upstream: "linear",
 			opts:     ChallengeOptions{ErrorDescription: "no bearer token"},
-			expected: `Bearer resource_metadata="https://tailgate.tail1234.ts.net/.well-known/oauth-protected-resource/mcp/linear", error_description="no bearer token"`,
+			expected: `Bearer resource_metadata="https://tailgate.tail1234.ts.net/.well-known/oauth-protected-resource/mcp/linear", scope="openid email", error_description="no bearer token"`,
 		},
 		{
 			name:     "quotes escaped",
 			upstream: "github",
 			opts:     ChallengeOptions{ErrorDescription: `token "abc" rejected`},
-			expected: `Bearer resource_metadata="https://tailgate.tail1234.ts.net/.well-known/oauth-protected-resource/mcp/github", error_description="token \"abc\" rejected"`,
+			expected: `Bearer resource_metadata="https://tailgate.tail1234.ts.net/.well-known/oauth-protected-resource/mcp/github", scope="openid email", error_description="token \"abc\" rejected"`,
 		},
 		{
 			name:     "backslash escaped",
 			upstream: "github",
 			opts:     ChallengeOptions{ErrorDescription: `a\b`},
-			expected: `Bearer resource_metadata="https://tailgate.tail1234.ts.net/.well-known/oauth-protected-resource/mcp/github", error_description="a\\b"`,
+			expected: `Bearer resource_metadata="https://tailgate.tail1234.ts.net/.well-known/oauth-protected-resource/mcp/github", scope="openid email", error_description="a\\b"`,
 		},
 		{
 			name:     "header injection dropped",
 			upstream: "github",
 			opts:     ChallengeOptions{Error: "invalid_token\r\nX-Evil: 1", ErrorDescription: "line\none"},
-			expected: `Bearer resource_metadata="https://tailgate.tail1234.ts.net/.well-known/oauth-protected-resource/mcp/github", error="invalid_tokenX-Evil: 1", error_description="lineone"`,
+			expected: `Bearer resource_metadata="https://tailgate.tail1234.ts.net/.well-known/oauth-protected-resource/mcp/github", scope="openid email", error="invalid_tokenX-Evil: 1", error_description="lineone"`,
 		},
 		{
 			name:     "non ascii bytes dropped",
 			upstream: "github",
 			opts:     ChallengeOptions{ErrorDescription: "caf\u00e9 rejected"},
-			expected: `Bearer resource_metadata="https://tailgate.tail1234.ts.net/.well-known/oauth-protected-resource/mcp/github", error_description="caf rejected"`,
+			expected: `Bearer resource_metadata="https://tailgate.tail1234.ts.net/.well-known/oauth-protected-resource/mcp/github", scope="openid email", error_description="caf rejected"`,
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -80,7 +80,7 @@ func TestChallengeOnNonDefaultPort(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewURLs: %v", err)
 	}
-	expected := `Bearer resource_metadata="https://tailgate.tail1234.ts.net:8443/.well-known/oauth-protected-resource/mcp/github"`
+	expected := `Bearer resource_metadata="https://tailgate.tail1234.ts.net:8443/.well-known/oauth-protected-resource/mcp/github", scope="openid email"`
 	if got := urls.Challenge("github", ChallengeOptions{}); got != expected {
 		t.Errorf("expected %s, got %s", expected, got)
 	}

@@ -20,6 +20,7 @@ func TestParseMessage(t *testing.T) {
 			expected: message{
 				Line:   []byte(`{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}`),
 				Method: "tools/list",
+				ID:     json.RawMessage("1"),
 				Key:    "n:1",
 			},
 		},
@@ -29,6 +30,7 @@ func TestParseMessage(t *testing.T) {
 			expected: message{
 				Line:   []byte(`{"jsonrpc":"2.0","id":"abc","method":"tools/list"}`),
 				Method: "tools/list",
+				ID:     json.RawMessage(`"abc"`),
 				Key:    "s:abc",
 			},
 		},
@@ -45,6 +47,7 @@ func TestParseMessage(t *testing.T) {
 			raw:  `{"jsonrpc":"2.0","id":2,"result":{"ok":true}}`,
 			expected: message{
 				Line: []byte(`{"jsonrpc":"2.0","id":2,"result":{"ok":true}}`),
+				ID:   json.RawMessage("2"),
 				Key:  "n:2",
 			},
 		},
@@ -54,13 +57,14 @@ func TestParseMessage(t *testing.T) {
 			expected: message{
 				Line:   []byte(`{"jsonrpc":"2.0","id":3,"method":"ping"}`),
 				Method: "ping",
+				ID:     json.RawMessage("3"),
 				Key:    "n:3",
 			},
 		},
 		{
 			name:      "null id is not a correlatable request",
 			raw:       `{"jsonrpc":"2.0","id":null,"method":"ping"}`,
-			expected:  message{Line: []byte(`{"jsonrpc":"2.0","id":null,"method":"ping"}`), Method: "ping"},
+			expected:  message{Line: []byte(`{"jsonrpc":"2.0","id":null,"method":"ping"}`), Method: "ping", ID: json.RawMessage("null")},
 			wantError: false,
 		},
 		{

@@ -3,12 +3,14 @@ package stdiotransport
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"os"
 	"os/exec"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -60,6 +62,15 @@ type session struct {
 
 	mu      sync.Mutex
 	pending map[string]chan []byte
+	// listeners are the open subscription streams the child's notifications
+	// fan out to. They exist only under a stateless revision, where a
+	// subscriptions/listen response stream is the sole path a server-initiated
+	// notification has back to a client.
+	listeners map[int64]*listener
+	nextKey   int64
+
+	// ids mints the correlation ids tailgate substitutes for a caller's own.
+	ids atomic.Uint64
 
 	lastUsed atomic.Int64
 	active   atomic.Int64
@@ -103,14 +114,15 @@ func (t *Transport) spawn(id string, subject string) (_ *session, err error) {
 	}
 
 	s := &session{
-		id:      id,
-		subject: subject,
-		grace:   t.shutdownGrace,
-		logger:  t.logger.With("session", id, "sub", subject),
-		cmd:     cmd,
-		stdin:   stdin,
-		exited:  make(chan struct{}),
-		pending: make(map[string]chan []byte),
+		id:        id,
+		subject:   subject,
+		grace:     t.shutdownGrace,
+		logger:    t.logger.With("session", id, "sub", subject),
+		cmd:       cmd,
+		stdin:     stdin,
+		exited:    make(chan struct{}),
+		pending:   make(map[string]chan []byte),
+		listeners: make(map[int64]*listener),
 	}
 	s.touch()
 
@@ -123,6 +135,10 @@ func (t *Transport) spawn(id string, subject string) (_ *session, err error) {
 	s.pipes.Add(2)
 	go func() {
 		defer s.pipes.Done()
+		// The child's output is the only source a subscription stream has, so
+		// its end is theirs: the handlers holding them are released here rather
+		// than left waiting on a channel nothing will write to again.
+		defer s.closeAllListeners()
 		if err := s.readMessages(stdout); err != nil {
 			// Nothing can correlate a response any more, so the session is
 			// over. Leaving it registered would strand every later request on
@@ -158,11 +174,16 @@ func (s *session) deliver(line []byte) {
 		s.logger.Warn("stdio child emitted an unparseable message")
 		return
 	}
+	if msg.IsNotification() {
+		s.broadcast(msg.Line)
+		return
+	}
 	if !msg.IsResponse() {
-		// Server-initiated requests and notifications have no HTTP response to
-		// ride on: this transport answers each POST with the single JSON
-		// object the spec allows, so there is no open stream to carry them.
-		s.logger.Debug("dropping unsolicited message from stdio child", "method", msg.Method)
+		// A server-initiated request has no HTTP response to ride on. Revisions
+		// that allowed one carried it on a stream this transport never opens,
+		// and 2026-07-28 removed the direction outright in favor of MRTR, where
+		// the server asks for input inside its own result.
+		s.logger.Debug("dropping server-initiated request from stdio child", "method", msg.Method)
 		return
 	}
 
@@ -187,6 +208,62 @@ func (s *session) logStderr(stderr io.Reader) {
 	for scanner.Scan() {
 		s.logger.Debug("stdio child stderr", "line", scanner.Text())
 	}
+}
+
+// request carries a caller's request to the child under an id tailgate mints,
+// and restores the caller's own id on the answer.
+//
+// Rewriting is what makes a stateless revision safe to serve: without the
+// session that used to give one caller a single id space, two independent
+// POSTs may both call themselves id 1, and correlating on the caller's id
+// would let either take the other's answer.
+func (s *session) request(ctx context.Context, msg message, timeout time.Duration) ([]byte, error) {
+	minted := s.mintID()
+	line, err := setID(msg.Line, json.RawMessage(strconv.Quote(minted)))
+	if err != nil {
+		return nil, err
+	}
+	response, err := s.exchange(ctx, message{Line: line, Method: msg.Method, Key: "s:" + minted}, timeout)
+	if err != nil {
+		return nil, err
+	}
+	return setID(response, msg.ID)
+}
+
+// mintID returns an id no caller can collide with, since a caller's id reaches
+// the child only after this substitution.
+func (s *session) mintID() string {
+	return "tailgate-" + strconv.FormatUint(s.ids.Add(1), 10)
+}
+
+// call issues a request tailgate originates on its own behalf rather than one
+// it carries for a caller, which is how the child's era is settled before any
+// caller's message reaches it.
+func (s *session) call(ctx context.Context, method string, params any, timeout time.Duration) ([]byte, error) {
+	minted := s.mintID()
+	line, err := json.Marshal(map[string]any{
+		"jsonrpc": jsonrpcVersion,
+		"id":      minted,
+		"method":  method,
+		"params":  params,
+	})
+	if err != nil {
+		return nil, errInvalidMessage
+	}
+	return s.exchange(ctx, message{Line: line, Method: method, Key: "s:" + minted}, timeout)
+}
+
+// notify sends a one-way message tailgate originates.
+func (s *session) notify(method string, params any, timeout time.Duration) error {
+	line, err := json.Marshal(map[string]any{
+		"jsonrpc": jsonrpcVersion,
+		"method":  method,
+		"params":  params,
+	})
+	if err != nil {
+		return errInvalidMessage
+	}
+	return s.send(line, timeout)
 }
 
 // exchange sends a request and waits for the child's answer to it.

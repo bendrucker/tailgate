@@ -3,9 +3,9 @@ package resource
 import "strings"
 
 // ChallengeOptions carries the optional RFC 6750 section 3 error parameters on
-// a WWW-Authenticate challenge. The zero value produces a bare challenge,
-// which is what a request carrying no credentials gets: the error parameters
-// describe a token that was presented and rejected.
+// a WWW-Authenticate challenge. The zero value produces a challenge with no
+// error parameters, which is what a request carrying no credentials gets: the
+// error parameters describe a token that was presented and rejected.
 type ChallengeOptions struct {
 	// Error is an RFC 6750 error code, such as invalid_token or
 	// insufficient_scope.
@@ -13,14 +13,32 @@ type ChallengeOptions struct {
 	// ErrorDescription is human-readable detail for the developer of the
 	// calling client. It must not restate the credential that failed.
 	ErrorDescription string
+	// Scope overrides the scopes the challenge asks for. Empty asks for the
+	// ones tailgate always needs.
+	Scope []string
 }
 
 // Challenge builds the WWW-Authenticate value for a 401 on the named upstream.
 // The resource_metadata parameter points at that upstream's metadata document
 // per RFC 9728 section 5.1, which is how an MCP client discovers the
 // authorization server with no prior configuration.
+//
+// The scope parameter states what the client must ask for, which a client
+// otherwise has to be told out of band. It matters here beyond the
+// specification's SHOULD: tsidp omits email from introspection unless the
+// token carries the email scope, and the shipped email-allowlist policy then
+// denies every request from a client that did not request it. Naming the scope
+// in the challenge turns that from an onboarding step into something a client
+// discovers from the refusal itself.
 func (u *URLs) Challenge(name string, opts ChallengeOptions) string {
-	params := []string{"resource_metadata=" + quoteParam(u.MetadataURL(name))}
+	scope := opts.Scope
+	if len(scope) == 0 {
+		scope = scopesSupported
+	}
+	params := []string{
+		"resource_metadata=" + quoteParam(u.MetadataURL(name)),
+		"scope=" + quoteParam(strings.Join(scope, " ")),
+	}
 	if opts.Error != "" {
 		params = append(params, "error="+quoteParam(opts.Error))
 	}

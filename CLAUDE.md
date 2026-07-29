@@ -8,11 +8,12 @@ tailgate is a single Go binary that fronts MCP servers behind Tailscale Funnel, 
 - **Tailscale.** Embedded via `tsnet`. tailgate joins the tailnet as its own node and serves Funnel itself. No dependency on a host `tailscaled`.
 - **Exposure.** Tailscale Funnel. Tailscale terminates TLS. Funnel supports TCP ports 443, 8443, and 10000 only.
 - **Identity.** tsidp is the issuer. Its access tokens are opaque, so validation is RFC 7662 introspection against tsidp over the tailnet. Funnel strips tailnet identity, so the bearer token is the only identity signal.
-- **MCP auth.** tailgate is a spec-compliant OAuth Resource Server (MCP 2025-11-25, the current revision). It serves `/.well-known/oauth-protected-resource`, answers `401` with `WWW-Authenticate`, and validates token audience per RFC 8707. It never forwards the client's token to an upstream.
+- **MCP auth.** tailgate is a spec-compliant OAuth Resource Server. It serves `/.well-known/oauth-protected-resource`, answers `401` with `WWW-Authenticate` naming the required scopes, and validates token audience per RFC 8707. It never forwards the client's token to an upstream.
+- **Protocol revisions.** tailgate speaks every revision from `2024-11-05` through `2026-07-28`, choosing per request from `MCP-Protocol-Version`. It fronts servers and serves clients it does not control, so cutting over to one revision is not available to it. `internal/protocol` is the single place that knows which revision has what.
 - **Routing.** Path prefix `/mcp/<name>`. Each upstream is a distinct protected resource with its own audience, which is its canonical URI.
 - **Authorization.** Claim-match policy. `auth.Identity` carries `sub`, `email`, and the full claim set from introspection. Config ships with email and sub allowlists.
 - **Config.** HuJSON, a list of upstreams plus policy. Reload is process restart for now.
-- **stdio upstreams.** One child process per MCP session, with a concurrency cap and idle reaping.
+- **stdio upstreams.** One child process per MCP session for a stateful caller, one per identity for a stateless one, with a concurrency cap and idle reaping either way.
 - **Audit.** Every allow and deny decision is logged with identity, upstream, and outcome via `log/slog`.
 
 ## Dependencies
@@ -38,28 +39,49 @@ These facts come from research against pinned sources plus an end-to-end proxy t
 - **Tailnet-only endpoints:** `/authorize` (the authorizing browser must be on the tailnet), `/register` (DCR, additionally gated by an `allow_dcr` grant), and the admin UI. Funnel-reachable: `/token`, `/introspect`, `/userinfo`, and the well-known metadata, which correctly omits `registration_endpoint` on Funnel requests.
 - **Lifetimes.** Access and ID tokens 5 minutes, refresh tokens 30 days and single-use. Caching introspection results until `exp` is bounded by the 5-minute lifetime, which is also the staleness window: deleting a client revokes its outstanding tokens immediately, and a cached allow can outlive that by up to the remaining lifetime.
 
-### MCP 2025-11-25, Verified Against the Published Spec
+### MCP, Verified Against the Published Specs
+
+Two eras are live at once, and tailgate serves both. Everything under "Both Eras" holds whatever revision a request declares.
+
+#### Both Eras
 
 - JSON-RPC batching stays removed. Each POST body is a single request, notification, or response.
-- POSTed notifications and responses get `202` with no body. POSTed requests get either one `application/json` object or a `text/event-stream` carrying exactly one response, possibly preceded by server requests and notifications.
+- POSTed notifications get `202` with no body. POSTed requests get either one `application/json` object or a `text/event-stream`.
+- An invalid `Origin` gets `403`.
+- `MCP-Protocol-Version` names the revision. An invalid value gets `400`. A missing header means assume `2025-03-26`, the last revision before the header existed.
+- Client ID metadata documents (CIMD) are the preferred registration mechanism and DCR is deprecated as of `2026-07-28`, so tailnet-side pre-registration of confidential clients remains spec-compliant onboarding.
+
+#### 2025-03-26 through 2025-11-25 (stateful)
+
 - The server mints `Mcp-Session-Id` on the initialize response. Requests missing a required session header get `400`. An unknown or expired session gets `404`, which is what tells the client to re-initialize. `DELETE` terminates a session and may be refused with `405`.
 - The standalone `GET` SSE stream may be refused with `405`. Resumption is always `GET` with `Last-Event-ID`, and replay is per stream, never across streams. Servers may close an SSE connection without terminating the stream (polling), so a proxy must pass `id` and `retry` fields through byte-for-byte and must not treat connection close as stream end.
-- `MCP-Protocol-Version` is required on every request after initialize. Invalid versions get `400`. A missing header means assume `2025-03-26`.
-- An invalid `Origin` gets `403`. Session IDs must be cryptographically random visible ASCII, must never serve as authentication, and should be bound to the authenticated identity, which shapes the stdio transport's synthesized sessions.
-- Client ID metadata documents (CIMD) are new and DCR is demoted to MAY, so tailnet-side pre-registration of confidential clients is spec-compliant onboarding.
+- Session IDs must be cryptographically random visible ASCII, must never serve as authentication, and should be bound to the authenticated identity.
+
+#### 2026-07-28 (stateless)
+
+- Protocol-level sessions and the `initialize` handshake are gone. Every request carries its own protocol version and client capabilities in `params._meta` under `io.modelcontextprotocol/*` keys. `Mcp-Session-Id` and `Last-Event-ID` are ignored, and `GET` and `DELETE` at the MCP endpoint get `405`. Cross-call state is a server-minted handle passed as an ordinary tool argument.
+- Selected body fields are mirrored into HTTP headers so intermediaries can route without parsing bodies. `Mcp-Method` is required on every request, and `Mcp-Name` on `tools/call`, `prompts/get`, and `resources/read`. A value that cannot be plain ASCII is wrapped in the `=?base64?…?=` sentinel. Servers that read the body **MUST** reject a header that disagrees with it, with `400` and JSON-RPC code `-32020`.
+- `Mcp-Param-{Name}` headers mirror tool arguments annotated with `x-mcp-header` in the tool's `inputSchema`. An intermediary that does not recognize one **MUST** forward it and otherwise ignore it. tailgate never sees an `inputSchema`, so every one of these is unrecognized to it.
+- The standalone `GET` stream and `resources/subscribe` are replaced by `subscriptions/listen`, a POST whose response stream stays open. Anything that assumes a POST response completes promptly breaks on it. Servers should emit an SSE comment line as a keep-alive and set `X-Accel-Buffering: no`. There is no resumption, so a broken stream loses its request and the client reissues.
+- `server/discover` is mandatory for servers, and the spec names it the backward-compatibility probe on stdio. A child that answers it is of this era. A child that reports `-32601` predates it and still expects `initialize`.
+- Server-initiated JSON-RPC requests are gone. Sampling, elicitation, and roots now arrive as an `InputRequiredResult` the client answers by retrying the original request (MRTR). Every result carries a `resultType`.
+- A `400` whose body is not a recognized JSON-RPC error tells a probing client the server is of the older era. An intermediary that refuses a modern request with bare text therefore talks its callers into downgrading.
+- Servers **SHOULD** put a `scope` parameter on the `WWW-Authenticate` challenge, and answer an insufficiently scoped token with `403` and `error="insufficient_scope"`.
+- Roots, sampling, and logging are deprecated with a twelve-month window. `ping`, `logging/setLevel`, and `tasks/list` are removed. Tasks moved to an official extension.
 
 ## Packages
 
 `main` joins the tailnet, seeds `resource.URLs` from the node's FQDN, builds the verifier on the tsnet HTTP client, assembles the router, serves Funnel, and drains on signal. The order is forced: nothing serves until every step succeeds.
 
 - `internal/config`: schema and loader. Policy `Match` fields are limited to what introspection returns.
+- `internal/protocol`: the revisions tailgate speaks and what each one puts on the wire. `Parse` resolves `MCP-Protocol-Version`, `Stateless` and `MirrorsHeaders` are the era predicates every other package branches on, and `ValidateMirrored` is the intermediary half of the header contract. `WriteError` answers refusals in JSON-RPC, which is what keeps a modern client from reading a `400` as a reason to downgrade.
 - `internal/resource`: `URLs` is the single canonicalization point, seeded from the tailnet FQDN after join. `ResourceURL(name)` output is the byte-exact string used in the client `resource` param, the tsidp grant, the `aud` check, and each metadata doc. `Handler` serves the RFC 9728 well-known subtree.
 - `internal/auth`: `Identity` and `Decision`, the introspection `Verifier`, the policy `Authorizer`, and identity-in-context helpers for transports and audit.
 - `internal/grant`: builds the `tailscale.com/cap/tsidp` grant from `resource.URLs`, so the resource strings in the tailnet policy come from the same place as the audience tailgate validates. Surfaced as `tailgate grant`. Generating it offline needs `node.tailnet`, which `serve` also checks against the FQDN the join reports.
 - `internal/proxy`: the `Transport` seam is `http.Handler` plus `Shutdown` and `Close`. HTTP semantics are the contract. The seam carries JSON and SSE responses, session headers, and resumption without a bespoke message layer. Sentinel errors plus `StatusOf` are the shared error taxonomy, and `Drain` is the shared refuse-and-wait choreography. The package doc records the lifecycle and drain contract.
 - `internal/proxy/httptransport`: the reverse proxy for HTTP upstreams.
-- `internal/proxy/stdiotransport`: the server side of streamable HTTP over a child process per session, with session ids bound to the caller, JSON-RPC correlation, a per-identity-per-upstream cap, and idle reaping.
-- `internal/router`: the public handler. Exact-segment routing, auth ahead of every transport, session binding, `Origin` validation, body limits, header stripping, identity injection, and panic recovery.
+- `internal/proxy/stdiotransport`: the server side of streamable HTTP over a child process, with JSON-RPC correlation, a per-identity-per-upstream cap, and idle reaping. A stateful caller gets a child per session with the session id bound to it. A stateless caller gets a child per identity, whose era the transport settles with `server/discover` and whose `initialize` handshake it runs itself when the child predates the revision. Caller JSON-RPC ids are substituted for minted ones on that path, since independent POSTs collide. `subscriptions/listen` is the one response held open, so it is the one exempt from the exchange timeout.
+- `internal/router`: the public handler. Exact-segment routing, auth ahead of every transport, session binding, `Origin` validation, body limits, mirrored-header validation, header stripping, identity injection, and panic recovery.
 - `internal/tsnetserver`: the embedded node, the `FQDN` that seeds `resource.URLs`, and the Funnel listener.
 - `internal/audit`: structured decision log.
 
@@ -68,7 +90,7 @@ These facts come from research against pinned sources plus an end-to-end proxy t
 - Grant the `funnel` node attribute to tailgate's node.
 - Configure the tsidp app-capability grant (`tailscale.com/cap/tsidp`) to authorize each upstream's resource URI. Grant strings must byte-match `ResourceURL` output.
 - Register each MCP client as a confidential client (tailnet-side, since DCR and the admin UI are tailnet-only) and instruct it to send `resource` on the token request.
-- Clients must request the `email` scope: introspection omits `email` without it, and the shipped email-allowlist policy then denies every request from that client.
+- Clients must request the `email` scope: introspection omits `email` without it, and the shipped email-allowlist policy then denies every request from that client. The `401` challenge and the metadata document both name the scope, so a client that reads either discovers this without being told.
 
 ## Conventions
 
@@ -87,7 +109,9 @@ tailgate is an internet-facing boundary where a validation gap is a remote explo
 - **Auth precedes spawn.** Token verify and the authz decision gate session creation. A stdio child is never spawned before authorization. The concurrency cap is per-identity-per-upstream, not global, so one caller cannot starve others.
 - **Recover middleware.** A panic in the request path returns 500 and never proceeds to an upstream.
 - **Origin validation.** Validate `Origin` against DNS rebinding, since tailgate is internet-facing via Funnel. Invalid origins get 403.
-- **Timeouts.** Set `ReadHeaderTimeout` against Slowloris and `MaxBytesReader` on POST bodies. Exempt SSE streams from the request timeout, which is why timeout policy lives on the seam, not on a blanket `http.Server` setting.
+- **Timeouts.** Set `ReadHeaderTimeout` against Slowloris and `MaxBytesReader` on POST bodies. Exempt SSE streams from the request timeout, which is why timeout policy lives on the seam rather than a blanket `http.Server` setting.
+- **Header and body agree.** Where a revision mirrors body fields into headers, refuse a request whose pair disagree. tailgate is the intermediary those rules exist to constrain: routing on the header while the upstream executes on the body is how one request becomes two.
+- **Session binding follows the header.** Bind any `Mcp-Session-Id` a caller presents, whatever revision the request declares. Gating the binding on the declared revision would let a caller shed it by claiming the revision that dropped the header.
 
 ## Curation
 

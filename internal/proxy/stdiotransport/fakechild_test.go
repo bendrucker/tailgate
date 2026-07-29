@@ -19,6 +19,10 @@ const (
 	fakeChildGrandchild = "TAILGATE_STDIO_FAKE_CHILD_GRANDCHILD"
 	fakeChildExitOnly   = "TAILGATE_STDIO_FAKE_CHILD_EXIT_ON_START"
 	fakeChildSilent     = "TAILGATE_STDIO_FAKE_CHILD_SILENT"
+	// fakeChildDiscovers makes the child answer server/discover, standing in
+	// for a server written against the stateless revision. Unset, it reports
+	// the method unknown, which is what every server written before it does.
+	fakeChildDiscovers = "TAILGATE_STDIO_FAKE_CHILD_DISCOVERS"
 )
 
 // Methods the fake child answers specially. Every other method echoes back.
@@ -60,6 +64,9 @@ func runFakeChild() {
 			Params struct {
 				DelayMS int    `json:"delay_ms"`
 				Echo    string `json:"echo"`
+				// Notify asks the child to emit this many notifications after
+				// answering, which is what a subscription stream carries.
+				Notify int `json:"notify"`
 			} `json:"params"`
 		}
 		if err := json.Unmarshal(scanner.Bytes(), &request); err != nil {
@@ -86,6 +93,10 @@ func runFakeChild() {
 				os.Exit(3)
 			case request.Method == initializeMethod:
 				respond(fmt.Sprintf(`{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2025-11-25","capabilities":{"tools":{}},"grandchildPid":%d,"serverInfo":{"name":"fake-stdio-server","version":"0.0.1"}}}`, request.ID, grandchildPid))
+			case request.Method == discoverMethod && os.Getenv(fakeChildDiscovers) == "":
+				respond(fmt.Sprintf(`{"jsonrpc":"2.0","id":%s,"error":{"code":%d,"message":"Method not found"}}`, request.ID, codeMethodNotFound))
+			case request.Method == discoverMethod:
+				respond(fmt.Sprintf(`{"jsonrpc":"2.0","id":%s,"result":{"protocolVersions":["2026-07-28"],"serverInfo":{"name":"fake-stdio-server","version":"0.0.1"}}}`, request.ID))
 			case request.Method == envMethod:
 				// The echo param names the variable to report.
 				respond(fmt.Sprintf(`{"jsonrpc":"2.0","id":%s,"result":{"value":%q}}`, request.ID, os.Getenv(request.Params.Echo)))
@@ -95,6 +106,9 @@ func runFakeChild() {
 				respond(fmt.Sprintf(`{"jsonrpc":"2.0","id":%s,"result":{"blob":%q}}`, request.ID, strings.Repeat("x", maxLineBytes)))
 			default:
 				respond(fmt.Sprintf(`{"jsonrpc":"2.0","id":%s,"result":{"method":%q,"echo":%q}}`, request.ID, request.Method, request.Params.Echo))
+			}
+			for i := range request.Params.Notify {
+				respond(fmt.Sprintf(`{"jsonrpc":"2.0","method":"notifications/message","params":{"seq":%d,"echo":%q}}`, i, request.Params.Echo))
 			}
 		}()
 	}

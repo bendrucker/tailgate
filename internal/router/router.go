@@ -4,10 +4,20 @@
 //
 // Every request runs the same sequence, and each step must pass before the
 // next observes anything: recover, Origin validation, routing, token
-// extraction, verification, authorization, session binding, body limiting, and
-// finally dispatch to the upstream's proxy.Transport. Authorization precedes
-// dispatch unconditionally, so a Transport never sees an unauthenticated
-// request and never spawns work for one.
+// extraction, verification, authorization, session binding, body limiting,
+// protocol validation, and finally dispatch to the upstream's proxy.Transport.
+// Authorization precedes dispatch unconditionally, so a Transport never sees
+// an unauthenticated request and never spawns work for one.
+//
+// # Protocol revisions
+//
+// The router serves every MCP revision tailgate recognizes, deciding per
+// request from MCP-Protocol-Version. Two of its steps turn on that answer.
+// Session binding applies whenever the caller presents an Mcp-Session-Id,
+// rather than whenever the declared revision has sessions, so a client cannot
+// shed the binding by claiming a revision that dropped the header. Header
+// validation applies only where the revision mirrors body fields into headers,
+// because only then is there a pair that can disagree.
 //
 // # Routing
 //
@@ -38,6 +48,7 @@ import (
 
 	"github.com/bendrucker/tailgate/internal/audit"
 	"github.com/bendrucker/tailgate/internal/auth"
+	"github.com/bendrucker/tailgate/internal/protocol"
 	"github.com/bendrucker/tailgate/internal/proxy"
 	"github.com/bendrucker/tailgate/internal/resource"
 )
@@ -45,8 +56,9 @@ import (
 const (
 	// PathPrefix is the path prefix every upstream is addressed under.
 	PathPrefix = "/mcp/"
-	// SessionHeader carries the MCP session identifier in both directions.
-	SessionHeader = "Mcp-Session-Id"
+	// SessionHeader carries the MCP session identifier in both directions. It
+	// belongs to the revisions through 2025-11-25; 2026-07-28 removed it.
+	SessionHeader = protocol.SessionHeader
 	// IdentityHeaderPrefix is proxy.IdentityHeaderPrefix, the prefix reserved
 	// for headers tailgate sets about the caller.
 	IdentityHeaderPrefix = proxy.IdentityHeaderPrefix
@@ -352,7 +364,11 @@ func (rt *Router) serveUpstream(rec *responseRecorder, r *http.Request, up *upst
 		return
 	}
 	defer release()
-	if !rt.limitBody(rec, r) {
+	body, ok := rt.limitBody(rec, r)
+	if !ok {
+		return
+	}
+	if !rt.checkProtocol(rec, r, up, body) {
 		return
 	}
 	rt.dispatch(rec, r, up, id)
