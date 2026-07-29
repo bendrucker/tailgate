@@ -72,11 +72,25 @@ tailgate -config /etc/tailgate.hujson
 
 It needs:
 
-- **A Tailscale auth key** in `TS_AUTHKEY` to join the tailnet on first start. Without one, tailgate logs an interactive login URL and waits.
+- **A Tailscale auth key** in `TS_AUTHKEY` to join the tailnet on first start. Without one, tailgate logs an interactive login URL and waits. `-open-login` hands that URL to the default browser, which is the one-time bootstrap on a machine with a human at it. The node key persists in `state_dir`, so later starts, including launchd's, never log in again.
 - **The `funnel` node attribute** granted to tailgate's node in the tailnet policy. Without it, Funnel fails at the public edge.
-- **A tsidp app-capability grant** that authorizes each upstream's resource URI and populates any claims the policy matches on.
+- **A tsidp app-capability grant** that authorizes each upstream's resource URI and populates any claims the policy matches on. Generate it with `tailgate grant` rather than writing it by hand.
 
 `SIGINT` and `SIGTERM` stop the listener, drain in-flight requests and open streams for up to 30 seconds, close whatever connections remain, then leave the tailnet.
+
+## The tsidp Grant
+
+tsidp matches an RFC 8707 `resource` parameter against its app-capability grant byte-for-byte, with no canonicalization. The same resource string therefore has to appear identically in the client's token request, in tailgate's audience check, and in the tailnet policy. tailgate already owns the first two, so it generates the third:
+
+```
+tailgate grant -config /etc/tailgate.hujson
+```
+
+The output is one entry of the policy's `grants` array, ready to commit to whatever repository applies your tailnet policy. Regenerate it when upstreams change instead of editing the resource strings, since a hand-edited URI that no longer matches denies every request with an audience mismatch and nothing pointing at why.
+
+Generating the grant needs `node.tailnet`, the MagicDNS suffix, because the canonical URIs are built from the node's FQDN and nothing else supplies it before the node joins. Setting it also makes tailgate check the name the join actually reports: if the control server hands back a suffixed hostname because the name was taken, every resource URI would shift away from the grant, so tailgate refuses to serve instead of denying every request at the audience check.
+
+`-src`, `-dst`, and `-users` shape the grant envelope. `-dst` defaults to the issuer's host, which is right when tsidp is reachable by that MagicDNS name and wrong when it is addressed by tag.
 
 ## Development
 

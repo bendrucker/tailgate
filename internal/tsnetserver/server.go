@@ -52,6 +52,11 @@ type Config struct {
 	// Logger, when set, receives tsnet's user-facing messages, which include
 	// the interactive login URL printed on an unauthenticated first join.
 	Logger *slog.Logger
+	// OpenLoginURL hands that login URL to the platform's default URL handler
+	// so an interactive first join does not require copying it out of the log.
+	// It is off by default because tailgate's deployment target is launchd,
+	// where no browser is watching and no one is there to complete the join.
+	OpenLoginURL bool
 }
 
 // Server is tailgate's embedded Tailscale node.
@@ -86,6 +91,9 @@ func New(cfg Config) (*Server, error) {
 	if cfg.Logger != nil {
 		srv.UserLogf = func(format string, args ...any) {
 			cfg.Logger.Info(fmt.Sprintf(format, args...))
+		}
+		if cfg.OpenLoginURL {
+			srv.UserLogf = (&opener{open: openURL, logger: cfg.Logger}).userLogf(srv.UserLogf)
 		}
 	}
 	return newServer(srv, cfg.Port), nil

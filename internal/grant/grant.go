@@ -1,0 +1,150 @@
+// Package grant builds the tsidp application-capability grant that authorizes
+// tailgate's upstreams as OAuth resources.
+//
+// tsidp validates an RFC 8707 resource parameter against the
+// tailscale.com/cap/tsidp grant in the tailnet policy, matching each requested
+// resource against the grant byte-for-byte with no canonicalization. The
+// resource strings therefore have to be identical in three places: the token
+// request a client sends, the audience tailgate checks, and the tailnet policy.
+// tailgate already owns the first two through resource.URLs, so it generates
+// the third here rather than leaving a human to transcribe URIs into a policy
+// file and byte-match them by eye.
+//
+// The output is a policy grant ready to commit to whatever repository applies
+// the tailnet policy, which keeps the config the single source of truth for
+// what an upstream is called.
+package grant
+
+import (
+	"encoding/json"
+	"fmt"
+	"strings"
+
+	"github.com/bendrucker/tailgate/internal/resource"
+)
+
+// Capability is the application capability tsidp reads its rules from.
+const Capability = "tailscale.com/cap/tsidp"
+
+// Defaults applied when Options leaves the corresponding field empty.
+const (
+	// DefaultSrc grants every member of the tailnet the ability to mint tokens
+	// for tailgate's upstreams. It is the identities tailgate's own policy then
+	// filters, so widening it here does not widen who reaches an upstream.
+	DefaultSrc = "autogroup:member"
+	// DefaultUser matches every user within the rule. tsidp checks it against
+	// the authorizing user, which tailgate's policy also checks, so the
+	// narrowing belongs in one place rather than being split across two files
+	// that drift.
+	DefaultUser = "*"
+	// DefaultDst matches every destination. A grant's destination has to be a
+	// tag, user, group, host alias, or address, and a node's MagicDNS name is
+	// none of those, so tailgate cannot derive tsidp's node from the issuer URL
+	// it already has. The capability is read only by tsidp, so a wider
+	// destination grants nothing else. A tagged deployment narrows it.
+	DefaultDst = "*"
+)
+
+// Options shapes the grant envelope around the resources tailgate derives.
+//
+// Only the resource list is tailgate's to know. Where tsidp runs and who may
+// reach it are facts about the tailnet, so they are inputs rather than guesses.
+type Options struct {
+	// Src is the policy source: who may request tokens for these resources.
+	// Empty uses DefaultSrc.
+	Src []string
+	// Dst is the policy destination, naming tsidp's node. Empty uses DefaultDst.
+	Dst []string
+	// Users are the tsidp rule's users. Empty uses DefaultUser.
+	Users []string
+	// AllowAdminUI and AllowDCR add the corresponding tsidp allowances. Neither
+	// is required to serve traffic: they gate tsidp's own admin surface and
+	// dynamic client registration, which are onboarding concerns.
+	AllowAdminUI bool
+	AllowDCR     bool
+}
+
+// Rule is one tsidp capability rule. It mirrors the fields tsidp reads, and
+// omits the ones tailgate has no business setting.
+type Rule struct {
+	Users     []string `json:"users"`
+	Resources []string `json:"resources"`
+
+	AllowAdminUI bool `json:"allow_admin_ui,omitempty"`
+	AllowDCR     bool `json:"allow_dcr,omitempty"`
+}
+
+// Grant is a single entry of the tailnet policy's grants array.
+//
+// An application-capability grant carries no ip field: it grants a capability
+// rather than network access, and the policy rejects the combination.
+type Grant struct {
+	Src []string          `json:"src"`
+	Dst []string          `json:"dst"`
+	App map[string][]Rule `json:"app"`
+}
+
+// New builds the grant authorizing each named upstream's canonical resource
+// URI. The URIs come from urls, the same instance that mints the audience
+// tailgate validates, so the policy cannot name a resource tailgate would
+// reject.
+func New(urls *resource.URLs, names []string, opts Options) (*Grant, error) {
+	if urls == nil {
+		return nil, fmt.Errorf("grant: resource URLs are required")
+	}
+	if len(names) == 0 {
+		return nil, fmt.Errorf("grant: no upstreams to authorize")
+	}
+
+	resources := make([]string, len(names))
+	for i, name := range names {
+		resources[i] = urls.ResourceURL(name)
+	}
+
+	return &Grant{
+		Src: orDefault(opts.Src, DefaultSrc),
+		Dst: orDefault(opts.Dst, DefaultDst),
+		App: map[string][]Rule{
+			Capability: {{
+				Users:        orDefault(opts.Users, DefaultUser),
+				Resources:    resources,
+				AllowAdminUI: opts.AllowAdminUI,
+				AllowDCR:     opts.AllowDCR,
+			}},
+		},
+	}, nil
+}
+
+// HuJSON renders the grant as one entry of a policy grants array, indented to
+// sit inside it and carrying a comment naming what generated it so a reviewer
+// of the policy file knows where the resource strings came from.
+func (g *Grant) HuJSON() ([]byte, error) {
+	body, err := json.MarshalIndent(g, "  ", "  ")
+	if err != nil {
+		return nil, fmt.Errorf("grant: marshal: %w", err)
+	}
+
+	var b strings.Builder
+	b.WriteString("// Generated by `tailgate grant`. The resource strings must match\n")
+	b.WriteString("// tailgate's canonical URIs byte-for-byte; regenerate rather than edit.\n")
+	b.WriteString("  ")
+	b.Write(body)
+	b.WriteString(",\n")
+	return []byte(b.String()), nil
+}
+
+// Resources reports the canonical URIs the grant authorizes, which is what a
+// drift check compares an applied policy against.
+func (g *Grant) Resources() []string {
+	for _, rule := range g.App[Capability] {
+		return rule.Resources
+	}
+	return nil
+}
+
+func orDefault(values []string, fallback string) []string {
+	if len(values) == 0 {
+		return []string{fallback}
+	}
+	return values
+}
