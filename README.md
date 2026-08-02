@@ -72,7 +72,9 @@ tailgate -config /etc/tailgate.hujson
 
 It needs:
 
-- **A Tailscale auth key** in `TS_AUTHKEY` to join the tailnet on first start. Without one, tailgate logs an interactive login URL and waits. `-open-login` hands that URL to the default browser, which is the one-time bootstrap on a machine with a human at it. The node key persists in `state_dir`, so later starts, including launchd's, never log in again.
+- **A Tailscale auth key** in `TS_AUTHKEY` to join the tailnet on first start. Without one, tailgate logs an interactive login URL and waits a bounded window before exiting, rather than sitting forever on a login nobody is there to complete. `-open-login` hands that URL to the default browser, which is the one-time bootstrap on a machine with a human at it, and gets a longer window to match. The node key persists in `state_dir`, so later starts, including launchd's, never log in again.
+
+  Node keys expire on the tailnet's key expiry schedule, six months by default. A long-lived deployment wants expiry disabled for the node, or an auth key scoped to a tag, since an expired key takes tailgate off the internet until someone reauthorizes it by hand.
 - **The `funnel` node attribute** granted to tailgate's node in the tailnet policy. Without it, Funnel fails at the public edge.
 - **A tsidp app-capability grant** that authorizes each upstream's resource URI and populates any claims the policy matches on. Generate it with `tailgate grant` rather than writing it by hand.
 

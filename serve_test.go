@@ -3,9 +3,12 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
+	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/google/go-cmp/cmp"
 )
@@ -99,6 +102,119 @@ func TestDrain(t *testing.T) {
 			}
 			if len(tc.expected) == 0 && err != nil {
 				t.Errorf("expected no error, got %v", err)
+			}
+		})
+	}
+}
+
+// fakeJoiner stands in for the embedded node. A node that cannot authenticate
+// itself blocks until its context expires, which is the case the join bound
+// exists for.
+type fakeJoiner struct {
+	fqdn  string
+	err   error
+	block bool
+}
+
+func (j *fakeJoiner) Up(ctx context.Context) (string, error) {
+	if !j.block {
+		return j.fqdn, j.err
+	}
+	<-ctx.Done()
+	// tsnetserver.Server.Up joins the context error onto tsnet's own, which is
+	// what keeps the deadline distinguishable from any other join failure.
+	return "", fmt.Errorf("tsnetserver: node did not join the tailnet in time: %w",
+		errors.Join(errors.New("tsnet: operation not permitted"), ctx.Err()))
+}
+
+func TestJoinTimeoutFor(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		opts     options
+		expected time.Duration
+	}{
+		{
+			name:     "unattended",
+			opts:     options{},
+			expected: joinTimeout,
+		},
+		{
+			name:     "waiting on a person",
+			opts:     options{OpenLoginURL: true},
+			expected: interactiveJoinTimeout,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := joinTimeoutFor(tc.opts); got != tc.expected {
+				t.Errorf("expected %s, got %s", tc.expected, got)
+			}
+		})
+	}
+}
+
+func TestJoinTailnet(t *testing.T) {
+	joinErr := errors.New("funnel attribute missing")
+
+	for _, tc := range []struct {
+		name string
+		node *fakeJoiner
+		// canceled cancels the parent context, which is the signal that asked
+		// tailgate to stop.
+		canceled     bool
+		expectedFQDN string
+		expectedIs   error
+		// remedy is whether the error should tell the operator how to join,
+		// which only a node that ran out of time needs to be told.
+		remedy bool
+	}{
+		{
+			name:         "join reports the node name",
+			node:         &fakeJoiner{fqdn: "tailgate.example.ts.net."},
+			expectedFQDN: "tailgate.example.ts.net.",
+		},
+		{
+			name:       "a node that cannot authenticate fails closed",
+			node:       &fakeJoiner{block: true},
+			expectedIs: context.DeadlineExceeded,
+			remedy:     true,
+		},
+		{
+			name:       "shutdown during a join is not a failed join",
+			node:       &fakeJoiner{block: true},
+			canceled:   true,
+			expectedIs: context.Canceled,
+		},
+		{
+			name:       "any other join failure passes through",
+			node:       &fakeJoiner{err: joinErr},
+			expectedIs: joinErr,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			if tc.canceled {
+				cancel()
+			}
+
+			fqdn, err := joinTailnet(ctx, tc.node, 10*time.Millisecond)
+
+			if fqdn != tc.expectedFQDN {
+				t.Errorf("expected fqdn %q, got %q", tc.expectedFQDN, fqdn)
+			}
+			if tc.expectedIs == nil {
+				if err != nil {
+					t.Fatalf("expected no error, got %v", err)
+				}
+				return
+			}
+			if !errors.Is(err, tc.expectedIs) {
+				t.Fatalf("expected error matching %v, got %v", tc.expectedIs, err)
+			}
+			for _, remedy := range []string{"TS_AUTHKEY", "-open-login"} {
+				if strings.Contains(err.Error(), remedy) != tc.remedy {
+					t.Errorf("expected mention of %s to be %t in %v", remedy, tc.remedy, err)
+				}
 			}
 		})
 	}

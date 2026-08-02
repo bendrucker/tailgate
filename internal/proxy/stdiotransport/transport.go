@@ -102,7 +102,8 @@ const (
 
 // Options configures a stdio Transport. Only Command is required.
 type Options struct {
-	// Name is the upstream's configured name, used for log context.
+	// Name is the upstream's configured name, which this transport records as
+	// the subject of the authorization decisions it makes itself.
 	Name string
 	// Command is the child executable.
 	Command string
@@ -119,7 +120,9 @@ type Options struct {
 	IdleTimeout time.Duration
 	// RequestTimeout bounds the wait for a child's response to one request.
 	RequestTimeout time.Duration
-	// Logger receives session lifecycle and child diagnostics.
+	// Logger receives session lifecycle and child diagnostics. It carries
+	// whatever identifies the upstream, which the caller attaches once for
+	// every transport it builds rather than each transport attaching its own.
 	Logger *slog.Logger
 	// Audit receives the authorization decisions this transport makes on its
 	// own: the session bindings it owns and the per-identity cap. A nil Audit
@@ -179,7 +182,7 @@ func New(opts Options) *Transport {
 	opts = opts.withDefaults()
 	t := &Transport{
 		options:       opts,
-		logger:        opts.Logger.With("upstream", opts.Name),
+		logger:        opts.Logger,
 		audit:         opts.Audit,
 		shutdownGrace: shutdownGrace,
 		reaperStopped: make(chan struct{}),

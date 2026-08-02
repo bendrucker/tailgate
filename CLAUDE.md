@@ -72,7 +72,7 @@ Two eras are live at once, and tailgate serves both. Everything under "Both Eras
 
 ## Packages
 
-`main` joins the tailnet, seeds `resource.URLs` from the node's FQDN, builds the verifier on the tsnet HTTP client, assembles the router, serves Funnel, and drains on signal. The order is forced: nothing serves until every step succeeds.
+`main` joins the tailnet, seeds `resource.URLs` from the node's FQDN, builds the verifier on the tsnet HTTP client, assembles the router, serves Funnel, and drains on signal. The order is forced: nothing serves until every step succeeds. The join is bounded, since a node that cannot authenticate itself makes tsnet reprint a login URL forever, and an unbounded wait under launchd is a process that looks healthy while serving nothing.
 
 - `internal/config`: schema and loader. Policy `Match` fields are limited to what introspection returns.
 - `internal/protocol`: the revisions tailgate speaks and what each one puts on the wire. `Parse` resolves `MCP-Protocol-Version`, `Stateless` and `MirrorsHeaders` are the era predicates every other package branches on, and `ValidateMirrored` is the intermediary half of the header contract. `WriteError` answers refusals in JSON-RPC, which is what keeps a modern client from reading a `400` as a reason to downgrade.
@@ -82,7 +82,7 @@ Two eras are live at once, and tailgate serves both. Everything under "Both Eras
 - `internal/proxy`: the `Transport` seam is `http.Handler` plus `Shutdown` and `Close`. HTTP semantics are the contract. The seam carries JSON and SSE responses, session headers, and resumption without a bespoke message layer. Sentinel errors plus `StatusOf` are the shared error taxonomy, and `Drain` is the shared refuse-and-wait choreography. The package doc records the lifecycle and drain contract.
 - `internal/proxy/httptransport`: the reverse proxy for HTTP upstreams.
 - `internal/proxy/stdiotransport`: the server side of streamable HTTP over a child process, with JSON-RPC correlation, a per-identity-per-upstream cap, and idle reaping. A stateful caller gets a child per session with the session id bound to it. A stateless caller gets a child per identity, whose era the transport settles with `server/discover` and whose `initialize` handshake it runs itself when the child predates the revision. Caller JSON-RPC ids are substituted for minted ones on that path, since independent POSTs collide, and a message carrying an id but no method is refused, since forwarding it would put a caller-chosen id into that minted namespace. `subscriptions/listen` is the one response held open, so it is the one exempt from the exchange timeout: the stream opens as soon as the request goes out, and the child's eventual response to it closes the stream.
-- `internal/router`: the public handler. Exact-segment routing, auth ahead of every transport, session binding, `Origin` validation, body limits, mirrored-header validation, header stripping, identity injection, and panic recovery.
+- `internal/router`: the public handler. Exact-segment routing, auth ahead of every transport, session binding, `Origin` validation, body limits, mirrored-header validation, header stripping, identity injection into the request context, and panic recovery.
 - `internal/tsnetserver`: the embedded node, the `FQDN` that seeds `resource.URLs`, and the Funnel listener.
 - `internal/audit`: structured decision log.
 

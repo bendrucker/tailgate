@@ -28,6 +28,15 @@ const (
 	// so a transport that spends the entire drain budget still leaves those
 	// connections a window to close cleanly rather than being severed.
 	closeTimeout = 10 * time.Second
+	// joinTimeout bounds an unattended join. A node with no auth key and no
+	// saved state cannot authenticate itself, and tsnet's fallback is to print
+	// a login URL every few seconds forever. Under launchd nobody reads that
+	// log, so an unbounded wait is a process launchd considers healthy while it
+	// serves nothing.
+	joinTimeout = 90 * time.Second
+	// interactiveJoinTimeout bounds a join that -open-login put in front of a
+	// person, whose approval takes longer than any network round trip.
+	interactiveJoinTimeout = 5 * time.Minute
 )
 
 // options carries the invocation's run-mode choices, which are the caller's
@@ -59,7 +68,7 @@ func serve(ctx context.Context, logger *slog.Logger, cfg *config.Config, opts op
 	}
 	defer node.Close()
 
-	fqdn, err := node.Up(ctx)
+	fqdn, err := joinTailnet(ctx, node, joinTimeoutFor(opts))
 	if err != nil {
 		return err
 	}
@@ -108,6 +117,47 @@ func serve(ctx context.Context, logger *slog.Logger, cfg *config.Config, opts op
 		return err
 	case <-ctx.Done():
 		return drain(logger, node, server, rt)
+	}
+}
+
+// joiner joins the tailnet and reports the node's name. *tsnetserver.Server
+// implements it.
+type joiner interface {
+	Up(ctx context.Context) (string, error)
+}
+
+// joinTimeoutFor reports how long tailgate waits for the join, which depends
+// on what it is waiting for: an unattended start has only the auth key it was
+// given, while -open-login is waiting on a person to approve a login in a
+// browser.
+func joinTimeoutFor(opts options) time.Duration {
+	if opts.OpenLoginURL {
+		return interactiveJoinTimeout
+	}
+	return joinTimeout
+}
+
+// joinTailnet bounds the join, so a node that cannot authenticate is a startup
+// failure rather than a process that runs forever without serving.
+//
+// The error names both remedies, since the log it lands in is all a launchd
+// deployment leaves behind.
+func joinTailnet(ctx context.Context, node joiner, timeout time.Duration) (string, error) {
+	joining, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	fqdn, err := node.Up(joining)
+	switch {
+	case err == nil:
+		return fqdn, nil
+	// A canceled parent is the signal that asked tailgate to stop, which main
+	// reports as the shutdown it is rather than a failure to join.
+	case ctx.Err() != nil:
+		return "", err
+	case errors.Is(err, context.DeadlineExceeded):
+		return "", fmt.Errorf("the node did not join within %s. Set TS_AUTHKEY to join unattended, or run once with -open-login on a machine with a browser to authorize interactively. The node key persists in the configured state_dir, so later starts do not log in again: %w", timeout, err)
+	default:
+		return "", err
 	}
 }
 
