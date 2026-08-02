@@ -2,6 +2,7 @@ package stdiotransport
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -1306,4 +1307,45 @@ func TestRequestsRacingTheReaperAreNeverBadGateway(t *testing.T) {
 		}()
 	}
 	wg.Wait()
+}
+
+// TestSessionLogTagsUpstreamOnce covers a duplicated log attribute. The caller
+// tags the logger it hands each transport with the upstream that transport
+// serves, so a transport tagging its own emitted "upstream" twice in every
+// record it wrote.
+func TestSessionLogTagsUpstreamOnce(t *testing.T) {
+	logs := &syncBuffer{}
+	h := newHarness(t, Options{
+		Name:   "files",
+		Logger: slog.New(slog.NewJSONHandler(logs, nil)).With("upstream", "files"),
+	})
+	h.initialize(t, "alice")
+
+	written := strings.TrimSpace(logs.String())
+	if written == "" {
+		t.Fatal("expected the established session to be logged")
+	}
+	for _, line := range strings.Split(written, "\n") {
+		if count := strings.Count(line, `"upstream"`); count != 1 {
+			t.Errorf("expected 1 upstream attribute, got %d in %s", count, line)
+		}
+	}
+}
+
+// syncBuffer collects log output written from the transport's goroutines.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
 }
