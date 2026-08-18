@@ -32,7 +32,13 @@ func handler(cfg *config.Config, urls *resource.URLs, verifier router.Verifier, 
 		names[i] = route.Name
 	}
 
-	metadata, err := resource.NewHandler(urls, cfg.OIDC.Issuer, names)
+	// The metadata names tailgate itself as the authorization server, matching
+	// what the facade below publishes. Naming the issuer instead would send a
+	// discovering client to endpoints tailgate does not front, and its
+	// /authorize is tailnet-only, so a browser arriving from outside is refused.
+	// Tokens still originate at the issuer: the facade redirects there for the
+	// human step and proxies the exchange.
+	metadata, err := resource.NewHandler(urls, urls.Origin(), names)
 	if err != nil {
 		return nil, errors.Join(err, closeUpstreams(routes))
 	}

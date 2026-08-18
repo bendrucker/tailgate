@@ -343,7 +343,12 @@ func (rt *Router) route(rec *responseRecorder, r *http.Request) {
 		return
 	}
 
+	// Discovery is the one surface that produces no authorization decision, so
+	// without this line a client's whole pre-token conversation is invisible and
+	// a client that reads the documents looks identical to one that never
+	// arrived. Volume is bounded: a client fetches these once per connection.
 	if isMetadataPath(r.URL) {
+		rt.logger.Info("discovery request", "method", r.Method, "path", r.URL.EscapedPath())
 		if rt.metadata == nil {
 			http.NotFound(rec, r)
 			return
@@ -356,6 +361,7 @@ func (rt *Router) route(rec *responseRecorder, r *http.Request) {
 	// and a token exchange is what the client does before it has a token. They
 	// resolve ahead of upstream routing and can never reach one.
 	if rt.authServer != nil && rt.authServer.Handles(r.URL.Path) {
+		rt.logger.Info("authorization server request", "method", r.Method, "path", r.URL.EscapedPath())
 		rt.authServer.ServeHTTP(rec, r)
 		return
 	}

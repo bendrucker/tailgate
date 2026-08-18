@@ -132,7 +132,9 @@ func TestHandlerServesMetadata(t *testing.T) {
 	if doc.Resource != testResource {
 		t.Errorf("expected resource %s, got %s", testResource, doc.Resource)
 	}
-	if diff := cmp.Diff([]string{testIssuer}, doc.AuthorizationServers); diff != "" {
+	// The document names tailgate, not the issuer: clients obtain tokens from the
+	// facade, which is the only authorization surface reachable from off-tailnet.
+	if diff := cmp.Diff([]string{testOrigin}, doc.AuthorizationServers); diff != "" {
 		t.Errorf("authorization servers differ:\n%s", diff)
 	}
 }
