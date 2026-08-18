@@ -224,7 +224,11 @@ func (f *Facade) serveAuthorize(w http.ResponseWriter, r *http.Request) {
 	}
 	target := *f.authorize
 	target.RawQuery = r.URL.RawQuery
-	f.logger.Info("redirecting authorization request", "to", target.Scheme+"://"+target.Host+target.Path)
+	// The query carries the client's state and PKCE challenge, so the log names
+	// only the endpoint the browser is being sent to.
+	endpoint := *f.authorize
+	endpoint.RawQuery = ""
+	f.logger.Info("redirecting authorization request", "to", endpoint.String())
 	http.Redirect(w, r, target.String(), http.StatusFound)
 }
 
