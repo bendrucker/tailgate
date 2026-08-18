@@ -13,6 +13,7 @@ import (
 
 	"github.com/bendrucker/tailgate/internal/audit"
 	"github.com/bendrucker/tailgate/internal/auth"
+	"github.com/bendrucker/tailgate/internal/authserver"
 	"github.com/bendrucker/tailgate/internal/config"
 	"github.com/bendrucker/tailgate/internal/resource"
 )
@@ -102,7 +103,7 @@ func testHandler(t *testing.T, respond http.HandlerFunc) (http.Handler, *fakeVer
 	}}
 
 	logger := discardLogger()
-	rt, err := handler(cfg, urls, verifier, logger, audit.New(logger))
+	rt, err := handler(cfg, urls, verifier, http.DefaultClient, logger, audit.New(logger))
 	if err != nil {
 		t.Fatalf("handler: %v", err)
 	}
@@ -314,4 +315,50 @@ func TestHandlerStreamsSSE(t *testing.T) {
 	if got := rec.Body.String(); got != stream {
 		t.Errorf("expected stream %q, got %q", stream, got)
 	}
+}
+
+// The facade's endpoints must resolve on the assembled surface, unauthenticated
+// and ahead of upstream routing. A client that skips RFC 9728 discovery reaches
+// tailgate with no token and no knowledge of the issuer, so a 404 or a 401 here
+// is the failure this package exists to prevent.
+func TestHandlerServesAuthorizationServerSurface(t *testing.T) {
+	rt, _, _ := testHandler(t, respondJSON)
+
+	t.Run("metadata", func(t *testing.T) {
+		rec := httptest.NewRecorder()
+		rt.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, authserver.MetadataPath, nil))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("expected 200, got %d", rec.Code)
+		}
+		var doc struct {
+			Issuer                string `json:"issuer"`
+			AuthorizationEndpoint string `json:"authorization_endpoint"`
+			TokenEndpoint         string `json:"token_endpoint"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &doc); err != nil {
+			t.Fatalf("unmarshal metadata: %v", err)
+		}
+		origin := strings.TrimSuffix(testResource, "/mcp/docs")
+		for _, tc := range []struct{ field, got, want string }{
+			{"issuer", doc.Issuer, origin},
+			{"authorization_endpoint", doc.AuthorizationEndpoint, origin + authserver.AuthorizePath},
+			{"token_endpoint", doc.TokenEndpoint, origin + authserver.TokenPath},
+		} {
+			if tc.got != tc.want {
+				t.Errorf("%s = %q, want %q", tc.field, tc.got, tc.want)
+			}
+		}
+	})
+
+	t.Run("authorize redirects to the issuer", func(t *testing.T) {
+		rec := httptest.NewRecorder()
+		rt.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, authserver.AuthorizePath+"?client_id=abc&state=xyz", nil))
+		if rec.Code != http.StatusFound {
+			t.Fatalf("expected 302, got %d", rec.Code)
+		}
+		want := testIssuer + authserver.AuthorizePath + "?client_id=abc&state=xyz"
+		if got := rec.Header().Get("Location"); got != want {
+			t.Errorf("Location = %q, want %q", got, want)
+		}
+	})
 }
