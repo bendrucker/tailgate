@@ -28,6 +28,11 @@ type Config struct {
 	OIDC      OIDC       `json:"oidc"`
 	Upstreams []Upstream `json:"upstreams"`
 	Policy    []Rule     `json:"policy"`
+	// Favicon is the path to an icon image served at /favicon.ico, along with
+	// a root page linking it, so icon crawlers index something for the origin.
+	// The path is configuration rather than an embedded asset because the
+	// right image is deployment-specific. Empty serves neither path.
+	Favicon string `json:"favicon,omitempty"`
 }
 
 // Node configures tailgate's embedded Tailscale node and Funnel listener.

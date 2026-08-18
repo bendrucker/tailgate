@@ -11,6 +11,7 @@ import (
 	"github.com/bendrucker/tailgate/internal/config"
 	"github.com/bendrucker/tailgate/internal/resource"
 	"github.com/bendrucker/tailgate/internal/router"
+	"github.com/bendrucker/tailgate/internal/site"
 )
 
 // handler assembles tailgate's public surface: the RFC 9728 metadata documents,
@@ -48,11 +49,23 @@ func handler(cfg *config.Config, urls *resource.URLs, verifier router.Verifier, 
 		return nil, errors.Join(err, closeUpstreams(routes))
 	}
 
+	// The favicon is optional, but a configured path that fails to load is a
+	// broken deployment, so it fails startup rather than serving iconless.
+	var pages router.Site
+	if cfg.Favicon != "" {
+		s, err := site.New(cfg.Favicon)
+		if err != nil {
+			return nil, errors.Join(err, closeUpstreams(routes))
+		}
+		pages = s
+	}
+
 	rt, err := router.New(router.Options{
 		Upstreams:  routes,
 		Resources:  urls,
 		Metadata:   metadata,
 		AuthServer: facade,
+		Site:       pages,
 		Verifier:   verifier,
 		Authorizer: auth.NewAuthorizer(cfg.Policy),
 		Audit:      auditor,
