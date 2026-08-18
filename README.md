@@ -62,6 +62,8 @@ tailgate reads a [HuJSON](https://github.com/tailscale/hujson) file, the same fo
 
 An HTTP upstream needs a `url`. A stdio upstream needs a `command` and takes optional `args`, `env`, `dir`, `max_children`, and `idle_timeout`.
 
+An optional top-level `favicon` names an icon image to serve at `/favicon.ico`, along with a root page linking it. Icon crawlers index it for the origin, which is where clients like claude.ai get a custom connector's icon. Without it, those crawlers fall back to the parent domain's icon, which for a `*.ts.net` node is Tailscale's logo.
+
 ## Deployment
 
 tailgate runs as a single binary under launchd:

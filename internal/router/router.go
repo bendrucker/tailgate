@@ -126,6 +126,15 @@ type AuthServer interface {
 	http.Handler
 }
 
+// Site serves tailgate's unauthenticated origin surface: the root page and
+// the favicon icon crawlers index. It owns its own path set, like AuthServer.
+// *site.Site implements it.
+type Site interface {
+	// Handles reports whether the path belongs to the site.
+	Handles(path string) bool
+	http.Handler
+}
+
 // Upstream is one routable MCP upstream.
 type Upstream struct {
 	// Name is the single path segment addressing the upstream at /mcp/<name>.
@@ -157,6 +166,10 @@ type Options struct {
 	// origin. Nil leaves those paths unrouted, which is correct for a
 	// deployment whose clients all follow RFC 9728 discovery.
 	AuthServer AuthServer
+	// Site serves the unauthenticated origin surface: the root page and the
+	// favicon. Nil leaves those paths unrouted, which only costs the origin an
+	// icon.
+	Site Site
 	// Verifier and Authorizer gate every upstream request.
 	Verifier   Verifier
 	Authorizer Authorizer
@@ -190,6 +203,7 @@ type Router struct {
 	resources  *resource.URLs
 	metadata   http.Handler
 	authServer AuthServer
+	site       Site
 	verifier   Verifier
 	authorizer Authorizer
 	audit      *audit.Logger
@@ -266,6 +280,7 @@ func New(opts Options) (*Router, error) {
 		resources:  opts.Resources,
 		metadata:   opts.Metadata,
 		authServer: opts.AuthServer,
+		site:       opts.Site,
 		verifier:   opts.Verifier,
 		authorizer: opts.Authorizer,
 		audit:      opts.Audit,
@@ -363,6 +378,16 @@ func (rt *Router) route(rec *responseRecorder, r *http.Request) {
 	if rt.authServer != nil && rt.authServer.Handles(r.URL.Path) {
 		rt.logger.Info("authorization server request", "method", r.Method, "path", r.URL.EscapedPath())
 		rt.authServer.ServeHTTP(rec, r)
+		return
+	}
+
+	// The site is public like discovery, and it logs for the same reason:
+	// without this line an icon crawler's visit is indistinguishable from one
+	// that never came, and the crawl is the event the operator is waiting on
+	// after configuring an icon.
+	if rt.site != nil && rt.site.Handles(r.URL.Path) {
+		rt.logger.Info("site request", "method", r.Method, "path", r.URL.EscapedPath())
+		rt.site.ServeHTTP(rec, r)
 		return
 	}
 
