@@ -116,6 +116,16 @@ type Authorizer interface {
 	Authorize(id auth.Identity, upstream string) auth.Decision
 }
 
+// AuthServer serves the authorization-server endpoints tailgate presents at
+// its own origin for clients that never read the RFC 9728 metadata document.
+// It owns its own path set, so the router asks rather than restating it.
+// *authserver.Facade implements it.
+type AuthServer interface {
+	// Handles reports whether the path belongs to the facade.
+	Handles(path string) bool
+	http.Handler
+}
+
 // Upstream is one routable MCP upstream.
 type Upstream struct {
 	// Name is the single path segment addressing the upstream at /mcp/<name>.
@@ -143,6 +153,10 @@ type Options struct {
 	// Metadata serves the RFC 9728 well-known subtree. A nil handler answers
 	// 404 there, which breaks discovery but never routes to an upstream.
 	Metadata http.Handler
+	// AuthServer serves the authorization-server surface at tailgate's own
+	// origin. Nil leaves those paths unrouted, which is correct for a
+	// deployment whose clients all follow RFC 9728 discovery.
+	AuthServer AuthServer
 	// Verifier and Authorizer gate every upstream request.
 	Verifier   Verifier
 	Authorizer Authorizer
@@ -175,6 +189,7 @@ type Router struct {
 	upstreams  map[string]*upstream
 	resources  *resource.URLs
 	metadata   http.Handler
+	authServer AuthServer
 	verifier   Verifier
 	authorizer Authorizer
 	audit      *audit.Logger
@@ -250,6 +265,7 @@ func New(opts Options) (*Router, error) {
 		upstreams:  upstreams,
 		resources:  opts.Resources,
 		metadata:   opts.Metadata,
+		authServer: opts.AuthServer,
 		verifier:   opts.Verifier,
 		authorizer: opts.Authorizer,
 		audit:      opts.Audit,
@@ -327,7 +343,12 @@ func (rt *Router) route(rec *responseRecorder, r *http.Request) {
 		return
 	}
 
+	// Discovery is the one surface that produces no authorization decision, so
+	// without this line a client's whole pre-token conversation is invisible and
+	// a client that reads the documents looks identical to one that never
+	// arrived. Volume is bounded: a client fetches these once per connection.
 	if isMetadataPath(r.URL) {
+		rt.logger.Info("discovery request", "method", r.Method, "path", r.URL.EscapedPath())
 		if rt.metadata == nil {
 			http.NotFound(rec, r)
 			return
@@ -336,10 +357,22 @@ func (rt *Router) route(rec *responseRecorder, r *http.Request) {
 		return
 	}
 
+	// The facade's endpoints are unauthenticated by nature: discovery is public,
+	// and a token exchange is what the client does before it has a token. They
+	// resolve ahead of upstream routing and can never reach one.
+	if rt.authServer != nil && rt.authServer.Handles(r.URL.Path) {
+		rt.logger.Info("authorization server request", "method", r.Method, "path", r.URL.EscapedPath())
+		rt.authServer.ServeHTTP(rec, r)
+		return
+	}
+
 	if !routed || !ok {
 		// Unrouted requests are the internet's background noise, so they are
-		// not audit decisions: nothing was authorized or refused.
-		rt.logger.Debug("no route", "method", r.Method, "path", r.URL.EscapedPath())
+		// not audit decisions: nothing was authorized or refused. They log at
+		// Info because the alternative is a client probing paths tailgate does
+		// not serve, which is invisible at any lower level and is exactly how a
+		// client that guesses its endpoints fails.
+		rt.logger.Info("no route", "method", r.Method, "path", r.URL.EscapedPath())
 		http.Error(rec, "not found", proxy.StatusOf(proxy.ErrUnknownUpstream))
 		return
 	}

@@ -46,14 +46,14 @@ type Handler struct {
 }
 
 // NewHandler builds the metadata documents for the named upstreams, naming
-// issuer as their authorization server. issuer must be the same string the
-// verifier discovers against, since a client that trusts this document will
-// obtain tokens from it.
-func NewHandler(urls *URLs, issuer string, upstreams []string) (*Handler, error) {
+// server as where clients obtain tokens. It must be an origin that answers RFC
+// 8414 discovery and serves the endpoints that discovery advertises, since a
+// client trusting this document goes there and looks no further.
+func NewHandler(urls *URLs, server string, upstreams []string) (*Handler, error) {
 	if urls == nil {
 		return nil, fmt.Errorf("resource: nil URLs")
 	}
-	authorizationServer, err := canonicalIssuer(issuer)
+	authorizationServer, err := canonicalIssuer(server)
 	if err != nil {
 		return nil, err
 	}

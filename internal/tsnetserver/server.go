@@ -14,6 +14,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"os"
 	"strconv"
 	"sync"
 
@@ -89,6 +90,14 @@ func New(cfg Config) (*Server, error) {
 		AuthKey:  cfg.AuthKey,
 	}
 	if cfg.Logger != nil {
+		// TAILGATE_TSNET_DEBUG surfaces tsnet's internal tailscaled logs,
+		// which otherwise go only to logtail. The funnel ingress wiring is
+		// only observable there.
+		if os.Getenv("TAILGATE_TSNET_DEBUG") != "" {
+			srv.Logf = func(format string, args ...any) {
+				cfg.Logger.Info("tsnet: " + fmt.Sprintf(format, args...))
+			}
+		}
 		srv.UserLogf = func(format string, args ...any) {
 			cfg.Logger.Info(fmt.Sprintf(format, args...))
 		}

@@ -1,11 +1,11 @@
 module github.com/bendrucker/tailgate
 
-go 1.26.5
+go 1.26.6
 
 require (
 	github.com/google/go-cmp v0.7.0
 	github.com/tailscale/hujson v0.0.0-20260722022634-78b5b162ee49
-	tailscale.com v1.102.0
+	tailscale.com v1.102.2
 )
 
 require (

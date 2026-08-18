@@ -90,7 +90,7 @@ func serve(ctx context.Context, logger *slog.Logger, cfg *config.Config, opts op
 		return fmt.Errorf("discover issuer %s: %w", cfg.OIDC.Issuer, err)
 	}
 
-	rt, err := handler(cfg, urls, verifier, logger, audit.New(logger))
+	rt, err := handler(cfg, urls, verifier, node.HTTPClient(), logger, audit.New(logger))
 	if err != nil {
 		return err
 	}
