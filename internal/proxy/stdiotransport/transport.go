@@ -25,10 +25,10 @@
 //
 // A caller's JSON-RPC id never reaches the child. Every request tailgate
 // carries goes out under an id it mints and comes back restored, whichever era
-// the caller speaks. A session was once thought to give one caller a single id
-// space, but independent POSTs may all call themselves id 1, and a caller that
-// hangs up mid-request and retries reuses an id the child is still working on.
-// Either would let one request take another's answer.
+// the caller speaks. A session is no id space of its own: independent POSTs
+// may all call themselves id 1, and a caller that hangs up mid-request and
+// retries reuses an id the child is still working on. Correlating on the
+// caller's id would let either request take the other's answer.
 //
 // # Notifications
 //
@@ -313,8 +313,18 @@ func (t *Transport) servePost(w http.ResponseWriter, r *http.Request, inflight *
 	defer s.finish()
 
 	if !msg.IsRequest() {
-		// Notifications and responses are one-way: the spec answers them with
-		// 202 and an empty body.
+		// A notification is the one caller message forwarded as it arrived,
+		// since it is the one carrying no id. These revisions let a server
+		// open a request of its own, which is what makes a POSTed response
+		// legal, but deliver drops that direction, so such a response answers
+		// nothing tailgate carried. Forwarding it would put a caller-chosen id
+		// into the namespace requests are minted from, where the child's
+		// answer to it would satisfy another request's wait.
+		if msg.IsResponse() {
+			t.logger.Debug("dropping a POSTed response to a request tailgate never carried")
+			w.WriteHeader(http.StatusAccepted)
+			return
+		}
 		if err := s.send(msg.Line, t.options.RequestTimeout); err != nil {
 			t.refuse(w, s, err)
 			return
@@ -795,35 +805,48 @@ func (t *Transport) writeError(w http.ResponseWriter, err error) {
 		// A 400 whose body is not a recognized JSON-RPC error is what tells a
 		// client probing for the server's era that it predates the stateless
 		// revision, so a refusal in bare text would talk the caller into
-		// retrying with the handshake this transport no longer offers it.
-		protocol.WriteError(w, status, protocol.CodeInvalidRequest, badRequestMessage(err), nil)
+		// retrying with the handshake this transport no longer offers it. The
+		// shape is owed to every 400, so an unnamed one still answers in it.
+		message, named := badRequestMessage(err)
+		if !named {
+			message = http.StatusText(status)
+		}
+		protocol.WriteError(w, status, protocol.CodeInvalidRequest, message, nil)
 		return
 	}
 	http.Error(w, http.StatusText(status), status)
 }
 
-// badRequestSentinels are the refusals whose own text a 400 carries. Each
-// names a protocol mistake in the request the caller wrote, so telling the
-// caller which one it made discloses nothing about the upstream, the identity,
-// or this transport's internals, and the wording matches the log line the
-// refusal wrote.
-var badRequestSentinels = []error{errInvalidMessage, errMissingSessionID, errDuplicateRequestID}
+// badRequestMessages is the 400 family and what each refusal says back. Every
+// one names a protocol mistake in the request the caller itself wrote, so
+// telling the caller which it made discloses nothing about the upstream, the
+// identity, or this transport's internals. The text is written here rather
+// than taken from the sentinel, whose own is prefixed with this package's name
+// for the log.
+var badRequestMessages = map[error]string{
+	errInvalidMessage:     "invalid JSON-RPC message",
+	errMissingSessionID:   "Mcp-Session-Id is required",
+	errAmbiguousSession:   "Mcp-Session-Id is present more than once",
+	errDuplicateRequestID: "duplicate in-flight JSON-RPC id",
+}
 
-func badRequestMessage(err error) string {
-	for _, sentinel := range badRequestSentinels {
+func badRequestMessage(err error) (string, bool) {
+	for sentinel, message := range badRequestMessages {
 		if errors.Is(err, sentinel) {
-			return sentinel.Error()
+			return message, true
 		}
 	}
-	return http.StatusText(http.StatusBadRequest)
+	return "", false
+}
+
+func isBadRequest(err error) bool {
+	_, named := badRequestMessage(err)
+	return named
 }
 
 func statusOf(err error) int {
 	switch {
-	case errors.Is(err, errInvalidMessage),
-		errors.Is(err, errMissingSessionID),
-		errors.Is(err, errAmbiguousSession),
-		errors.Is(err, errDuplicateRequestID):
+	case isBadRequest(err):
 		return http.StatusBadRequest
 	case errors.Is(err, errBodyTooLarge):
 		return http.StatusRequestEntityTooLarge

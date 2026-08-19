@@ -126,9 +126,10 @@ func TestStatelessChildIsPerIdentity(t *testing.T) {
 }
 
 // A message carrying a correlation key and no method is neither request nor
-// notification. Forwarding it verbatim would put a caller-chosen id into the
-// namespace the transport mints from, where the child's answer to it satisfies
-// another request's pending wait.
+// notification. This revision left no server-initiated request to answer, so
+// forwarding one verbatim would put a caller-chosen id into the namespace the
+// transport mints from, where the child's answer to it satisfies another
+// request's pending wait.
 func TestStatelessRefusesAMessageWithNoMethod(t *testing.T) {
 	h := newHarness(t, Options{})
 

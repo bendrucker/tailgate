@@ -253,22 +253,24 @@ func (t *Transport) listenerCount() int {
 	return count
 }
 
-// pendingRequests reports the waiters registered across every live session,
-// which is how a test sees a request reach the child and an abandoned one
-// leave the correlation map.
-func (t *Transport) pendingRequests() int {
+// pendingKeys reports the correlation keys registered across every live
+// session, which is how a test sees a request reach the child and an abandoned
+// one leave the correlation map.
+func (t *Transport) pendingKeys() []string {
 	t.mu.Lock()
 	sessions := slices.Collect(maps.Values(t.sessions))
 	t.mu.Unlock()
 
-	total := 0
+	var keys []string
 	for _, s := range sessions {
 		s.mu.Lock()
-		total += len(s.pending)
+		keys = append(keys, slices.Collect(maps.Keys(s.pending))...)
 		s.mu.Unlock()
 	}
-	return total
+	return keys
 }
+
+func (t *Transport) pendingRequests() int { return len(t.pendingKeys()) }
 
 // reservedSlots reports the cap slots subject currently holds, which is what a
 // leaked reservation shows up in.
@@ -430,6 +432,50 @@ func TestConcurrentRequestsCorrelateByID(t *testing.T) {
 		if diff := cmp.Diff(expected, message); diff != "" {
 			t.Errorf("request %d got the wrong response (-want +got):\n%s", id, diff)
 		}
+	}
+}
+
+// TestPostedResponseNeverReachesTheChild covers the one caller message that
+// could otherwise carry an id of the caller's choosing into the namespace
+// requests are minted from. The stateful revisions let a client POST a
+// response, so tailgate must answer one with 202, but deliver drops the
+// server-initiated direction that would have asked for it.
+//
+// The attack it defends against: name the minted id a live request is waiting
+// on, and a child that reflects the response back answers that request's
+// waiter with the caller's own payload. The minted ids run from tailgate-1, so
+// initialize takes tailgate-1 and the request below takes tailgate-2. The
+// refusal never reads the id, so the test asserts that pairing rather than
+// assuming it: a change to the minting format fails here instead of leaving
+// the exploit body naming nothing and the test passing on it.
+func TestPostedResponseNeverReachesTheChild(t *testing.T) {
+	h := newHarness(t, Options{})
+	session := h.initialize(t, "alice")
+
+	answered := make(chan map[string]any, 1)
+	go func() {
+		response := h.do(t, call{subject: "alice", session: session, body: requestBody(9, "tools/call", "mine", 300*time.Millisecond)})
+		defer response.Body.Close()
+		answered <- decodeMessage(t, response)
+	}()
+	waitFor(t, "the request to reach the child", func() bool {
+		return h.transport.pendingRequests() == 1
+	})
+
+	const stolenID = `"tailgate-2"`
+	if keys := h.transport.pendingKeys(); !slices.Contains(keys, correlationKey(json.RawMessage(stolenID))) {
+		t.Fatalf("no request is pending under %s, so the body names nothing: %v", stolenID, keys)
+	}
+
+	posted := h.do(t, call{subject: "alice", session: session, body: fmt.Sprintf(`{"jsonrpc":"2.0","id":%s,"result":{"stolen":true}}`, stolenID)})
+	posted.Body.Close()
+	if posted.StatusCode != http.StatusAccepted {
+		t.Fatalf("expected 202 for a POSTed response, got %d", posted.StatusCode)
+	}
+
+	result, _ := (<-answered)["result"].(map[string]any)
+	if result["echo"] != "mine" {
+		t.Errorf("the in-flight request was answered with %v", result)
 	}
 }
 
@@ -833,17 +879,27 @@ func observedID(t *testing.T, message map[string]any) any {
 // TestBadRequestNamesTheRefusal covers what a client is told when tailgate
 // refuses its message. The status alone leaves a caller with a tool call that
 // failed for no stated reason, and each of these sentinels names a mistake in
-// the request the caller itself wrote.
+// the request the caller itself wrote. What the caller is told is the
+// transport's own text: a sentinel's is written for the log, where the package
+// name that prefixes it belongs, and an internet-facing response is no place
+// to disclose it.
 func TestBadRequestNamesTheRefusal(t *testing.T) {
 	h := newHarness(t, Options{})
 
+	for sentinel, message := range badRequestMessages {
+		if strings.Contains(message, "stdiotransport") {
+			t.Errorf("the text answering %v carries the package name: %q", sentinel, message)
+		}
+	}
+
 	for _, tc := range []struct {
-		name string
-		err  error
+		name     string
+		err      error
+		expected string
 	}{
-		{name: "invalid message", err: errInvalidMessage},
-		{name: "missing session id", err: errMissingSessionID},
-		{name: "duplicate request id", err: errDuplicateRequestID},
+		{name: "invalid message", err: errInvalidMessage, expected: "invalid JSON-RPC message"},
+		{name: "missing session id", err: errMissingSessionID, expected: "Mcp-Session-Id is required"},
+		{name: "duplicate request id", err: errDuplicateRequestID, expected: "duplicate in-flight JSON-RPC id"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			recorder := httptest.NewRecorder()
@@ -860,8 +916,8 @@ func TestBadRequestNamesTheRefusal(t *testing.T) {
 			if err := json.Unmarshal(recorder.Body.Bytes(), &refusal); err != nil {
 				t.Fatalf("decode refusal: %v", err)
 			}
-			if refusal.Error.Message != tc.err.Error() {
-				t.Errorf("expected the refusal named, got %q", refusal.Error.Message)
+			if refusal.Error.Message != tc.expected {
+				t.Errorf("expected %q, got %q", tc.expected, refusal.Error.Message)
 			}
 		})
 	}
@@ -1565,6 +1621,10 @@ func TestMessagesOutsideTheJSONRPCShapesAreRejected(t *testing.T) {
 		{
 			name: "neither a method nor a usable id",
 			body: `{"jsonrpc":"2.0","id":null,"result":{}}`,
+		},
+		{
+			name: "neither a method nor an id at all",
+			body: `{"jsonrpc":"2.0","params":{}}`,
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

@@ -71,12 +71,12 @@ func (t *Transport) serveStateless(w http.ResponseWriter, r *http.Request, infli
 	defer s.finish()
 
 	if !msg.IsRequest() {
-		// Only a notification reaches the child unmodified. A message carrying
-		// a correlation key but no method is neither request nor notification,
-		// and forwarding it verbatim would put a caller-chosen id into the
-		// namespace s.request mints from, where the child's answer to it would
-		// satisfy another request's pending wait.
-		if msg.Key != "" {
+		// Only a notification reaches the child unmodified. This revision left
+		// no server-initiated request to answer, so a POSTed response is
+		// invalid input, and forwarding it verbatim would put a caller-chosen
+		// id into the namespace s.request mints from, where the child's answer
+		// to it would satisfy another request's pending wait.
+		if !msg.IsNotification() {
 			t.writeError(w, errInvalidMessage)
 			return
 		}

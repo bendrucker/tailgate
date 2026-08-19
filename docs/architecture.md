@@ -63,6 +63,8 @@ Each exchange gets a one-minute timeout, canceled the moment a response's `Conte
 
 A caller's JSON-RPC ID never reaches the child. The transport substitutes a monotonic ID of its own on the way in and restores the caller's on the way out, whichever era the caller speaks. Independent POSTs from one caller may each call themselves request `1`, and a caller that hangs up mid-request and retries reuses an ID the child is still working on. Correlating on the caller's ID would let either request take the other's answer.
 
+A notification is the one caller message that reaches the child unmodified, because it is the one carrying no ID. tailgate drops a child's server-initiated requests, so a client is never handed anything to answer, and a POSTed response therefore answers nothing tailgate carried. The stateful revisions make such a response legal, so it gets the `202` they specify and goes no further. The stateless revision left no server-initiated request to answer, so there it is a `400`. A message carrying neither a method nor an ID is a `400` on both, since it names nothing to dispatch and nothing to answer.
+
 ### Stateful Sessions
 
 A caller on a revision through 2025-11-25 gets one child per session. `initialize` reserves a cap slot, mints a cryptographically random session ID, spawns the child, and runs the handshake. The session ID is bound to both the child and the identity that created it, and `DELETE` terminates the session.
