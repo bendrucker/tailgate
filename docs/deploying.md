@@ -2,37 +2,33 @@
 
 ## Installing
 
-```
+```sh
 go install github.com/bendrucker/tailgate@latest
 ```
 
-## Tailnet setup
+## Tailnet Prerequisites
 
-tsidp must already be running on the tailnet. [Tailscale's tsidp documentation](https://tailscale.com/docs/features/tsidp) covers deploying it. Its URL is the `oidc.issuer` value.
+tsidp must already be running on the tailnet. [Tailscale's tsidp documentation](https://tailscale.com/docs/features/tsidp) covers deploying it, and its URL is the `oidc.issuer` value.
 
-Grant the `funnel` node attribute to tailgate's node. Without it, Funnel fails at the public edge.
+Grant the `funnel` node attribute to tailgate's node in the tailnet policy. Without it, Funnel fails at the public edge.
 
-Generate the tsidp grant and append it to the policy:
+Node keys expire on the tailnet's [key expiry](https://tailscale.com/kb/1028/key-expiry) schedule, six months by default. Disable expiry for tailgate's node, or use an [auth key](https://tailscale.com/kb/1085/auth-keys) scoped to a tag. An expired key takes tailgate offline until someone reauthorizes it by hand.
 
-```
+## The tsidp Grant
+
+tsidp matches the RFC 8707 `resource` parameter against its app-capability [grant](https://tailscale.com/kb/1324/acl-grants) with no canonicalization, so the same string has to appear identically in the client's token request, in tailgate's audience check, and in the tailnet policy. tailgate owns the first two and generates the third:
+
+```sh
 tailgate grant -config /etc/tailgate.hujson >> tailnet-policy/grants.hujson
 ```
 
-This needs `node.tailnet` in the config, since the resource URIs are built from the node's FQDN. Add `-allow-admin-ui` if you will register clients through tsidp's admin UI, and `-allow-dcr` for dynamic client registration. Neither is granted by default.
+The output is one entry of the policy's `grants` array. Regenerate it when upstreams change rather than editing a resource string, since a hand-edited URI denies every request with an audience mismatch and nothing pointing at why.
 
-Register each MCP client with tsidp as a confidential client, from a tailnet device, in tsidp's admin UI at the issuer origin. `/register` and the admin UI are reachable only from the tailnet, and tailgate does not front `/register`.
+Generating never contacts the control server, which is why it needs `node.tailnet` in the config: the resource URIs are built from the node's FQDN. `-src`, `-dst`, and `-users` shape the grant envelope. `-dst` defaults to `*` because a grant destination must be a tag, user, group, host alias, or address, none of which can be derived from the issuer URL. Narrow it when tsidp runs on a tagged node. `-allow-admin-ui` and `-allow-dcr` add those tsidp capabilities to the generated rule, and neither is granted by default.
 
-Authorizing a client sends a browser to tsidp's `/authorize`, which tsidp refuses over Funnel. Whoever completes that step must be on the tailnet.
+## Running as a Service
 
-Give the client its `client_id` and `client_secret`, plus the RFC 8707 `resource` value for the upstream it calls. That value is the canonical URI `tailgate grant` emits, `https://<node>.<tailnet>.ts.net/mcp/<name>`. A client that omits `resource` on the token request gets a token carrying no resource audience, and every one of its requests then fails the audience check.
-
-A client that discovers its authorization server from the RFC 9728 metadata needs no further configuration. One that asks for an authorization server URL outright takes tailgate's own origin, `https://<node>.<tailnet>.ts.net`, which fronts `/authorize` and `/token`.
-
-Clients must request the `email` scope. Introspection omits `email` without it, and an email allowlist then denies every request from that client.
-
-## Running as a service
-
-Set `TS_AUTHKEY` for the first start so the node joins unattended. A launchd sketch:
+Set `TS_AUTHKEY` for the first start so the node joins unattended. The node key persists in `state_dir`, so later starts never log in again. A launchd sketch:
 
 ```xml
 <dict>
@@ -63,40 +59,73 @@ Restart=always
 TimeoutStopSec=60
 ```
 
-`SIGINT` and `SIGTERM` drain in-flight requests and open SSE streams for up to 30 seconds, then wait up to 10 more for the connections that remain. The supervisor's kill timeout must exceed the 40-second total.
+`SIGINT` and `SIGTERM` stop the listener, drain in-flight requests and open SSE streams for up to 30 seconds, then wait up to 10 more for connections that never reached a transport. The supervisor's kill timeout must exceed the 40-second total.
 
-## Node keys
+## Startup Failures
 
-Node keys expire on the tailnet's key expiry schedule, six months by default. Disable expiry for tailgate's node, or use an auth key scoped to a tag. An expired key takes tailgate offline until someone reauthorizes it by hand.
+Nothing serves until every startup step succeeds, so a failure here is downtime rather than an unauthenticated window.
 
-## Startup failures
+- A node with no auth key and no saved state exits after 90 seconds rather than waiting on a login nobody is there to complete. Run once with `-open-login` on a machine with a browser to authorize interactively, which waits five minutes.
+- The issuer's discovery document must carry an `issuer` field equal to the configured `oidc.issuer`, and must advertise an `introspection_endpoint` sharing the issuer's scheme and host.
+- Setting `node.tailnet` makes tailgate compare the name the join reports against it. A mismatch stops it, because a control server that suffixes a taken hostname shifts every resource URI away from the grant.
+- An optional top-level `favicon` names an image file, served at `/favicon.ico` under a root page linking it. A path that cannot be read, or that is zero bytes, fails startup. Without one, the icon crawlers that supply a client like claude.ai with a connector icon fall back to Tailscale's logo for a `*.ts.net` node.
 
-A node with no auth key and no saved state exits after 90 seconds rather than waiting on a login nobody is there to complete. Run once with `-open-login` on a machine with a browser to authorize interactively, which waits five minutes.
+## Registering Clients
 
-An optional top-level `favicon` names an icon served at `/favicon.ico`, alongside a root page linking it. Crawlers index it for the origin, which is where a client like claude.ai gets a connector's icon. Without it a `*.ts.net` node shows Tailscale's logo. A configured icon that cannot be read, or that is zero bytes, fails startup.
+tsidp's `/register` and admin UI answer only on the tailnet, and tailgate does not front `/register`. Register each MCP client as a confidential client from a tailnet device, in tsidp's admin UI at the issuer origin.
 
-The issuer's discovery document must carry an `issuer` field equal to the configured `oidc.issuer`. It must advertise an `introspection_endpoint`, and that endpoint must share the issuer's scheme and host. Any of these failing stops tailgate before it serves.
+Give the client its `client_id` and `client_secret`, plus the `resource` value for the upstream it calls, which is the canonical URI `tailgate grant` emitted for that upstream. A client that omits `resource` on the token request gets a token carrying no resource audience, and every one of its requests then fails the audience check.
 
-Setting `node.tailnet` also makes tailgate check the name the join reports. A mismatch stops it from serving.
+Clients must request the `email` scope. Introspection omits `email` without it, and an email allowlist then denies every request from that client.
 
-## Policy evaluation
+A client that discovers its authorization server from the RFC 9728 metadata needs no further configuration. One that asks for an authorization server URL outright, as claude.ai does, takes tailgate's own origin, `https://<node>.<tailnet>.ts.net`, which fronts `/authorize` and `/token`.
 
-Policy is allow-only. An upstream with no policy rule is reachable by nobody.
+Policy is allow-only, so an upstream with no rule is reachable by nobody. A `sub` match is tsidp's bare decimal user ID, not the `userid:N` form that appears in ID tokens. A `claim` map matches the rest of what introspection returns, which is `username` and `scope`.
 
-Every condition within one `allow` entry must match.
+## Getting a Token
 
-A `sub` value is the bare decimal user ID, not the `userid:N` form that appears in ID tokens.
+Whoever completes the `/authorize` step has to be on the tailnet, since tsidp refuses that endpoint over Funnel.
 
-Besides `sub` and `email`, a `claim` map matches the other claims introspection returns, which are `username` and `scope`. Grant `extraClaims`, including `groups`, appear only in ID tokens and userinfo, so no policy can match on them.
+```mermaid
+sequenceDiagram
+  autonumber
+  participant C as MCP client
+  participant T as tailgate
+  participant I as tsidp
+  participant U as upstream
 
-## Fixed limits
+  C->>T: POST /mcp/github, no token
+  T-->>C: 401, WWW-Authenticate names metadata and scopes
+  C->>T: GET /.well-known/oauth-protected-resource/mcp/github
+  T-->>C: authorization server is tailgate's origin
+  C->>T: GET /.well-known/oauth-authorization-server
+  T-->>C: authorization server metadata
+  Note over C,I: the authorizing browser must be on the tailnet
+  C->>T: GET /authorize
+  T-->>C: 302 to tsidp's /authorize
+  C->>I: user authorizes on the tailnet
+  C->>T: POST /token with resource=.../mcp/github
+  T->>I: proxied token request
+  I-->>T: access token with aud = .../mcp/github
+  T-->>C: access token
+  C->>T: POST /mcp/github with Bearer token
+  T->>I: introspect over the tailnet
+  T->>T: audience and policy checks
+  T->>U: forward, token stripped
+  U-->>T: response, JSON or SSE
+  T-->>C: response, JSON or SSE
+```
 
-Request bodies are capped at 1 MiB. Sessions expire after an hour. A verified token is cached for up to five minutes, and never past its own expiry. The config file has no keys for any of these.
+A client that skips discovery joins at step 5, probing `/.well-known/oauth-authorization-server` at the MCP origin.
 
-On a stdio upstream, `max_children` and `idle_timeout` are the only tunable limits.
+## Limits
 
-## Operating notes
+Request bodies are capped at 1 MiB and session bindings expire after an hour. Neither has a config key. On a stdio upstream, `max_children` (default 4) and `idle_timeout` (default 5m) are the only tunable limits.
+
+## Operating Notes
 
 The Funnel listener also accepts tailnet peers dialing the same port. Those requests still need a bearer token, because Funnel strips tailnet identity.
 
 Setting `TAILGATE_TSNET_DEBUG` to any non-empty value routes the embedded node's internal logs to `slog`. Funnel ingress problems show up there.
+
+[architecture.md](architecture.md) maps the internals. [security.md](security.md) states the trust boundaries and the known limitations, including how long revocation lags.
