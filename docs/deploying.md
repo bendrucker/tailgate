@@ -12,13 +12,21 @@ tsidp must already be running on the tailnet. [Tailscale's tsidp documentation](
 
 Grant the `funnel` node attribute to tailgate's node. Without it, Funnel fails at the public edge.
 
-Run `tailgate grant` and follow its output.
+Generate the tsidp grant and append it to the policy:
+
+```
+tailgate grant -config /etc/tailgate.hujson >> tailnet-policy/grants.hujson
+```
+
+This needs `node.tailnet` in the config, since the resource URIs are built from the node's FQDN. Add `-allow-admin-ui` if you will register clients through tsidp's admin UI, and `-allow-dcr` for dynamic client registration. Neither is granted by default.
 
 Register each MCP client with tsidp as a confidential client, from a tailnet device, in tsidp's admin UI at the issuer origin. `/register` and the admin UI are reachable only from the tailnet, and tailgate does not front `/register`.
 
 Authorizing a client sends a browser to tsidp's `/authorize`, which tsidp refuses over Funnel. Whoever completes that step must be on the tailnet.
 
 Give the client its `client_id` and `client_secret`, plus the RFC 8707 `resource` value for the upstream it calls. That value is the canonical URI `tailgate grant` emits, `https://<node>.<tailnet>.ts.net/mcp/<name>`. A client that omits `resource` on the token request gets a token carrying no resource audience, and every one of its requests then fails the audience check.
+
+A client that discovers its authorization server from the RFC 9728 metadata needs no further configuration. One that asks for an authorization server URL outright takes tailgate's own origin, `https://<node>.<tailnet>.ts.net`, which fronts `/authorize` and `/token`.
 
 Clients must request the `email` scope. Introspection omits `email` without it, and an email allowlist then denies every request from that client.
 
@@ -55,7 +63,7 @@ Restart=always
 TimeoutStopSec=60
 ```
 
-`SIGINT` and `SIGTERM` drain in-flight requests and open SSE streams for up to 30 seconds before the node leaves the tailnet. The supervisor's kill timeout must exceed that.
+`SIGINT` and `SIGTERM` drain in-flight requests and open SSE streams for up to 30 seconds, then wait up to 10 more for the connections that remain. The supervisor's kill timeout must exceed the 40-second total.
 
 ## Node keys
 
@@ -65,7 +73,7 @@ Node keys expire on the tailnet's key expiry schedule, six months by default. Di
 
 A node with no auth key and no saved state exits after 90 seconds rather than waiting on a login nobody is there to complete. Run once with `-open-login` on a machine with a browser to authorize interactively, which waits five minutes.
 
-A configured `favicon` that cannot be read, or that is zero bytes, fails startup.
+An optional top-level `favicon` names an icon served at `/favicon.ico`, alongside a root page linking it. Crawlers index it for the origin, which is where a client like claude.ai gets a connector's icon. Without it a `*.ts.net` node shows Tailscale's logo. A configured icon that cannot be read, or that is zero bytes, fails startup.
 
 The issuer's discovery document must carry an `issuer` field equal to the configured `oidc.issuer`. It must advertise an `introspection_endpoint`, and that endpoint must share the issuer's scheme and host. Any of these failing stops tailgate before it serves.
 
@@ -76,8 +84,6 @@ Setting `node.tailnet` also makes tailgate check the name the join reports. A mi
 Policy is allow-only. An upstream with no policy rule is reachable by nobody.
 
 Every condition within one `allow` entry must match.
-
-Rules evaluate in configured order. The first match wins.
 
 A `sub` value is the bare decimal user ID, not the `userid:N` form that appears in ID tokens.
 
@@ -92,7 +98,5 @@ On a stdio upstream, `max_children` and `idle_timeout` are the only tunable limi
 ## Operating notes
 
 The Funnel listener also accepts tailnet peers dialing the same port. Those requests still need a bearer token, because Funnel strips tailnet identity.
-
-An optional top-level `favicon` names an icon served at `/favicon.ico`, alongside a root page linking it. Crawlers index it for the origin, which is where a client like claude.ai gets a connector's icon. Without it a `*.ts.net` node shows Tailscale's logo.
 
 Setting `TAILGATE_TSNET_DEBUG` to any non-empty value routes the embedded node's internal logs to `slog`. Funnel ingress problems show up there.
