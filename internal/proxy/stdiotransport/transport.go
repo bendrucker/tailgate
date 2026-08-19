@@ -83,6 +83,7 @@ const (
 
 var (
 	errMissingSessionID = errors.New("stdiotransport: Mcp-Session-Id is required")
+	errAmbiguousSession = errors.New("stdiotransport: Mcp-Session-Id is present more than once")
 	errUnauthenticated  = errors.New("stdiotransport: request carries no authorized identity")
 	errBodyTooLarge     = errors.New("stdiotransport: request body exceeds the message limit")
 	errBodyTimeout      = errors.New("stdiotransport: request body was not sent in time")
@@ -112,9 +113,18 @@ type Options struct {
 	Env []string
 	// Dir is the child's working directory, defaulting to tailgate's.
 	Dir string
+	// UID and GID run the child under a different user and group than
+	// tailgate's own. Zero means unset, which leaves the child at tailgate's
+	// uid with no containment at all. Changing a child's uid is privileged, so
+	// a tailgate that does not hold that privilege fails the spawn rather than
+	// starting the child uncontained.
+	UID int
+	GID int
 	// MaxSessions caps live sessions per identity per upstream, which is the
 	// config's max_children: a session is a child. The cap is per-identity so
-	// one caller cannot starve the others.
+	// one caller cannot starve the others. It bounds one further thing that is
+	// not a child: the subscription streams a single child will carry at once,
+	// which cost no process but hold one open for as long as they last.
 	MaxSessions int
 	// IdleTimeout terminates a session no request has touched for this long.
 	IdleTimeout time.Duration
@@ -220,6 +230,16 @@ func (t *Transport) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Every session lookup below reads one copy of this header, and this
+	// transport is what binds a session id to its caller, so which copy to
+	// resolve is a question it must answer rather than inherit: leading with a
+	// session the caller holds and trailing with one it does not would pass the
+	// binding check on the value read here.
+	if len(r.Header.Values(sessionHeader)) > 1 {
+		t.writeError(w, errAmbiguousSession)
+		return
+	}
+
 	requested := r.Header.Get(protocolVersionHeader)
 	revision, err := protocol.Parse(requested)
 	if err != nil {
@@ -256,6 +276,10 @@ func (t *Transport) servePost(w http.ResponseWriter, r *http.Request, inflight *
 	msg, err := parseMessage(body)
 	if err != nil {
 		t.writeError(w, err)
+		return
+	}
+	if !msg.WellFormed() {
+		t.writeError(w, errInvalidMessage)
 		return
 	}
 
@@ -577,11 +601,13 @@ func (t *Transport) unregisterLocked(s *session) bool {
 func (t *Transport) supervise(s *session) {
 	s.pipes.Wait()
 	err := s.cmd.Wait()
-	t.releaseSlot(s.subject)
-	// Marking before the broadcast keeps every waiter's view ordered: a
-	// goroutine that observes exited never signals a pid that is no longer the
-	// child's.
+	// The pid is the OS's to hand out again the moment Wait returns, so it is
+	// retired as a signal target before anything that can block: releaseSlot
+	// takes the transport's lock, and terminate's grace timer firing inside that
+	// window would signal a process group that is no longer the child's. Marking
+	// before the broadcast orders every waiter's view for the same reason.
 	s.markReaped()
+	t.releaseSlot(s.subject)
 	close(s.exited)
 	t.removeSession(s)
 	t.logger.Info("stdio child exited", "session", s.id, "sub", s.subject, "err", err)
@@ -692,19 +718,27 @@ func waitForExit(ctx context.Context, sessions []*session) error {
 	return nil
 }
 
-// scrubbedEnv names the environment variables tailgate itself consumes as
-// credentials. tsnet reads both spellings of its node auth key, and a key that
-// can join nodes to the tailnet is exactly what a hostile MCP server wants.
+// scrubbedEnv names tailgate's tailnet auth key, which tsnet reads under both
+// spellings. It is the one secret in this environment that keeps working
+// wherever it is carried: a key that can join nodes to the tailnet outlives the
+// host it leaked from.
 var scrubbedEnv = []string{"TS_AUTHKEY", "TS_AUTH_KEY"}
 
 // childEnv passes tailgate's environment plus the upstream's additions, so a
 // child inherits PATH and HOME without every upstream restating them.
 //
-// A stdio upstream is third-party code (commonly an npx or uv wrapper) running
-// as tailgate, so tailgate's own credentials never reach it: scrubbedEnv is
-// removed. The scrub is a denylist because a child still needs the ordinary
-// environment to run at all. An upstream's own Env is applied afterwards, since
-// that is the operator deliberately handing the child a value.
+// The scrub removes the tailnet auth key and nothing else, and it is a denylist
+// because a child still needs the ordinary environment to run at all. It is not
+// a boundary: an upstream left at tailgate's uid reads the node state directory
+// and the config file whatever the environment says, and Options.UID is what
+// changes that. What the scrub buys either way is that the one long-lived
+// transportable credential tailgate holds is not handed to the child.
+//
+// An upstream's own Env is applied afterwards, since that is the operator
+// deliberately handing the child a value. Appending is also how it overrides
+// one: os/exec builds the child's environment keeping the last occurrence of
+// each name, so an upstream running under its own uid names its own HOME here
+// rather than inheriting tailgate's, which it cannot write.
 func (t *Transport) childEnv() []string {
 	parent := os.Environ()
 	env := make([]string, 0, len(parent)+len(t.options.Env))
@@ -764,6 +798,7 @@ func statusOf(err error) int {
 	switch {
 	case errors.Is(err, errInvalidMessage),
 		errors.Is(err, errMissingSessionID),
+		errors.Is(err, errAmbiguousSession),
 		errors.Is(err, errDuplicateRequestID):
 		return http.StatusBadRequest
 	case errors.Is(err, errBodyTooLarge):

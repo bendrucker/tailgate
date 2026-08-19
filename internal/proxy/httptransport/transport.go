@@ -70,7 +70,7 @@ func New(target *url.URL, logger *slog.Logger) *Transport {
 			// Rewrite drops only the four X-Forwarded headers it knows how to
 			// re-set, so the full strip runs here as well as in the router: the
 			// no-token-passthrough invariant cannot depend on caller discipline.
-			proxy.StripCredentials(r.Out.Header)
+			proxy.StripRequest(r.Out)
 			r.Out.Host = target.Host
 		},
 		// Flush every write immediately so each SSE event reaches the client
@@ -78,6 +78,7 @@ func New(target *url.URL, logger *slog.Logger) *Transport {
 		FlushInterval: -1,
 		Transport:     dialer,
 		ModifyResponse: func(resp *http.Response) error {
+			stripResponse(resp.Header)
 			if isEventStream(resp.Header) {
 				if timer, ok := resp.Request.Context().Value(exchangeTimerKey{}).(*time.Timer); ok {
 					timer.Stop()
@@ -108,6 +109,29 @@ func New(target *url.URL, logger *slog.Logger) *Transport {
 		},
 	}
 	return t
+}
+
+// corsHeaderPrefix names the family that states who may reach an origin
+// cross-origin. An upstream's answer would state it for the whole origin.
+const corsHeaderPrefix = "Access-Control-"
+
+// stripResponse removes the response headers that would govern the origin
+// rather than the upstream that set them. Every upstream, the authorization
+// server facade, the metadata documents, and the site answer on one Funnel
+// origin, so a cookie one upstream sets is sent back to all of them, and a CORS
+// allowance one upstream grants opens the origin to that grantee.
+//
+// The list is a denylist because MCP does not enumerate what a server may put
+// on a response. An allowlist would drop whatever a legitimate upstream sends
+// that nobody thought of, and do it silently, which is the failure a proxy
+// carrying an extensible protocol cannot afford.
+func stripResponse(header http.Header) {
+	header.Del("Set-Cookie")
+	for name := range header {
+		if len(name) >= len(corsHeaderPrefix) && strings.EqualFold(name[:len(corsHeaderPrefix)], corsHeaderPrefix) {
+			delete(header, name)
+		}
+	}
 }
 
 // isEventStream reports whether the response is an SSE stream. Media types are

@@ -262,7 +262,11 @@ func (t *Transport) initialize(ctx context.Context, s *session) error {
 // request goes out is what keeps a notification the child emits immediately
 // after from falling between the two.
 func (t *Transport) serveListen(w http.ResponseWriter, inflight *proxy.InFlight, s *session, msg message) {
-	l, unlisten := s.listen()
+	l, unlisten, err := s.listen(t.options.MaxSessions)
+	if err != nil {
+		t.writeError(w, err)
+		return
+	}
 	defer unlisten()
 
 	ended, release, err := s.subscribe(msg, t.options.RequestTimeout)

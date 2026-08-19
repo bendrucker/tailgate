@@ -459,3 +459,107 @@ func scanEvents(response *http.Response, count int) ([]map[string]any, error) {
 	}
 	return events, fmt.Errorf("stream ended: %w", scanner.Err())
 }
+
+// A subscription stream is exempt from the exchange timeout and holds its child
+// off the idle sweep, so one caller opening them without limit would pin the
+// host's goroutines and connections against every other caller.
+func TestSubscriptionStreamsAreCappedPerChild(t *testing.T) {
+	const capacity = 4
+	h := newHarness(t, Options{MaxSessions: capacity, IdleTimeout: time.Hour})
+	// The default client caps its own connections well below what this opens.
+	client := &http.Client{Transport: &http.Transport{MaxIdleConnsPerHost: 128}}
+	t.Cleanup(client.CloseIdleConnections)
+
+	listen := func(id int) *http.Response {
+		body := statelessBody(id, listenMethod, "")
+		request, err := http.NewRequest(http.MethodPost, h.gateway.URL, strings.NewReader(body))
+		if err != nil {
+			t.Errorf("new request: %v", err)
+			return nil
+		}
+		request.Header.Set(subjectHeader, "alice")
+		request.Header.Set(protocolVersionHeader, stateless)
+		response, err := client.Do(request)
+		if err != nil {
+			t.Errorf("listen %d: %v", id, err)
+			return nil
+		}
+		return response
+	}
+
+	const attempts = 64
+	responses := make([]*http.Response, attempts)
+	var wait sync.WaitGroup
+	for i := range attempts {
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			responses[i] = listen(i + 1)
+		}()
+	}
+	wait.Wait()
+
+	var opened, refused int
+	for _, response := range responses {
+		if response == nil {
+			continue
+		}
+		switch response.StatusCode {
+		case http.StatusOK:
+			opened++
+		case http.StatusTooManyRequests:
+			refused++
+		default:
+			t.Errorf("unexpected status %d", response.StatusCode)
+		}
+	}
+	if opened != capacity {
+		t.Errorf("expected exactly %d streams to open, got %d", capacity, opened)
+	}
+	if refused != attempts-capacity {
+		t.Errorf("expected %d refusals, got %d", attempts-capacity, refused)
+	}
+
+	// Every stream a caller abandons must free its slot, or a caller that opens
+	// and hangs up in a loop reaches the cap permanently without holding a
+	// single live stream.
+	for _, response := range responses {
+		if response != nil {
+			response.Body.Close()
+		}
+	}
+	waitFor(t, "the abandoned streams to release their slots", func() bool {
+		return h.transport.listenerCount() == 0
+	})
+
+	reopened := listen(attempts + 1)
+	defer reopened.Body.Close()
+	if reopened.StatusCode != http.StatusOK {
+		t.Fatalf("expected a freed slot to be reusable, got %d", reopened.StatusCode)
+	}
+}
+
+// A child that goes away takes its streams with it, which is the other way a
+// slot comes back: the handlers holding them are released by the registry
+// emptying rather than by their callers.
+func TestChildExitReleasesSubscriptionSlots(t *testing.T) {
+	h := newHarness(t, Options{IdleTimeout: time.Hour})
+	response := h.do(t, call{subject: "alice", protocol: stateless, body: statelessBody(1, listenMethod, "")})
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("expected the stream to open, got %d", response.StatusCode)
+	}
+	waitFor(t, "the stream to register", func() bool { return h.transport.listenerCount() == 1 })
+
+	h.transport.mu.Lock()
+	var child *session
+	for _, s := range h.transport.sessions {
+		child = s
+	}
+	h.transport.mu.Unlock()
+	h.transport.removeSession(child)
+
+	waitFor(t, "the child's exit to release its streams", func() bool {
+		return h.transport.listenerCount() == 0
+	})
+}

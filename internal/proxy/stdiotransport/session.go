@@ -89,6 +89,11 @@ func (t *Transport) spawn(id string, subject string) (_ *session, err error) {
 	cmd.Dir = t.options.Dir
 	cmd.Env = t.childEnv()
 	isolateProcessGroup(cmd)
+	if t.options.UID != 0 {
+		if err := runAs(cmd, t.options.UID, t.options.GID); err != nil {
+			return nil, err
+		}
+	}
 
 	stdinRead, stdin, err := os.Pipe()
 	if err != nil {
@@ -127,7 +132,7 @@ func (t *Transport) spawn(id string, subject string) (_ *session, err error) {
 	s.touch()
 
 	if err := cmd.Start(); err != nil {
-		return nil, err
+		return nil, t.startError(err)
 	}
 
 	// Both pipes must reach EOF before cmd.Wait runs, or Wait closes them out
@@ -152,6 +157,18 @@ func (t *Transport) spawn(id string, subject string) (_ *session, err error) {
 		s.logStderr(stderr)
 	}()
 	return s, nil
+}
+
+// startError names the cause a configured uid makes likely and the error text
+// does not: changing a child's uid is privileged, and a tailgate that does not
+// hold that privilege can never start this upstream. The upstream is
+// unavailable rather than uncontained, since nothing falls back to tailgate's
+// own uid.
+func (t *Transport) startError(err error) error {
+	if t.options.UID == 0 {
+		return err
+	}
+	return fmt.Errorf("start as uid %d gid %d, which requires privilege tailgate may not hold: %w", t.options.UID, t.options.GID, err)
 }
 
 // readMessages fans the child's newline-delimited output out to the requests
@@ -207,6 +224,14 @@ func (s *session) logStderr(stderr io.Reader) {
 	scanner.Buffer(make([]byte, 0, 4<<10), maxLineBytes)
 	for scanner.Scan() {
 		s.logger.Debug("stdio child stderr", "line", scanner.Text())
+	}
+	if err := scanner.Err(); err != nil {
+		// Past maxLineBytes nothing further can be framed as a line, but the
+		// child goes on writing, and a pipe no one drains stops it on its next
+		// write with the session otherwise healthy. Reading the rest away costs
+		// the diagnostics and keeps the child running.
+		s.logger.Warn("stdio child stderr ended in error", "err", err)
+		_, _ = io.Copy(io.Discard, stderr)
 	}
 }
 

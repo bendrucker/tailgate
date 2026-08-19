@@ -2,6 +2,7 @@ package stdiotransport
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -20,6 +21,9 @@ const (
 	fakeChildGrandchild = "TAILGATE_STDIO_FAKE_CHILD_GRANDCHILD"
 	fakeChildExitOnly   = "TAILGATE_STDIO_FAKE_CHILD_EXIT_ON_START"
 	fakeChildSilent     = "TAILGATE_STDIO_FAKE_CHILD_SILENT"
+	// fakeChildStderrFlood makes the child open with one diagnostic line longer
+	// than the reader can frame, and go on writing after it.
+	fakeChildStderrFlood = "TAILGATE_STDIO_FAKE_CHILD_STDERR_FLOOD"
 	// fakeChildDiscover chooses how the child answers server/discover.
 	// "answer" stands in for a server written against the stateless revision.
 	// Any other value is a JSON-RPC error code to refuse with, which is how the
@@ -55,6 +59,7 @@ func runFakeChild() {
 	if os.Getenv(fakeChildExitOnly) != "" {
 		os.Exit(1)
 	}
+	floodStderr()
 	silent := os.Getenv(fakeChildSilent) != ""
 	grandchildPid := startGrandchild()
 
@@ -152,6 +157,16 @@ func discoverRefusalCode() int {
 		return codeMethodNotFound
 	}
 	return code
+}
+
+// floodStderr writes one line past what the parent can frame, before the child
+// has read anything. A parent that stops draining stderr there leaves the rest
+// of the write with nowhere to go, and the child never reaches its stdin loop.
+func floodStderr() {
+	if os.Getenv(fakeChildStderrFlood) == "" {
+		return
+	}
+	os.Stderr.Write(bytes.Repeat([]byte("x"), maxLineBytes+(1<<20)))
 }
 
 // startGrandchild stands in for the wrapper case, where the configured command

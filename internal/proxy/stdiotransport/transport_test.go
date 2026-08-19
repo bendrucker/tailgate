@@ -20,6 +20,7 @@ import (
 
 	"github.com/bendrucker/tailgate/internal/audit"
 	"github.com/bendrucker/tailgate/internal/auth"
+	"github.com/bendrucker/tailgate/internal/protocol"
 	"github.com/google/go-cmp/cmp"
 )
 
@@ -222,6 +223,25 @@ func (t *Transport) sessionCount() int {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	return len(t.sessions)
+}
+
+// listenerCount reports the subscription streams open across every session,
+// which is what a slot leaked by an abandoned stream shows up in.
+func (t *Transport) listenerCount() int {
+	t.mu.Lock()
+	sessions := make([]*session, 0, len(t.sessions))
+	for _, s := range t.sessions {
+		sessions = append(sessions, s)
+	}
+	t.mu.Unlock()
+
+	count := 0
+	for _, s := range sessions {
+		s.mu.Lock()
+		count += len(s.listeners)
+		s.mu.Unlock()
+	}
+	return count
 }
 
 // reservedSlots reports the cap slots subject currently holds, which is what a
@@ -1240,6 +1260,28 @@ func TestChildEnvironmentScrubsTailgateCredentials(t *testing.T) {
 	}
 }
 
+// TestChildEnvironmentPrefersTheUpstreamsOwnEntry covers what an upstream
+// running under its own uid depends on. It cannot write tailgate's HOME, so it
+// has to name its own, and the only place to name one is the upstream's Env.
+// os/exec builds the child's environment keeping the last occurrence of each
+// name, and Env is appended after the inherited environment, so it wins.
+func TestChildEnvironmentPrefersTheUpstreamsOwnEntry(t *testing.T) {
+	t.Setenv("HOME", "/inherited-from-tailgate")
+
+	h := newHarness(t, Options{Env: []string{"HOME=/var/lib/tailgate-upstream"}})
+	session := h.initialize(t, "alice")
+
+	response := h.do(t, call{subject: "alice", session: session, body: requestBody(2, envMethod, "HOME", 0)})
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d", response.StatusCode)
+	}
+	result, _ := decodeMessage(t, response)["result"].(map[string]any)
+	if value, _ := result["value"].(string); value != "/var/lib/tailgate-upstream" {
+		t.Fatalf("child saw HOME=%q, expected the upstream's own", value)
+	}
+}
+
 // TestClaimedSessionSurvivesTheIdleSweep pins the resolve-and-claim to one
 // critical section. A request that has resolved its session but not yet marked
 // it busy used to be invisible to the reaper, which then terminated the child
@@ -1348,4 +1390,130 @@ func (b *syncBuffer) String() string {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return b.buf.String()
+}
+
+// A message carrying an id that correlates to nothing is none of the three
+// shapes JSON-RPC defines. Passing one to the child would spend a caller-chosen
+// id in the child's own id space on a message whose answer can never be routed
+// back, so it is refused before any child sees it, under either era.
+func TestMessagesOutsideTheJSONRPCShapesAreRejected(t *testing.T) {
+	h := newHarness(t, Options{})
+	session := h.initialize(t, "alice")
+
+	for _, tc := range []struct {
+		name string
+		body string
+	}{
+		{
+			name: "array id",
+			body: `{"jsonrpc":"2.0","id":[1],"method":"tools/call","params":{}}`,
+		},
+		{
+			name: "object id",
+			body: `{"jsonrpc":"2.0","id":{"a":1},"method":"tools/call","params":{}}`,
+		},
+		{
+			name: "null id with a method",
+			body: `{"jsonrpc":"2.0","id":null,"method":"tools/call","params":{}}`,
+		},
+		{
+			name: "neither a method nor a usable id",
+			body: `{"jsonrpc":"2.0","id":null,"result":{}}`,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			bound := h.do(t, call{subject: "alice", session: session, body: tc.body})
+			bound.Body.Close()
+			if bound.StatusCode != http.StatusBadRequest {
+				t.Errorf("session revision: expected 400, got %d", bound.StatusCode)
+			}
+
+			sessionless := h.do(t, call{subject: "alice", protocol: stateless, body: tc.body})
+			defer sessionless.Body.Close()
+			if sessionless.StatusCode != http.StatusBadRequest {
+				t.Fatalf("stateless revision: expected 400, got %d", sessionless.StatusCode)
+			}
+			message := decodeMessage(t, sessionless)
+			failure, _ := message["error"].(map[string]any)
+			if code, ok := failure["code"].(float64); !ok || int(code) != protocol.CodeInvalidRequest {
+				t.Errorf("expected code %d, got %v", protocol.CodeInvalidRequest, failure["code"])
+			}
+		})
+	}
+}
+
+// Which copy of a repeated session header to resolve is not decidable, and this
+// transport is what binds a session id to its caller. Reading the first would
+// let a caller lead with a session it holds and trail with one it does not.
+func TestRepeatedSessionHeaderIsRefused(t *testing.T) {
+	h := newHarness(t, Options{})
+	mine := h.initialize(t, "alice")
+	theirs := h.initialize(t, "bob")
+
+	for _, tc := range []struct {
+		name   string
+		method string
+		body   string
+	}{
+		{
+			name:   "post",
+			method: http.MethodPost,
+			body:   requestBody(2, "tools/list", "", 0),
+		},
+		{
+			name:   "delete",
+			method: http.MethodDelete,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var body io.Reader
+			if tc.body != "" {
+				body = strings.NewReader(tc.body)
+			}
+			request, err := http.NewRequestWithContext(t.Context(), tc.method, h.gateway.URL, body)
+			if err != nil {
+				t.Fatalf("new request: %v", err)
+			}
+			request.Header.Set(subjectHeader, "alice")
+			request.Header.Add(sessionHeader, mine)
+			request.Header.Add(sessionHeader, theirs)
+
+			response, err := h.gateway.Client().Do(request)
+			if err != nil {
+				t.Fatalf("%s: %v", tc.method, err)
+			}
+			defer response.Body.Close()
+			if response.StatusCode != http.StatusBadRequest {
+				t.Fatalf("expected 400, got %d", response.StatusCode)
+			}
+		})
+	}
+
+	// The refusal must not have ended either session along the way.
+	for subject, session := range map[string]string{"alice": mine, "bob": theirs} {
+		response := h.do(t, call{subject: subject, session: session, body: requestBody(3, "tools/list", "", 0)})
+		response.Body.Close()
+		if response.StatusCode != http.StatusOK {
+			t.Errorf("%s lost its session to the refusal: got %d", subject, response.StatusCode)
+		}
+	}
+}
+
+// A child whose diagnostics run past what the reader can frame goes on writing
+// them. Once the reader stops, the pipe fills and stops the child on its next
+// write, which here is before it has read a single request.
+func TestUnframeableStderrDoesNotStallTheChild(t *testing.T) {
+	h := newHarness(t, Options{
+		Env:            []string{fakeChildStderrFlood + "=1"},
+		RequestTimeout: 10 * time.Second,
+	})
+
+	response := h.do(t, call{subject: "alice", body: initializeBody})
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("expected the child to answer past its stderr flood, got %d", response.StatusCode)
+	}
+	if session := response.Header.Get(sessionHeader); session == "" {
+		t.Error("initialize response carried no Mcp-Session-Id")
+	}
 }
