@@ -1,10 +1,14 @@
 // Package tsnetserver runs tailgate's embedded Tailscale node and Funnel
 // listener.
 //
-// A Server owns the node's lifecycle in the order the proxy seam requires:
-// Up joins the tailnet and yields the FQDN every canonical resource URL is
-// built from, ListenFunnel exposes the node on the public internet, and
-// shutdown runs StopAccepting, then the caller's transport drain, then Close.
+// tailgate joins the tailnet as its own node through tsnet and serves Funnel
+// itself, so it never depends on a host tailscaled. Nothing here may be
+// rewritten to call out to one.
+//
+// A Server owns the node's lifecycle in the order shutdown requires: Up joins
+// the tailnet and yields the FQDN every canonical resource URL is built from,
+// ListenFunnel exposes the node on the public internet, and shutdown runs
+// StopAccepting, then the caller's transport drain, then Close.
 package tsnetserver
 
 import (

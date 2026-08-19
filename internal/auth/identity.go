@@ -1,4 +1,8 @@
 // Package auth verifies OIDC tokens and authorizes identities against policy.
+//
+// tsidp access tokens are opaque, so verification is RFC 7662 introspection
+// over tsnet. No token is verified locally anywhere in this package, and no
+// JOSE or JWT dependency belongs here.
 package auth
 
 // Identity is the validated caller extracted from a tsidp token. It carries the

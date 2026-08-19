@@ -1,4 +1,8 @@
 // Package config loads and validates tailgate's HuJSON configuration.
+//
+// Reload is a process restart. There is no watcher and no reload path, and none
+// should be added: every consumer reads its configuration once at startup and
+// holds it for the process lifetime.
 package config
 
 import (
