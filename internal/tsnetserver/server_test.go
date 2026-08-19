@@ -190,6 +190,34 @@ func TestNew(t *testing.T) {
 	}
 }
 
+// TestNewAdvertisesTags covers the plumbing that puts the node's tailnet
+// identity in the config rather than leaving it implicit in whichever auth key
+// minted the node.
+func TestNewAdvertisesTags(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		tags []string
+	}{
+		{name: "no tags advertises none"},
+		{name: "one tag", tags: []string{"tag:tailgate"}},
+		{name: "several tags", tags: []string{"tag:tailgate", "tag:mcp"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv, err := New(Config{Hostname: "tailgate", Port: 443, Tags: tc.tags})
+			if err != nil {
+				t.Fatalf("New = %v", err)
+			}
+			node, ok := srv.node.(*tsnet.Server)
+			if !ok {
+				t.Fatalf("New built a %T, want a *tsnet.Server", srv.node)
+			}
+			if diff := cmp.Diff(tc.tags, node.AdvertiseTags); diff != "" {
+				t.Errorf("advertised tags (-want +got):\n%s", diff)
+			}
+		})
+	}
+}
+
 func TestServerUp(t *testing.T) {
 	blockUntilDone := func(ctx context.Context) (*ipnstate.Status, error) {
 		<-ctx.Done()
