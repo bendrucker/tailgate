@@ -44,7 +44,7 @@ func handler(cfg *config.Config, urls *resource.URLs, verifier router.Verifier, 
 		return nil, errors.Join(err, closeUpstreams(routes))
 	}
 
-	facade, err := authserver.New(urls.Origin(), cfg.OIDC.Issuer, issuerClient, logger)
+	facade, err := authserver.New(urls.Origin(), cfg.OIDC.Issuer, names, issuerClient, logger)
 	if err != nil {
 		return nil, errors.Join(err, closeUpstreams(routes))
 	}

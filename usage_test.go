@@ -59,7 +59,7 @@ Flags:
   -src string
     	policy source, comma separated (default "autogroup:member")
   -users string
-    	tsidp rule users, comma separated (default "*")
+    	tsidp rule users, comma separated (default: the identities the config's policy allows)
 
 A grant destination must be a tag, user, group, host alias, or address, so it
 cannot be derived from the issuer URL. Narrow -dst when tsidp runs on a tagged
@@ -97,8 +97,8 @@ func TestGrantCommandParseError(t *testing.T) {
 }
 
 // TestGrantCommandTrailingArgument covers a word that lost its leading dash. The
-// flag it meant to set keeps its default, and for -users that default authorizes
-// every user, so accepting it silently widens the grant.
+// flag it meant to set keeps its default, so a -users list meant to narrow the
+// grant is silently dropped in favor of whatever the default resolves to.
 func TestGrantCommandTrailingArgument(t *testing.T) {
 	var out, errOut bytes.Buffer
 	err := grantCommand([]string{"-config", "tailgate.hujson", "users", "alice"}, &out, &errOut)

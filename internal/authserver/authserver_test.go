@@ -8,20 +8,30 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
 const (
 	origin = "https://tailgate.example.ts.net"
 	issuer = "https://idp.example.ts.net"
+
+	// credentialedForm is the minimum a token request must carry to be
+	// forwarded: the facade refuses one that authenticates no client.
+	credentialedForm = "grant_type=authorization_code&client_id=abc&client_secret=shh"
 )
+
+// testUpstreams is the configured upstream set, which decides the RFC 8414
+// section 3.1 metadata paths the facade answers.
+var testUpstreams = []string{"things", "github"}
 
 func testFacade(t *testing.T, client *http.Client) *Facade {
 	t.Helper()
 	if client == nil {
 		client = http.DefaultClient
 	}
-	f, err := New(origin, issuer, client, slog.New(slog.DiscardHandler))
+	f, err := New(origin, issuer, testUpstreams, client, slog.New(slog.DiscardHandler))
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -138,7 +148,7 @@ func TestTokenProxiesCredentialsAndResource(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	f, err := New(origin, upstream.URL, upstream.Client(), slog.New(slog.DiscardHandler))
+	f, err := New(origin, upstream.URL, testUpstreams, upstream.Client(), slog.New(slog.DiscardHandler))
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -178,12 +188,12 @@ func TestTokenPreservesIssuerError(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	f, err := New(origin, upstream.URL, upstream.Client(), slog.New(slog.DiscardHandler))
+	f, err := New(origin, upstream.URL, testUpstreams, upstream.Client(), slog.New(slog.DiscardHandler))
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
 
-	req := httptest.NewRequest(http.MethodPost, TokenPath, strings.NewReader("grant_type=authorization_code"))
+	req := httptest.NewRequest(http.MethodPost, TokenPath, strings.NewReader(credentialedForm))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	rec := httptest.NewRecorder()
 	f.ServeHTTP(rec, req)
@@ -226,7 +236,7 @@ func TestTokenRejectsOversizedRequest(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	f, err := New(origin, upstream.URL, upstream.Client(), slog.New(slog.DiscardHandler))
+	f, err := New(origin, upstream.URL, testUpstreams, upstream.Client(), slog.New(slog.DiscardHandler))
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -251,9 +261,223 @@ func TestNewRejectsUnusableInputs(t *testing.T) {
 		{"issuer with fragment", origin, issuer + "#f"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if _, err := New(tc.origin, tc.issuer, http.DefaultClient, slog.New(slog.DiscardHandler)); err == nil {
+			if _, err := New(tc.origin, tc.issuer, testUpstreams, http.DefaultClient, slog.New(slog.DiscardHandler)); err == nil {
 				t.Fatal("New succeeded, want an error")
 			}
 		})
+	}
+}
+
+// A redirect from the token endpoint would be followed from inside the
+// tailnet on behalf of an unauthenticated caller, turning the facade into a
+// fetcher for anything the issuer's node can reach.
+func TestTokenDoesNotFollowRedirects(t *testing.T) {
+	var requests atomic.Int64
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		if r.URL.Path == TokenPath {
+			http.Redirect(w, r, "/elsewhere", http.StatusFound)
+			return
+		}
+		w.Write([]byte("tailnet-only"))
+	}))
+	defer upstream.Close()
+
+	f, err := New(origin, upstream.URL, testUpstreams, upstream.Client(), slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, TokenPath, strings.NewReader(credentialedForm))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	rec := httptest.NewRecorder()
+	f.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusFound {
+		t.Errorf("status = %d, want 302", rec.Code)
+	}
+	if got := requests.Load(); got != 1 {
+		t.Errorf("issuer requests = %d, want 1", got)
+	}
+	if strings.Contains(rec.Body.String(), "tailnet-only") {
+		t.Errorf("body = %q, want nothing fetched from the redirect target", rec.Body.String())
+	}
+}
+
+// The token endpoint is unauthenticated, so an issuer that never answers must
+// not be a way to hold tailgate's connections open.
+func TestTokenBoundsASlowIssuer(t *testing.T) {
+	release := make(chan struct{})
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-release
+	}))
+	defer upstream.Close()
+	defer close(release)
+
+	f, err := New(origin, upstream.URL, testUpstreams, upstream.Client(), slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	f.timeout = 50 * time.Millisecond
+
+	req := httptest.NewRequest(http.MethodPost, TokenPath, strings.NewReader(credentialedForm))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	rec := httptest.NewRecorder()
+	f.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadGateway {
+		t.Errorf("status = %d, want 502", rec.Code)
+	}
+}
+
+// The token endpoint is unauthenticated and reaches tsidp over the tailnet as
+// tailgate's own node. A request carrying no client credentials must stop at
+// the facade rather than arrive there identified by that node.
+func TestTokenRequiresClientCredentials(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		header     string
+		form       string
+		wantIssuer bool
+	}{
+		{
+			name: "no credentials at all",
+			form: "grant_type=authorization_code&code=abc",
+		},
+		{
+			name: "client id without a secret",
+			form: "grant_type=authorization_code&client_id=abc",
+		},
+		{
+			name: "empty secret",
+			form: "grant_type=authorization_code&client_id=abc&client_secret=",
+		},
+		{
+			name:   "bearer token instead of client authentication",
+			header: "Bearer opaque",
+			form:   "grant_type=authorization_code",
+		},
+		{
+			name:   "basic scheme with no credential",
+			header: "Basic ",
+			form:   "grant_type=authorization_code",
+		},
+		{
+			name:       "basic authorization header",
+			header:     "Basic Y2xpZW50OnNlY3JldA==",
+			form:       "grant_type=authorization_code",
+			wantIssuer: true,
+		},
+		{
+			name:       "client id and secret in the form",
+			form:       credentialedForm,
+			wantIssuer: true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var reached atomic.Bool
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				reached.Store(true)
+				w.Header().Set("Content-Type", "application/json")
+				w.Write([]byte(`{"access_token":"opaque","token_type":"Bearer"}`))
+			}))
+			defer upstream.Close()
+
+			f, err := New(origin, upstream.URL, testUpstreams, upstream.Client(), slog.New(slog.DiscardHandler))
+			if err != nil {
+				t.Fatalf("New: %v", err)
+			}
+
+			req := httptest.NewRequest(http.MethodPost, TokenPath, strings.NewReader(tc.form))
+			req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+			if tc.header != "" {
+				req.Header.Set("Authorization", tc.header)
+			}
+			rec := httptest.NewRecorder()
+			f.ServeHTTP(rec, req)
+
+			if got := reached.Load(); got != tc.wantIssuer {
+				t.Errorf("issuer reached = %v, want %v", got, tc.wantIssuer)
+			}
+			if tc.wantIssuer {
+				if rec.Code != http.StatusOK {
+					t.Errorf("status = %d, want 200", rec.Code)
+				}
+				return
+			}
+			if rec.Code != http.StatusBadRequest {
+				t.Errorf("status = %d, want 400", rec.Code)
+			}
+			var oauthErr struct {
+				Error       string `json:"error"`
+				Description string `json:"error_description"`
+			}
+			if err := json.Unmarshal(rec.Body.Bytes(), &oauthErr); err != nil {
+				t.Fatalf("decode refusal: %v", err)
+			}
+			if oauthErr.Error != "invalid_client" {
+				t.Errorf("error = %q, want invalid_client", oauthErr.Error)
+			}
+		})
+	}
+}
+
+// The facade must not answer discovery for a resource that does not exist. A
+// client trusting a document it found there would go looking for tokens for an
+// upstream tailgate does not serve.
+func TestMetadataResolvesOnlyConfiguredUpstreams(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		path string
+		want bool
+	}{
+		{name: "configured upstream", path: MetadataPath + "/mcp/things", want: true},
+		{name: "second configured upstream", path: MetadataPath + "/mcp/github", want: true},
+		{name: "unconfigured upstream", path: MetadataPath + "/mcp/absent"},
+		{name: "configured name with a suffix", path: MetadataPath + "/mcp/things-staging"},
+		{name: "configured name with a trailing slash", path: MetadataPath + "/mcp/things/"},
+		{name: "configured name with a further segment", path: MetadataPath + "/mcp/things/extra"},
+		{name: "traversal to a configured name", path: MetadataPath + "/mcp/absent/../things"},
+		{name: "traversal out of the subtree", path: MetadataPath + "/mcp/../../etc/passwd"},
+		{name: "bare subtree slash", path: MetadataPath + "/"},
+		{name: "arbitrary suffix", path: MetadataPath + "/anything"},
+		{name: "percent encoded configured name", path: MetadataPath + "/mcp/%74hings"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := testFacade(t, nil)
+			if got := f.Handles(tc.path); got != tc.want {
+				t.Errorf("Handles(%q) = %v, want %v", tc.path, got, tc.want)
+			}
+
+			rec := httptest.NewRecorder()
+			f.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, tc.path, nil))
+
+			want := http.StatusNotFound
+			if tc.want {
+				want = http.StatusOK
+			}
+			if rec.Code != want {
+				t.Errorf("status = %d, want %d", rec.Code, want)
+			}
+		})
+	}
+}
+
+// RFC 8414 section 3.1 says an authorization server's metadata endpoint should
+// support CORS. tailgate does not: the router refuses a request carrying a
+// foreign Origin before any handler runs, so a header here would grant nothing
+// and would describe a request the gate never admits.
+func TestMetadataCarriesNoCrossOriginGrant(t *testing.T) {
+	for _, path := range []string{MetadataPath, OpenIDMetadataPath} {
+		rec := httptest.NewRecorder()
+		testFacade(t, nil).ServeHTTP(rec, httptest.NewRequest(http.MethodGet, path, nil))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("%s status = %d, want 200", path, rec.Code)
+		}
+		for _, header := range []string{"Access-Control-Allow-Origin", "Access-Control-Allow-Credentials", "Access-Control-Expose-Headers"} {
+			if got := rec.Header().Get(header); got != "" {
+				t.Errorf("%s %s = %q, want none", path, header, got)
+			}
+		}
 	}
 }

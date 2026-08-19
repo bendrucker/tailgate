@@ -60,6 +60,7 @@ func serve(ctx context.Context, logger *slog.Logger, cfg *config.Config, opts op
 		Hostname:     cfg.Node.Hostname,
 		StateDir:     cfg.Node.StateDir,
 		Port:         cfg.Node.Port,
+		Tags:         cfg.Node.Tags,
 		Logger:       logger,
 		OpenLoginURL: opts.OpenLoginURL,
 	})

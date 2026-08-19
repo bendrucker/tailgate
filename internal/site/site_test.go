@@ -98,3 +98,43 @@ func TestHeadOmitsTheBody(t *testing.T) {
 		t.Errorf("HEAD body = %d bytes, want none", rec.Body.Len())
 	}
 }
+
+// TestNewRejectsFilesThatAreNotImages defends the one origin tailgate is
+// trusted on. The type is sniffed, so a favicon path pointed at markup would
+// be served as HTML and run its script there.
+func TestNewRejectsFilesThatAreNotImages(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		content string
+		wantErr bool
+	}{
+		{name: "png", content: "\x89PNG\r\n\x1a\n"},
+		{name: "icon", content: "\x00\x00\x01\x00"},
+		{name: "html doctype", content: "<!doctype html><script>alert(1)</script>", wantErr: true},
+		{name: "html element", content: "<html><script>alert(1)</script></html>", wantErr: true},
+		{name: "xml declared svg", content: `<?xml version="1.0"?><svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script></svg>`, wantErr: true},
+		{name: "bare svg", content: `<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script></svg>`, wantErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "favicon.ico")
+			if err := os.WriteFile(path, []byte(tc.content), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			_, err := New(path)
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("New error = %v, wantErr %v", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+func TestResponsesRefuseSniffing(t *testing.T) {
+	s := testSite(t)
+	for _, path := range []string{RootPath, FaviconPath} {
+		rec := httptest.NewRecorder()
+		s.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, path, nil))
+		if got := rec.Header().Get("X-Content-Type-Options"); got != "nosniff" {
+			t.Errorf("%s X-Content-Type-Options = %q, want nosniff", path, got)
+		}
+	}
+}

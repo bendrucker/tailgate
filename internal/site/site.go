@@ -19,6 +19,7 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"strings"
 )
 
 // Paths the site serves, both on tailgate's origin.
@@ -56,7 +57,14 @@ func New(path string) (*Site, error) {
 	if len(icon) == 0 {
 		return nil, fmt.Errorf("site: favicon %s is empty", path)
 	}
-	return &Site{icon: icon, iconType: http.DetectContentType(icon)}, nil
+	contentType := http.DetectContentType(icon)
+	// The type is sniffed from the bytes, so a file that is not an image is
+	// served as whatever it parses as. An HTML one would put attacker-authored
+	// script on the only origin tailgate trusts.
+	if !strings.HasPrefix(contentType, "image/") {
+		return nil, fmt.Errorf("site: favicon %s is %s, not an image", path, contentType)
+	}
+	return &Site{icon: icon, iconType: contentType}, nil
 }
 
 // Handles reports whether the site owns a path, so the router can dispatch
@@ -85,6 +93,7 @@ func (s *Site) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Cache-Control", "public, max-age=86400")
 	w.Header().Set("Content-Type", contentType)
+	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.Header().Set("Content-Length", strconv.Itoa(len(body)))
 	if r.Method == http.MethodHead {
 		return

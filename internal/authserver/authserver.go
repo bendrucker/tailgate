@@ -55,6 +55,7 @@
 package authserver
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -64,6 +65,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // Paths the facade serves, all on tailgate's origin.
@@ -81,10 +83,21 @@ const (
 	TokenPath = "/token"
 )
 
+// upstreamPathPrefix is the prefix every upstream is addressed under, and the
+// path a client that mistakes an upstream's resource URI for an issuer
+// identifier inserts the well-known prefix ahead of.
+const upstreamPathPrefix = "/mcp/"
+
 // maxTokenRequestBytes bounds a proxied token request. An OAuth token request
 // is a short form body, and the bound is what keeps an unauthenticated caller
 // from spending tailgate's memory on a path that reaches tsidp.
 const maxTokenRequestBytes = 64 << 10
+
+// defaultTokenExchangeTimeout bounds both halves of a proxied token exchange.
+// The server sets no ReadTimeout, since an MCP response may be an SSE stream
+// held open, so an unauthenticated caller dribbling a body would otherwise
+// hold a connection for as long as it liked.
+const defaultTokenExchangeTimeout = 10 * time.Second
 
 // metadata is the RFC 8414 document. Both endpoints name tailgate rather than
 // the issuer, so a client that reads this document and a client that assumes
@@ -116,25 +129,39 @@ var (
 // Facade serves the authorization-server surface at tailgate's origin. It is
 // safe for concurrent use.
 type Facade struct {
+	// metadata is the exact set of paths serving the document, so a probe for
+	// an upstream that is not configured is answered as the absence it is.
+	metadata  map[string]bool
 	document  []byte
 	authorize *url.URL
 	token     *url.URL
 	client    *http.Client
+	timeout   time.Duration
 	logger    *slog.Logger
 }
 
 // New builds the facade for an origin whose tokens are issued by issuer.
 //
+// upstreams names the configured upstreams, which is what decides the RFC 8414
+// section 3.1 paths the facade answers. It must be the same list the metadata
+// handler is built from, so a client cannot discover an authorization server
+// for a resource that has none.
+//
 // client must dial the tailnet, the same requirement introspection has: the
 // token endpoint is reached as tailgate's node rather than over the public
 // internet.
-func New(origin, issuer string, client *http.Client, logger *slog.Logger) (*Facade, error) {
+func New(origin, issuer string, upstreams []string, client *http.Client, logger *slog.Logger) (*Facade, error) {
 	if client == nil {
 		return nil, errors.New("authserver: nil HTTP client")
 	}
 	if logger == nil {
 		return nil, errors.New("authserver: nil logger")
 	}
+	// The redirect policy is set on a copy, since the client belongs to the
+	// caller. A redirect followed here would be fetched from inside the tailnet
+	// on behalf of an unauthenticated caller, and its body returned to them.
+	direct := *client
+	direct.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 	base, err := absoluteURL("origin", origin)
 	if err != nil {
 		return nil, err
@@ -159,38 +186,45 @@ func New(origin, issuer string, client *http.Client, logger *slog.Logger) (*Faca
 		return nil, fmt.Errorf("authserver: encode metadata: %w", err)
 	}
 
+	metadata := map[string]bool{MetadataPath: true, OpenIDMetadataPath: true}
+	for _, name := range upstreams {
+		metadata[MetadataPath+upstreamPathPrefix+name] = true
+	}
+
 	return &Facade{
+		metadata:  metadata,
 		document:  document,
 		authorize: upstream.JoinPath(AuthorizePath),
 		token:     upstream.JoinPath(TokenPath),
-		client:    client,
+		client:    &direct,
+		timeout:   defaultTokenExchangeTimeout,
 		logger:    logger,
 	}, nil
 }
 
 // Handles reports whether the facade owns a path, so the router can dispatch
-// without duplicating the path set.
+// without duplicating the path set. A path it does not own falls through to
+// the router, which answers it as unrouted.
 func (f *Facade) Handles(path string) bool {
-	switch path {
-	case MetadataPath, OpenIDMetadataPath, AuthorizePath, TokenPath:
-		return true
-	}
-	// RFC 8414 section 3.1 also locates metadata by inserting the well-known
-	// prefix ahead of the issuer's path, which is what a client probes when it
-	// treats /mcp/<name> as the issuer.
-	return strings.HasPrefix(path, MetadataPath+"/")
+	return path == AuthorizePath || path == TokenPath || f.metadata[path]
 }
 
 // ServeHTTP dispatches to the endpoint owning the request path. Every endpoint
 // here is unauthenticated, which is inherent to OAuth discovery and to the
 // token exchange that has no token yet.
 func (f *Facade) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// The paths are matched decoded, so a percent-encoded spelling would reach
+	// an endpoint under a name the router never resolved.
+	if r.URL.EscapedPath() != r.URL.Path {
+		http.NotFound(w, r)
+		return
+	}
 	switch {
 	case r.URL.Path == AuthorizePath:
 		f.serveAuthorize(w, r)
 	case r.URL.Path == TokenPath:
 		f.serveToken(w, r)
-	case f.Handles(r.URL.Path):
+	case f.metadata[r.URL.Path]:
 		f.serveMetadata(w, r)
 	default:
 		http.NotFound(w, r)
@@ -203,9 +237,6 @@ func (f *Facade) serveMetadata(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	// Discovery is fetched cross-origin by browser-based clients, and the
-	// document is public by definition.
-	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Content-Length", strconv.Itoa(len(f.document)))
 	w.Write(f.document)
@@ -244,13 +275,31 @@ func (f *Facade) serveToken(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// An h2 connection has no deadline to set, and the exchange below is
+	// bounded either way, so an unsupported controller is not a refusal.
+	if err := http.NewResponseController(w).SetReadDeadline(time.Now().Add(f.timeout)); err != nil && !errors.Is(err, http.ErrNotSupported) {
+		f.logger.Error("setting token request deadline", "err", err)
+		http.Error(w, "token endpoint unavailable", http.StatusBadGateway)
+		return
+	}
+
 	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxTokenRequestBytes))
 	if err != nil {
 		http.Error(w, "invalid token request", http.StatusBadRequest)
 		return
 	}
+	if !hasClientCredentials(r.Header, body) {
+		// The log names the refusal, never the request: the body it was read
+		// from is where a client secret lives.
+		f.logger.Warn("refusing token request that presents no client credentials")
+		f.writeOAuthError(w, http.StatusBadRequest, "invalid_client", "client authentication is required")
+		return
+	}
 
-	proxied, err := http.NewRequestWithContext(r.Context(), http.MethodPost, f.token.String(), strings.NewReader(string(body)))
+	ctx, cancel := context.WithTimeout(r.Context(), f.timeout)
+	defer cancel()
+
+	proxied, err := http.NewRequestWithContext(ctx, http.MethodPost, f.token.String(), strings.NewReader(string(body)))
 	if err != nil {
 		f.logger.Error("building token request", "err", err)
 		http.Error(w, "token endpoint unavailable", http.StatusBadGateway)
@@ -290,6 +339,51 @@ func (f *Facade) serveToken(w http.ResponseWriter, r *http.Request) {
 	f.logger.Info("proxied token request", "status", response.StatusCode)
 	w.Header().Set("Content-Length", strconv.Itoa(len(payload)))
 	w.WriteHeader(response.StatusCode)
+	w.Write(payload)
+}
+
+// hasClientCredentials reports whether the request presents client
+// authentication in one of the two forms the facade advertises.
+//
+// tailgate cannot check the credentials, only that some were offered, and that
+// is the point. The request reaches tsidp over tsnet, so it arrives carrying
+// tailgate's own tailnet node identity. tsidp identifies a caller by
+// credentials first and by that node identity last, so forwarding a request
+// with none would let an anonymous caller off the internet be identified as
+// tailgate's node. Whether the token endpoint actually consults that fallback
+// decides how bad it is, not whether the facade should be the thing that sets
+// it up.
+func hasClientCredentials(header http.Header, body []byte) bool {
+	scheme, credential, ok := strings.Cut(header.Get("Authorization"), " ")
+	if ok && strings.EqualFold(scheme, "Basic") && strings.TrimSpace(credential) != "" {
+		return true
+	}
+	form, err := url.ParseQuery(string(body))
+	if err != nil {
+		return false
+	}
+	return form.Get("client_id") != "" && form.Get("client_secret") != ""
+}
+
+// writeOAuthError answers with the RFC 6749 section 5.2 error object. The
+// status is 400 rather than 401: that section makes 401 mandatory only for a
+// caller whose Authorization header was rejected, and a 401 here would assert
+// that the caller must authenticate to tailgate. It never does. The credentials
+// authenticate the client to the issuer, and tailgate only checks that they are
+// present.
+func (f *Facade) writeOAuthError(w http.ResponseWriter, status int, code, description string) {
+	payload, err := json.Marshal(struct {
+		Error       string `json:"error"`
+		Description string `json:"error_description"`
+	}{Error: code, Description: description})
+	if err != nil {
+		f.logger.Error("encoding oauth error", "err", err)
+		http.Error(w, "token endpoint unavailable", http.StatusBadGateway)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Length", strconv.Itoa(len(payload)))
+	w.WriteHeader(status)
 	w.Write(payload)
 }
 
