@@ -18,9 +18,17 @@
 // That child is the same kind of program either way, and it holds state across
 // messages whatever HTTP has decided. So the stateless path supplies what the
 // caller no longer does: it settles the child's own era with the revision's
-// server/discover probe, runs the initialize handshake itself for a child that
-// predates the revision, and substitutes its own JSON-RPC ids, since
-// independent POSTs from one caller may all call themselves id 1.
+// server/discover probe, and runs the initialize handshake itself for a child
+// that predates the revision.
+//
+// # Correlation ids
+//
+// A caller's JSON-RPC id never reaches the child. Every request tailgate
+// carries goes out under an id it mints and comes back restored, whichever era
+// the caller speaks. A session was once thought to give one caller a single id
+// space, but independent POSTs may all call themselves id 1, and a caller that
+// hangs up mid-request and retries reuses an id the child is still working on.
+// Either would let one request take another's answer.
 //
 // # Notifications
 //
@@ -315,7 +323,7 @@ func (t *Transport) servePost(w http.ResponseWriter, r *http.Request, inflight *
 		return
 	}
 
-	response, err := s.exchange(inflight.Context(), msg, t.options.RequestTimeout)
+	response, err := s.request(inflight.Context(), msg, t.options.RequestTimeout)
 	if err != nil {
 		t.refuse(w, s, err)
 		return
@@ -413,7 +421,7 @@ func (t *Transport) serveInitialize(ctx context.Context, w http.ResponseWriter, 
 	}
 	defer s.finish()
 
-	response, err := s.exchange(inflight.Context(), msg, t.options.RequestTimeout)
+	response, err := s.request(inflight.Context(), msg, t.options.RequestTimeout)
 	if err != nil {
 		// A child that cannot answer initialize has no session to belong to.
 		t.removeSession(s)
@@ -772,10 +780,10 @@ func writeJSON(w http.ResponseWriter, response []byte) {
 }
 
 // writeError maps a request-path failure to its status. Malformed input is the
-// transport's own 400 family; everything else is the shared proxy taxonomy. The
-// body is the status text alone: the failure detail names the child command,
-// the caller's cap, and other internals an internet-facing response must not
-// carry, so it goes to the log instead.
+// transport's own 400 family; everything else is the shared proxy taxonomy. A
+// status other than 400 answers in status text alone: the failure detail names
+// the child command, the caller's cap, and other internals an internet-facing
+// response must not carry, so it goes to the log instead.
 func (t *Transport) writeError(w http.ResponseWriter, err error) {
 	if errors.Is(err, context.Canceled) {
 		// The caller hung up. There is nobody to answer.
@@ -788,10 +796,26 @@ func (t *Transport) writeError(w http.ResponseWriter, err error) {
 		// client probing for the server's era that it predates the stateless
 		// revision, so a refusal in bare text would talk the caller into
 		// retrying with the handshake this transport no longer offers it.
-		protocol.WriteError(w, status, protocol.CodeInvalidRequest, http.StatusText(status), nil)
+		protocol.WriteError(w, status, protocol.CodeInvalidRequest, badRequestMessage(err), nil)
 		return
 	}
 	http.Error(w, http.StatusText(status), status)
+}
+
+// badRequestSentinels are the refusals whose own text a 400 carries. Each
+// names a protocol mistake in the request the caller wrote, so telling the
+// caller which one it made discloses nothing about the upstream, the identity,
+// or this transport's internals, and the wording matches the log line the
+// refusal wrote.
+var badRequestSentinels = []error{errInvalidMessage, errMissingSessionID, errDuplicateRequestID}
+
+func badRequestMessage(err error) string {
+	for _, sentinel := range badRequestSentinels {
+		if errors.Is(err, sentinel) {
+			return sentinel.Error()
+		}
+	}
+	return http.StatusText(http.StatusBadRequest)
 }
 
 func statusOf(err error) int {

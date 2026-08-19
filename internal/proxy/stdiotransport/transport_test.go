@@ -8,11 +8,13 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -142,6 +144,10 @@ type call struct {
 	session       string
 	protocol      string
 	body          string
+	// ctx stands in for the client's own lifetime. A call carrying one may be
+	// abandoned before its answer, and do reports that as a nil response rather
+	// than a failure.
+	ctx context.Context
 }
 
 func (h *harness) do(t *testing.T, c call) *http.Response {
@@ -154,7 +160,11 @@ func (h *harness) do(t *testing.T, c call) *http.Response {
 	if c.body != "" {
 		body = strings.NewReader(c.body)
 	}
-	request, err := http.NewRequestWithContext(t.Context(), method, h.gateway.URL, body)
+	ctx := c.ctx
+	if ctx == nil {
+		ctx = t.Context()
+	}
+	request, err := http.NewRequestWithContext(ctx, method, h.gateway.URL, body)
 	if err != nil {
 		t.Fatalf("new request: %v", err)
 	}
@@ -174,6 +184,9 @@ func (h *harness) do(t *testing.T, c call) *http.Response {
 	}
 	response, err := h.gateway.Client().Do(request)
 	if err != nil {
+		if c.ctx != nil && c.ctx.Err() != nil {
+			return nil
+		}
 		t.Fatalf("%s: %v", method, err)
 	}
 	return response
@@ -229,10 +242,7 @@ func (t *Transport) sessionCount() int {
 // which is what a slot leaked by an abandoned stream shows up in.
 func (t *Transport) listenerCount() int {
 	t.mu.Lock()
-	sessions := make([]*session, 0, len(t.sessions))
-	for _, s := range t.sessions {
-		sessions = append(sessions, s)
-	}
+	sessions := slices.Collect(maps.Values(t.sessions))
 	t.mu.Unlock()
 
 	count := 0
@@ -242,6 +252,23 @@ func (t *Transport) listenerCount() int {
 		s.mu.Unlock()
 	}
 	return count
+}
+
+// pendingRequests reports the waiters registered across every live session,
+// which is how a test sees a request reach the child and an abandoned one
+// leave the correlation map.
+func (t *Transport) pendingRequests() int {
+	t.mu.Lock()
+	sessions := slices.Collect(maps.Values(t.sessions))
+	t.mu.Unlock()
+
+	total := 0
+	for _, s := range sessions {
+		s.mu.Lock()
+		total += len(s.pending)
+		s.mu.Unlock()
+	}
+	return total
 }
 
 // reservedSlots reports the cap slots subject currently holds, which is what a
@@ -708,33 +735,153 @@ func TestRequestTimeout(t *testing.T) {
 	}
 }
 
-func TestDuplicateRequestIDIsRejected(t *testing.T) {
+// TestConcurrentRequestsMayReuseACallerID covers the collision a session was
+// once assumed to rule out. A client numbering its POSTs from a per-request
+// counter sends two id 1s at once, which JSON-RPC forbids and which the Claude
+// app was observed doing. Both must be served, each under its own id to the
+// child and its own id back.
+func TestConcurrentRequestsMayReuseACallerID(t *testing.T) {
 	h := newHarness(t, Options{})
 	session := h.initialize(t, "alice")
 
-	first := make(chan int, 1)
+	slow := make(chan map[string]any, 1)
 	go func() {
-		response := h.do(t, call{subject: "alice", session: session, body: requestBody(7, slowMethod, "first", 300*time.Millisecond)})
+		response := h.do(t, call{subject: "alice", session: session, body: requestBody(1, observedIDMethod, "", 300*time.Millisecond)})
 		defer response.Body.Close()
-		first <- response.StatusCode
+		if response.StatusCode != http.StatusOK {
+			slow <- nil
+			return
+		}
+		slow <- decodeMessage(t, response)
 	}()
 
-	h.transport.mu.Lock()
-	child := h.transport.sessions[session]
-	h.transport.mu.Unlock()
 	waitFor(t, "the first request to reach the child", func() bool {
-		child.mu.Lock()
-		defer child.mu.Unlock()
-		return len(child.pending) == 1
+		return h.transport.pendingRequests() == 1
 	})
 
-	response := h.do(t, call{subject: "alice", session: session, body: requestBody(7, "tools/list", "second", 0)})
-	response.Body.Close()
-	if response.StatusCode != http.StatusBadRequest {
-		t.Fatalf("expected 400 for a reused in-flight id, got %d", response.StatusCode)
+	response := h.do(t, call{subject: "alice", session: session, body: requestBody(1, observedIDMethod, "", 0)})
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 for the concurrent reuse of id 1, got %d", response.StatusCode)
 	}
-	if status := <-first; status != http.StatusOK {
-		t.Fatalf("expected the original request to survive, got %d", status)
+	second := decodeMessage(t, response)
+
+	first := <-slow
+	if first == nil {
+		t.Fatal("the first request was refused")
+	}
+
+	for _, message := range []map[string]any{first, second} {
+		if message["id"] != float64(1) {
+			t.Errorf("expected the caller's own id 1 restored, got %v", message["id"])
+		}
+	}
+	if observedID(t, first) == observedID(t, second) {
+		t.Errorf("the child saw both requests under id %v", observedID(t, first))
+	}
+}
+
+// TestRetryAfterCancelGetsItsOwnAnswer covers the collision no compliant
+// client can avoid. A caller that hangs up mid-request leaves the child still
+// working on that id, and the retry reuses it. Correlating on the caller's id
+// would hand the retry the abandoned request's answer.
+func TestRetryAfterCancelGetsItsOwnAnswer(t *testing.T) {
+	h := newHarness(t, Options{})
+	session := h.initialize(t, "alice")
+
+	abandoned, hangUp := context.WithCancel(t.Context())
+	sent := make(chan struct{})
+	go func() {
+		defer close(sent)
+		response := h.do(t, call{ctx: abandoned, subject: "alice", session: session, body: requestBody(1, "tools/call", "abandoned", 300*time.Millisecond)})
+		if response != nil {
+			response.Body.Close()
+		}
+	}()
+
+	waitFor(t, "the abandoned request to reach the child", func() bool {
+		return h.transport.pendingRequests() == 1
+	})
+	hangUp()
+	<-sent
+	waitFor(t, "the abandoned request to leave the correlation map", func() bool {
+		return h.transport.pendingRequests() == 0
+	})
+
+	// Outlasting the child's answer to the abandoned request is what puts the
+	// retry in the way of it.
+	response := h.do(t, call{subject: "alice", session: session, body: requestBody(1, "tools/call", "retry", time.Second)})
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 for the retry, got %d", response.StatusCode)
+	}
+
+	result, _ := decodeMessage(t, response)["result"].(map[string]any)
+	if result["echo"] != "retry" {
+		t.Errorf("the retry was answered with %v, not its own result", result)
+	}
+}
+
+func observedID(t *testing.T, message map[string]any) any {
+	t.Helper()
+	result, ok := message["result"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected a result, got %v", message)
+	}
+	return result["observedId"]
+}
+
+// TestBadRequestNamesTheRefusal covers what a client is told when tailgate
+// refuses its message. The status alone leaves a caller with a tool call that
+// failed for no stated reason, and each of these sentinels names a mistake in
+// the request the caller itself wrote.
+func TestBadRequestNamesTheRefusal(t *testing.T) {
+	h := newHarness(t, Options{})
+
+	for _, tc := range []struct {
+		name string
+		err  error
+	}{
+		{name: "invalid message", err: errInvalidMessage},
+		{name: "missing session id", err: errMissingSessionID},
+		{name: "duplicate request id", err: errDuplicateRequestID},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			h.transport.writeError(recorder, tc.err)
+
+			if recorder.Code != http.StatusBadRequest {
+				t.Fatalf("expected 400, got %d", recorder.Code)
+			}
+			var refusal struct {
+				Error struct {
+					Message string `json:"message"`
+				} `json:"error"`
+			}
+			if err := json.Unmarshal(recorder.Body.Bytes(), &refusal); err != nil {
+				t.Fatalf("decode refusal: %v", err)
+			}
+			if refusal.Error.Message != tc.err.Error() {
+				t.Errorf("expected the refusal named, got %q", refusal.Error.Message)
+			}
+		})
+	}
+}
+
+// TestRefusalAboveBadRequestStaysOpaque holds the other half: a status outside
+// the 400 family reports a failure of tailgate's own, whose detail names the
+// child command and other internals an internet-facing response must not carry.
+func TestRefusalAboveBadRequestStaysOpaque(t *testing.T) {
+	h := newHarness(t, Options{})
+
+	recorder := httptest.NewRecorder()
+	h.transport.writeError(recorder, errUnauthenticated)
+
+	if recorder.Code != http.StatusInternalServerError {
+		t.Fatalf("expected 500, got %d", recorder.Code)
+	}
+	if body := recorder.Body.String(); !strings.HasPrefix(body, http.StatusText(http.StatusInternalServerError)) {
+		t.Errorf("expected the status text alone, got %q", body)
 	}
 }
 

@@ -58,6 +58,8 @@ Where the `2026-07-28` revision mirrors body fields into headers, tailgate refus
 
 A `400` whose body is not a recognized JSON-RPC error tells a probing client the server predates the stateless revision, so every refusal tailgate originates at that status answers in the modern shape. Bare text talks callers into downgrading to revisions with weaker rules.
 
+That error message names which validation the request failed. Each refusal at `400` describes a protocol mistake in the message the caller itself wrote, so naming it discloses nothing about the upstream, the identity, or tailgate's internals. Every other status answers in status text alone, since those report a failure whose detail names the child command, the caller's cap, and other internals.
+
 ## Token and Log Handling
 
 - Verification caches key on SHA-256 digests of the token, never the bearer itself.

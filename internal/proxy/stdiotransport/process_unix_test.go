@@ -62,7 +62,8 @@ func TestChildGetsAnOrdinaryStdin(t *testing.T) {
 	h := newHarness(t, Options{
 		Command: "/bin/sh",
 		Args: []string{"-c", `read line
-printf '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-11-25"}}\n'
+id=$(printf '%s' "$line" | sed -n 's/.*"id":\([^,}]*\).*/\1/p')
+printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2025-11-25"}}\n' "$id"
 while read line; do :; done`},
 	})
 	// Long enough that a killed child is unmistakable next to one that exited
