@@ -145,8 +145,7 @@ type call struct {
 	protocol      string
 	body          string
 	// ctx stands in for the client's own lifetime. A call carrying one may be
-	// abandoned before its answer, and do reports that as a nil response rather
-	// than a failure.
+	// abandoned before its answer, and do reports that as a nil response.
 	ctx context.Context
 }
 

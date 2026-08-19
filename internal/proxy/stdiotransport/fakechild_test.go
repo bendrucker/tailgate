@@ -51,8 +51,7 @@ const (
 	deafMethod   = "test/deaf"
 	envMethod    = "test/env"
 	// observedIDMethod reports the id the child was addressed by, which is the
-	// only way a test sees what tailgate put on the wire rather than the
-	// caller's own id restored on the answer.
+	// only way a test sees what tailgate put on the wire.
 	observedIDMethod = "test/observed-id"
 )
 
