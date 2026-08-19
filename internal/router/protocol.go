@@ -38,12 +38,15 @@ func (rt *Router) checkProtocol(rec *responseRecorder, r *http.Request, up *upst
 		protocol.WriteUnsupportedVersion(rec, r.Header.Get(protocol.VersionHeader))
 		return false
 	}
-	if !revision.MirrorsHeaders() || r.Method != http.MethodPost {
+	if r.Method != http.MethodPost {
 		// The mirroring contract is about a POST body. A request without one
 		// carries no pair that can disagree, and refusing it here would answer
 		// a stateless GET or DELETE with a mismatch instead of the 405 the
 		// transport owes it. A POST is held to the contract whether or not it
 		// carried a body, since an empty one backs no header either.
+		return true
+	}
+	if !revision.MirrorsHeaders() && !mirrorsAnything(r.Header) {
 		return true
 	}
 	if err := protocol.ValidateMirrored(r.Header, body); err != nil {
@@ -52,4 +55,14 @@ func (rt *Router) checkProtocol(rec *responseRecorder, r *http.Request, up *upst
 		return false
 	}
 	return true
+}
+
+// mirrorsAnything reports whether the request carries a header the mirroring
+// contract governs. The revision that defines those headers is named by the
+// caller, so gating validation on it would let a caller carry a mirrored header
+// past the check by declaring a revision that has no rules for it, while an
+// upstream that reads mirrored headers whatever the declaration executes on the
+// pair tailgate never compared.
+func mirrorsAnything(header http.Header) bool {
+	return header.Get(protocol.MethodHeader) != "" || header.Get(protocol.NameHeader) != ""
 }

@@ -262,3 +262,36 @@ func TestSessionBindingSurvivesAClaimedRevision(t *testing.T) {
 		t.Fatalf("status = %d, want 404 for another identity's session", resp.StatusCode)
 	}
 }
+
+// The revision that defines the mirrored headers is named by the caller, so a
+// caller must not be able to carry a disagreeing pair past validation by
+// declaring a revision that has no mirroring rules.
+func TestMirroredHeadersAreValidatedUnderAnyDeclaredRevision(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		version string
+	}{
+		{name: "no revision declared"},
+		{name: "revision predating the mirroring rules", version: string(protocol.Rev20251125)},
+		{name: "the revision that mirrors", version: string(protocol.Rev20260728)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHarness(t)
+			h.grant("good", "42", "user@example.com", httpUpstream)
+
+			req := post("/mcp/"+httpUpstream, "good")
+			if tc.version != "" {
+				req.Header.Set(protocol.VersionHeader, tc.version)
+			}
+			req.Header.Set(protocol.MethodHeader, "tools/list")
+
+			resp := h.serve(req)
+			if resp.StatusCode != http.StatusBadRequest {
+				t.Errorf("status = %d, want 400", resp.StatusCode)
+			}
+			if h.httpUp.count() > 0 {
+				t.Error("a request whose header and body disagree reached the upstream")
+			}
+		})
+	}
+}

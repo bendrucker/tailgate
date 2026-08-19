@@ -37,14 +37,19 @@ package router
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"path"
 	"strings"
 	"time"
+
+	"tailscale.com/ipn"
 
 	"github.com/bendrucker/tailgate/internal/audit"
 	"github.com/bendrucker/tailgate/internal/auth"
@@ -99,6 +104,7 @@ const (
 	ReasonNoToken                = "no bearer token presented"
 	ReasonMalformedAuthorization = "malformed Authorization header"
 	ReasonInvalidToken           = "token rejected by the issuer"
+	ReasonInsufficientScope      = "token lacks a required scope"
 	ReasonVerifierUnavailable    = "token verification unavailable"
 	ReasonOriginNotAllowed       = "origin not allowed"
 	ReasonSessionBound           = "session bound to a different identity"
@@ -303,10 +309,37 @@ func New(opts Options) (*Router, error) {
 func Server(h http.Handler) *http.Server {
 	return &http.Server{
 		Handler:           h,
+		ConnContext:       connContext,
 		ReadHeaderTimeout: DefaultReadHeaderTimeout,
 		MaxHeaderBytes:    DefaultMaxHeaderBytes,
 		IdleTimeout:       DefaultIdleTimeout,
 	}
+}
+
+// connContext puts the address the connection came from where the abuse
+// controls can charge it. It belongs to [Server] for the same reason the
+// header-phase limits do: an unpopulated address is not an error anywhere
+// downstream, it silently charges every request to one shared bucket.
+func connContext(ctx context.Context, c net.Conn) context.Context {
+	return auth.WithClientAddr(ctx, clientAddr(c))
+}
+
+// clientAddr recovers the address the request originated from. Over Funnel the
+// connection's RemoteAddr is the relaying tailnet node, and the client's own
+// address is carried on the [ipn.FunnelConn] the TLS listener wraps. An address
+// that cannot be recovered comes back as the zero Addr, which is charged like
+// any other rather than exempted.
+func clientAddr(c net.Conn) netip.Addr {
+	if tc, ok := c.(*tls.Conn); ok {
+		c = tc.NetConn()
+	}
+	if fc, ok := c.(*ipn.FunnelConn); ok {
+		return fc.Src.Addr()
+	}
+	if ap, err := netip.ParseAddrPort(c.RemoteAddr().String()); err == nil {
+		return ap.Addr()
+	}
+	return netip.Addr{}
 }
 
 // ServeHTTP runs the request pipeline. The panic recovery is outermost, so a
@@ -443,9 +476,14 @@ func (rt *Router) dispatch(rec *responseRecorder, r *http.Request, up *upstream,
 	}
 
 	outbound := r.Clone(auth.WithIdentity(r.Context(), id))
-	proxy.StripCredentials(outbound.Header)
+	proxy.StripRequest(outbound)
 	outbound.URL.Path = "/"
 	outbound.URL.RawPath = ""
+	// A reverse proxy concatenates the inbound query onto the target's rather
+	// than replacing it, so a query surviving here adds parameters to the
+	// endpoint the operator configured. MCP defines none.
+	outbound.URL.RawQuery = ""
+	outbound.URL.ForceQuery = false
 
 	up.transport.ServeHTTP(rec, outbound)
 }
