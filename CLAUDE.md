@@ -1,6 +1,6 @@
 # tailgate Build Guide
 
-tailgate is a single Go binary that fronts MCP servers behind Tailscale Funnel, validates tsidp OIDC tokens, and proxies authorized requests to HTTP or stdio MCP upstreams. `README.md` is the human overview. This file is the build contract for agents working in the repo.
+tailgate is a single Go binary that fronts MCP servers behind Tailscale Funnel, validates tsidp OIDC tokens, and proxies authorized requests to HTTP or stdio MCP upstreams. `README.md` is the human overview, `docs/architecture.md` maps the internals, and `docs/security.md` is the operator-facing threat model. This file is the build contract for agents working in the repo.
 
 ## Locked Decisions
 
@@ -15,6 +15,7 @@ tailgate is a single Go binary that fronts MCP servers behind Tailscale Funnel, 
 - **Config.** HuJSON, a list of upstreams plus policy. Reload is process restart for now.
 - **stdio upstreams.** One child process per MCP session for a stateful caller, one per identity for a stateless one, with a concurrency cap and idle reaping either way.
 - **Audit.** Every allow and deny decision is logged with identity, upstream, and outcome via `log/slog`.
+- **Authorization-server fronting.** tailgate serves RFC 8414 metadata, `/authorize`, and `/token` at its own origin for clients that assume same-origin OAuth. `/authorize` is a redirect so tsidp sees the authorizing person's tailnet identity, `/token` is a bounded proxy over the tailnet, and `/register` stays absent so serving traffic never depends on an `allow_dcr` grant on tailgate's node.
 
 ## Dependencies
 
@@ -78,11 +79,13 @@ Two eras are live at once, and tailgate serves both. Everything under "Both Eras
 - `internal/protocol`: the revisions tailgate speaks and what each one puts on the wire. `Parse` resolves `MCP-Protocol-Version`, `Stateless` and `MirrorsHeaders` are the era predicates every other package branches on, and `ValidateMirrored` is the intermediary half of the header contract. `WriteError` answers refusals in JSON-RPC, which is what keeps a modern client from reading a `400` as a reason to downgrade.
 - `internal/resource`: `URLs` is the single canonicalization point, seeded from the tailnet FQDN after join. `ResourceURL(name)` output is the byte-exact string used in the client `resource` param, the tsidp grant, the `aud` check, and each metadata doc. `Handler` serves the RFC 9728 well-known subtree.
 - `internal/auth`: `Identity` and `Decision`, the introspection `Verifier`, the policy `Authorizer`, and identity-in-context helpers for transports and audit.
+- `internal/authserver`: the authorization-server facade at tailgate's own origin, for clients like claude.ai that assume same-origin OAuth instead of following RFC 9728 discovery. `/authorize` is a redirect to tsidp with the query preserved, `/token` is a bounded reverse proxy over the tailnet, and the RFC 8414 metadata is served under both well-known names. `/register` is deliberately absent: tsidp resolves its grant from the caller's tailnet identity. Proxying DCR would arrive as tailgate's node and couple serving traffic to an `allow_dcr` grant.
+- `internal/site`: the unauthenticated root page and configured favicon, which is where icon crawlers get a custom connector's icon for the origin.
 - `internal/grant`: builds the `tailscale.com/cap/tsidp` grant from `resource.URLs`, so the resource strings in the tailnet policy come from the same place as the audience tailgate validates. Surfaced as `tailgate grant`. Generating it offline needs `node.tailnet`, which `serve` also checks against the FQDN the join reports.
 - `internal/proxy`: the `Transport` seam is `http.Handler` plus `Shutdown` and `Close`. HTTP semantics are the contract. The seam carries JSON and SSE responses, session headers, and resumption without a bespoke message layer. Sentinel errors plus `StatusOf` are the shared error taxonomy, and `Drain` is the shared refuse-and-wait choreography. The package doc records the lifecycle and drain contract.
 - `internal/proxy/httptransport`: the reverse proxy for HTTP upstreams.
 - `internal/proxy/stdiotransport`: the server side of streamable HTTP over a child process, with JSON-RPC correlation, a per-identity-per-upstream cap, and idle reaping. A stateful caller gets a child per session with the session id bound to it. A stateless caller gets a child per identity, whose era the transport settles with `server/discover` and whose `initialize` handshake it runs itself when the child predates the revision. Caller JSON-RPC ids are substituted for minted ones on that path, since independent POSTs collide, and a message carrying an id but no method is refused, since forwarding it would put a caller-chosen id into that minted namespace. `subscriptions/listen` is the one response held open, so it is the one exempt from the exchange timeout: the stream opens as soon as the request goes out, and the child's eventual response to it closes the stream.
-- `internal/router`: the public handler. Exact-segment routing, auth ahead of every transport, session binding, `Origin` validation, body limits, mirrored-header validation, header stripping, identity injection into the request context, and panic recovery.
+- `internal/router`: the public handler. `Origin` validation, exact-segment routing, auth ahead of every transport, session binding, body limits, mirrored-header validation, header stripping, identity injection into the request context, and panic recovery. Mounts the resource-metadata, authserver, and site handlers ahead of upstream routing.
 - `internal/tsnetserver`: the embedded node, the `FQDN` that seeds `resource.URLs`, and the Funnel listener.
 - `internal/audit`: structured decision log.
 
@@ -102,10 +105,11 @@ Two eras are live at once, and tailgate serves both. Everything under "Both Eras
 
 ## Security Invariants
 
-tailgate is an internet-facing boundary where a validation gap is a remote exploit. Every request path holds these:
+tailgate is an internet-facing boundary where a validation gap is a remote exploit. Every request path holds these. `docs/security.md` is the operator-facing treatment of the same material. This section is the build contract.
 
 - **Fail closed.** Any verify, discovery, introspection, or authorization error denies the request. A verifier-construction failure means the upstream is unavailable, never a passthrough. An introspection transport failure is a 503, never a 401 challenge and never an allow.
 - **No token passthrough.** Strip the client `Authorization` header before forwarding to any upstream. `httputil.ReverseProxy` forwards inbound headers by default. Strip inbound `X-Forwarded-*` and any identity header tailgate sets itself. The router strips, and `httptransport` strips again so the invariant survives caller mistakes.
+- **Audience binding.** Validate that the token's `aud` contains the requested upstream's canonical resource URI, byte-exact from `resource.URLs`, on every request including cache hits. A token minted for one upstream is useless against another.
 - **Exact-segment routing.** Decode and clean the path, then match the `/mcp/<name>` segment as exact membership in the configured upstream set. Reject `/mcp//x`, `/mcp/x/../y`, and `%2e%2e`. Route `/.well-known/oauth-protected-resource/mcp/<name>` to metadata rather than to the upstream.
 - **Auth precedes spawn.** Token verify and the authz decision gate session creation. A stdio child is never spawned before authorization. The concurrency cap is per-identity-per-upstream, not global, so one caller cannot starve others.
 - **Recover middleware.** A panic in the request path returns 500 and never proceeds to an upstream.
