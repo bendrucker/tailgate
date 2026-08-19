@@ -149,6 +149,12 @@ func TestDispatch(t *testing.T) {
 			code:   2,
 			stderr: "tailgate: unknown command \"grnat\"\nRun 'tailgate -h' for usage.\n",
 		},
+		{
+			name:   "command after the flags is refused",
+			args:   []string{"-config", "x", "grant"},
+			code:   2,
+			stderr: "tailgate: unexpected argument \"grant\"\nRun 'tailgate -h' for usage.\n",
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			cmd := exec.Command(binary, tc.args...)

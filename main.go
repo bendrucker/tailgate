@@ -78,6 +78,15 @@ func main() {
 
 	flag.Parse()
 
+	// The dispatch above only sees a command in the first argument. flag.Parse
+	// stops at the first non-flag rather than reporting it, so one written after
+	// the flags would otherwise fall through and start serving.
+	if flag.NArg() > 0 {
+		fmt.Fprintf(os.Stderr, "tailgate: unexpected argument %q\n", flag.Arg(0))
+		fmt.Fprintln(os.Stderr, "Run 'tailgate -h' for usage.")
+		os.Exit(2)
+	}
+
 	logger := slog.New(slog.NewJSONHandler(os.Stderr, nil))
 	slog.SetDefault(logger)
 
