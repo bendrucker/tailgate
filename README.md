@@ -11,13 +11,13 @@ tailgate works end to end and fronts the author's own MCP servers for Claude and
 ```mermaid
 flowchart LR
   client[MCP client] -->|HTTPS via Funnel| edge[Tailscale edge]
-  edge -->|plain HTTP, TLS terminated| tg[tailgate node]
+  edge -->|relayed TCP| tg[tailgate node]
   tg -->|OAuth endpoints, introspection| idp[tsidp]
   tg -->|/mcp/github| u1[HTTP MCP server]
   tg -->|/mcp/files| u2[stdio MCP server]
 ```
 
-Tailscale terminates TLS at the edge and forwards plain HTTP to the node. tailgate answers an unauthenticated request with a `401` naming the metadata and scopes the client needs. It validates the bearer token by [RFC 7662](https://www.rfc-editor.org/rfc/rfc7662) introspection against tsidp over the tailnet, checks that the token's audience names the requested upstream, and applies the configured policy. It logs every allow and deny, and strips the client's token before forwarding. Clients that assume OAuth lives at the MCP origin rather than reading the discovery document, claude.ai among them, get an authorization server fronted there too.
+The Funnel edge relays encrypted TCP and TLS terminates inside tailgate, on a listener whose certificate `tsnet` obtains for the node. tailgate answers an unauthenticated request with a `401` naming the metadata and scopes the client needs. It validates the bearer token by [RFC 7662](https://www.rfc-editor.org/rfc/rfc7662) introspection against tsidp over the tailnet, checks that the token's audience names the requested upstream, and applies the configured policy. It logs every allow and deny, and strips the client's token before forwarding. Clients that assume OAuth lives at the MCP origin rather than reading the discovery document, claude.ai among them, get an authorization server fronted there too.
 
 tailgate speaks every MCP revision from [2024-11-05](https://modelcontextprotocol.io/specification/2024-11-05) through [2026-07-28](https://modelcontextprotocol.io/specification/2026-07-28), resolving each request's revision from its `MCP-Protocol-Version` header, because it controls neither the clients it serves nor the servers it fronts.
 
@@ -40,6 +40,10 @@ tailgate reads a [HuJSON](https://github.com/tailscale/hujson) file, the same fo
     "tailnet": "example.ts.net",
     "state_dir": "/var/lib/tailgate",
     "port": 443,
+
+    // Optional. Tagging moves the node's identity into policy and turns off
+    // key expiry along with it. See Deployment.
+    // "tags": ["tag:tailgate"],
   },
   "oidc": {
     "issuer": "https://idp.example.ts.net",

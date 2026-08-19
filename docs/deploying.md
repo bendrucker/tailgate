@@ -12,7 +12,11 @@ tsidp must already be running on the tailnet. [Tailscale's tsidp documentation](
 
 Grant the `funnel` node attribute to tailgate's node in the tailnet policy. Without it, Funnel fails at the public edge.
 
-Node keys expire on the tailnet's [key expiry](https://tailscale.com/kb/1028/key-expiry) schedule, six months by default. Disable expiry for tailgate's node, or use an [auth key](https://tailscale.com/kb/1085/auth-keys) scoped to a tag. An expired key takes tailgate offline until someone reauthorizes it by hand.
+The node key is the longest-lived credential in the deployment. After the first join it replaces the auth key entirely, and anything that can read it is tailgate on your tailnet. How long it lasts follows from `node.tags`, which also states the node's identity in the config rather than leaving it implicit in whichever auth key minted the node.
+
+Untagged, the key expires on the tailnet's [key expiry](https://tailscale.com/kb/1028/key-expiry) schedule, six months by default, and the deployment goes offline until someone reauthenticates it. [Applying a tag disables expiry by default](https://tailscale.com/docs/features/access-control/key-expiry), which keeps tailgate up and leaves the credential unbounded.
+
+Prefer untagged with a scheduled rejoin. Tag the node when a rejoin is impractical, or when a shared tailnet needs the node's identity in policy more than it needs the bound. An untagged node with expiry disabled by hand is the one arrangement with neither property. The control server decides whether a node may adopt a tag it advertises, so grant the tag in your tailnet policy.
 
 ## The tsidp Grant
 
@@ -24,9 +28,11 @@ tailgate grant -config /etc/tailgate.hujson >> tailnet-policy/grants.hujson
 
 The output is one entry of the policy's `grants` array. Regenerate it when upstreams change rather than editing a resource string, since a hand-edited URI denies every request with an audience mismatch and nothing pointing at why.
 
-Generating never contacts the control server, which is why it needs `node.tailnet` in the config: the resource URIs are built from the node's FQDN. `-src`, `-dst`, and `-users` shape the grant envelope. `-dst` defaults to `*` because a grant destination must be a tag, user, group, host alias, or address, none of which can be derived from the issuer URL. Narrow it when tsidp runs on a tagged node. `-allow-admin-ui` and `-allow-dcr` add those tsidp capabilities to the generated rule, and neither is granted by default.
+Generating never contacts the control server, which is why it needs `node.tailnet` in the config: the resource URIs are built from the node's FQDN. `-src`, `-dst`, and `-users` shape the grant envelope. `-users` defaults to the identities the config's policy already allows, so tsidp and tailgate gate an upstream from one list; leaving it at `*` would let any tailnet member mint a token whose audience names an upstream, collapsing two independent checks into one. A policy matching on a claim rather than an identity falls back to `*`, since a grant narrower than the policy denies at the token request, where tailgate's audit log has nothing to say about it. `-dst` defaults to `*` because a grant destination must be a tag, user, group, host alias, or address, none of which can be derived from the issuer URL. Narrow it when tsidp runs on a tagged node. `-allow-admin-ui` and `-allow-dcr` add those tsidp capabilities to the generated rule, and neither is granted by default.
 
 ## Running as a Service
+
+The config file and `state_dir` must be readable only by their owner, and tailgate refuses to start otherwise. The config holds every stdio upstream's credentials in `env`, and `state_dir` holds the node key and the TLS private key, so `chmod 600` on the config and `chmod 700` on the directory are part of installing it. `tsnet` creates `state_dir` at `0700` itself but leaves an existing directory at whatever mode it had.
 
 Set `TS_AUTHKEY` for the first start so the node joins unattended. The node key persists in `state_dir`, so later starts never log in again. A launchd sketch:
 
@@ -117,6 +123,16 @@ sequenceDiagram
 ```
 
 A client that skips discovery joins at step 5, probing `/.well-known/oauth-authorization-server` at the MCP origin.
+
+## Node Key Rotation
+
+There is no rotate command. Rotation is a rejoin, and the order matters.
+
+1. Delete the node in the tailnet admin console.
+2. Delete `state_dir`.
+3. Start tailgate with a fresh `TS_AUTHKEY`, or once with `-open-login`.
+
+Deleting the node first frees the hostname. A name still held comes back from the control server with a suffix appended, and every canonical resource URI is built from the name the join reports, so a rejoin landing on `tailgate-1` shifts every audience away from what the tsidp grant authorizes. With `node.tailnet` set, tailgate catches that and refuses to serve rather than denying every request at the audience check. It cannot name the stale node behind the mismatch, so check the admin console.
 
 ## Limits
 
