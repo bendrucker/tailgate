@@ -15,6 +15,7 @@ tailgate is a single Go binary that fronts MCP servers behind Tailscale Funnel, 
 - **stdio upstreams.** One child process per MCP session for a stateful caller, one per identity for a stateless one, with a concurrency cap and idle reaping either way.
 - **Authorization-server fronting.** tailgate serves RFC 8414 metadata, `/authorize`, and `/token` at its own origin for clients that assume same-origin OAuth instead of following discovery. `/authorize` is a redirect so tsidp sees the authorizing person's tailnet identity, `/token` is a bounded proxy over the tailnet, and `/register` stays absent.
 - **Dependencies.** `go.mod` is the list and it stays short: adding one to an internet-facing binary needs a reason. Opaque access tokens mean nothing is verified locally, so no JOSE or JWT library belongs here.
+- **Naming.** No numbered phases or steps in code or names, and no catch-all packages. Descriptive functions called in sequence instead.
 
 ## Settled Contracts
 
