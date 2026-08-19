@@ -50,6 +50,9 @@ const (
 	floodMethod  = "test/flood"
 	deafMethod   = "test/deaf"
 	envMethod    = "test/env"
+	// observedIDMethod reports the id the child was addressed by, which is the
+	// only way a test sees what tailgate put on the wire.
+	observedIDMethod = "test/observed-id"
 )
 
 // runFakeChild is a minimal stdio MCP server: one JSON-RPC message per line,
@@ -131,6 +134,8 @@ func runFakeChild() {
 				respond(fmt.Sprintf(`{"jsonrpc":"2.0","id":%s,"result":{"protocolVersions":["2026-07-28"],"serverInfo":{"name":"fake-stdio-server","version":"0.0.1"}}}`, request.ID))
 			case request.Method == discoverMethod:
 				respond(fmt.Sprintf(`{"jsonrpc":"2.0","id":%s,"error":{"code":%d,"message":"Refused"}}`, request.ID, discoverRefusalCode()))
+			case request.Method == observedIDMethod:
+				respond(fmt.Sprintf(`{"jsonrpc":"2.0","id":%s,"result":{"observedId":%s}}`, request.ID, request.ID))
 			case request.Method == envMethod:
 				// The echo param names the variable to report.
 				respond(fmt.Sprintf(`{"jsonrpc":"2.0","id":%s,"result":{"value":%q}}`, request.ID, os.Getenv(request.Params.Echo)))

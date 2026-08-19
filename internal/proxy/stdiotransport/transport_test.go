@@ -8,11 +8,13 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -142,6 +144,9 @@ type call struct {
 	session       string
 	protocol      string
 	body          string
+	// ctx stands in for the client's own lifetime. A call carrying one may be
+	// abandoned before its answer, and do reports that as a nil response.
+	ctx context.Context
 }
 
 func (h *harness) do(t *testing.T, c call) *http.Response {
@@ -154,7 +159,11 @@ func (h *harness) do(t *testing.T, c call) *http.Response {
 	if c.body != "" {
 		body = strings.NewReader(c.body)
 	}
-	request, err := http.NewRequestWithContext(t.Context(), method, h.gateway.URL, body)
+	ctx := c.ctx
+	if ctx == nil {
+		ctx = t.Context()
+	}
+	request, err := http.NewRequestWithContext(ctx, method, h.gateway.URL, body)
 	if err != nil {
 		t.Fatalf("new request: %v", err)
 	}
@@ -174,6 +183,9 @@ func (h *harness) do(t *testing.T, c call) *http.Response {
 	}
 	response, err := h.gateway.Client().Do(request)
 	if err != nil {
+		if c.ctx != nil && c.ctx.Err() != nil {
+			return nil
+		}
 		t.Fatalf("%s: %v", method, err)
 	}
 	return response
@@ -229,10 +241,7 @@ func (t *Transport) sessionCount() int {
 // which is what a slot leaked by an abandoned stream shows up in.
 func (t *Transport) listenerCount() int {
 	t.mu.Lock()
-	sessions := make([]*session, 0, len(t.sessions))
-	for _, s := range t.sessions {
-		sessions = append(sessions, s)
-	}
+	sessions := slices.Collect(maps.Values(t.sessions))
 	t.mu.Unlock()
 
 	count := 0
@@ -243,6 +252,25 @@ func (t *Transport) listenerCount() int {
 	}
 	return count
 }
+
+// pendingKeys reports the correlation keys registered across every live
+// session, which is how a test sees a request reach the child and an abandoned
+// one leave the correlation map.
+func (t *Transport) pendingKeys() []string {
+	t.mu.Lock()
+	sessions := slices.Collect(maps.Values(t.sessions))
+	t.mu.Unlock()
+
+	var keys []string
+	for _, s := range sessions {
+		s.mu.Lock()
+		keys = append(keys, slices.Collect(maps.Keys(s.pending))...)
+		s.mu.Unlock()
+	}
+	return keys
+}
+
+func (t *Transport) pendingRequests() int { return len(t.pendingKeys()) }
 
 // reservedSlots reports the cap slots subject currently holds, which is what a
 // leaked reservation shows up in.
@@ -404,6 +432,50 @@ func TestConcurrentRequestsCorrelateByID(t *testing.T) {
 		if diff := cmp.Diff(expected, message); diff != "" {
 			t.Errorf("request %d got the wrong response (-want +got):\n%s", id, diff)
 		}
+	}
+}
+
+// TestPostedResponseNeverReachesTheChild covers the one caller message that
+// could otherwise carry an id of the caller's choosing into the namespace
+// requests are minted from. The stateful revisions let a client POST a
+// response, so tailgate must answer one with 202, but deliver drops the
+// server-initiated direction that would have asked for it.
+//
+// The attack it defends against: name the minted id a live request is waiting
+// on, and a child that reflects the response back answers that request's
+// waiter with the caller's own payload. The minted ids run from tailgate-1, so
+// initialize takes tailgate-1 and the request below takes tailgate-2. The
+// refusal never reads the id, so the test asserts that pairing rather than
+// assuming it: a change to the minting format fails here instead of leaving
+// the exploit body naming nothing and the test passing on it.
+func TestPostedResponseNeverReachesTheChild(t *testing.T) {
+	h := newHarness(t, Options{})
+	session := h.initialize(t, "alice")
+
+	answered := make(chan map[string]any, 1)
+	go func() {
+		response := h.do(t, call{subject: "alice", session: session, body: requestBody(9, "tools/call", "mine", 300*time.Millisecond)})
+		defer response.Body.Close()
+		answered <- decodeMessage(t, response)
+	}()
+	waitFor(t, "the request to reach the child", func() bool {
+		return h.transport.pendingRequests() == 1
+	})
+
+	const stolenID = `"tailgate-2"`
+	if keys := h.transport.pendingKeys(); !slices.Contains(keys, correlationKey(json.RawMessage(stolenID))) {
+		t.Fatalf("no request is pending under %s, so the body names nothing: %v", stolenID, keys)
+	}
+
+	posted := h.do(t, call{subject: "alice", session: session, body: fmt.Sprintf(`{"jsonrpc":"2.0","id":%s,"result":{"stolen":true}}`, stolenID)})
+	posted.Body.Close()
+	if posted.StatusCode != http.StatusAccepted {
+		t.Fatalf("expected 202 for a POSTed response, got %d", posted.StatusCode)
+	}
+
+	result, _ := (<-answered)["result"].(map[string]any)
+	if result["echo"] != "mine" {
+		t.Errorf("the in-flight request was answered with %v", result)
 	}
 }
 
@@ -708,33 +780,163 @@ func TestRequestTimeout(t *testing.T) {
 	}
 }
 
-func TestDuplicateRequestIDIsRejected(t *testing.T) {
+// TestConcurrentRequestsMayReuseACallerID covers the collision a session was
+// once assumed to rule out. A client numbering its POSTs from a per-request
+// counter sends two id 1s at once, which JSON-RPC forbids and which the Claude
+// app was observed doing. Both must be served, each under its own id to the
+// child and its own id back.
+func TestConcurrentRequestsMayReuseACallerID(t *testing.T) {
 	h := newHarness(t, Options{})
 	session := h.initialize(t, "alice")
 
-	first := make(chan int, 1)
+	slow := make(chan map[string]any, 1)
 	go func() {
-		response := h.do(t, call{subject: "alice", session: session, body: requestBody(7, slowMethod, "first", 300*time.Millisecond)})
+		response := h.do(t, call{subject: "alice", session: session, body: requestBody(1, observedIDMethod, "", 300*time.Millisecond)})
 		defer response.Body.Close()
-		first <- response.StatusCode
+		if response.StatusCode != http.StatusOK {
+			slow <- nil
+			return
+		}
+		slow <- decodeMessage(t, response)
 	}()
 
-	h.transport.mu.Lock()
-	child := h.transport.sessions[session]
-	h.transport.mu.Unlock()
 	waitFor(t, "the first request to reach the child", func() bool {
-		child.mu.Lock()
-		defer child.mu.Unlock()
-		return len(child.pending) == 1
+		return h.transport.pendingRequests() == 1
 	})
 
-	response := h.do(t, call{subject: "alice", session: session, body: requestBody(7, "tools/list", "second", 0)})
-	response.Body.Close()
-	if response.StatusCode != http.StatusBadRequest {
-		t.Fatalf("expected 400 for a reused in-flight id, got %d", response.StatusCode)
+	response := h.do(t, call{subject: "alice", session: session, body: requestBody(1, observedIDMethod, "", 0)})
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 for the concurrent reuse of id 1, got %d", response.StatusCode)
 	}
-	if status := <-first; status != http.StatusOK {
-		t.Fatalf("expected the original request to survive, got %d", status)
+	second := decodeMessage(t, response)
+
+	first := <-slow
+	if first == nil {
+		t.Fatal("the first request was refused")
+	}
+
+	for _, message := range []map[string]any{first, second} {
+		if message["id"] != float64(1) {
+			t.Errorf("expected the caller's own id 1 restored, got %v", message["id"])
+		}
+	}
+	if observedID(t, first) == observedID(t, second) {
+		t.Errorf("the child saw both requests under id %v", observedID(t, first))
+	}
+}
+
+// TestRetryAfterCancelGetsItsOwnAnswer covers the collision no compliant
+// client can avoid. A caller that hangs up mid-request leaves the child still
+// working on that id, and the retry reuses it. Correlating on the caller's id
+// would hand the retry the abandoned request's answer.
+func TestRetryAfterCancelGetsItsOwnAnswer(t *testing.T) {
+	h := newHarness(t, Options{})
+	session := h.initialize(t, "alice")
+
+	abandoned, hangUp := context.WithCancel(t.Context())
+	sent := make(chan struct{})
+	go func() {
+		defer close(sent)
+		response := h.do(t, call{ctx: abandoned, subject: "alice", session: session, body: requestBody(1, "tools/call", "abandoned", 300*time.Millisecond)})
+		if response != nil {
+			response.Body.Close()
+		}
+	}()
+
+	waitFor(t, "the abandoned request to reach the child", func() bool {
+		return h.transport.pendingRequests() == 1
+	})
+	hangUp()
+	<-sent
+	waitFor(t, "the abandoned request to leave the correlation map", func() bool {
+		return h.transport.pendingRequests() == 0
+	})
+
+	// Outlasting the child's answer to the abandoned request is what puts the
+	// retry in the way of it.
+	response := h.do(t, call{subject: "alice", session: session, body: requestBody(1, "tools/call", "retry", time.Second)})
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 for the retry, got %d", response.StatusCode)
+	}
+
+	result, _ := decodeMessage(t, response)["result"].(map[string]any)
+	if result["echo"] != "retry" {
+		t.Errorf("the retry was answered with %v, not its own result", result)
+	}
+}
+
+func observedID(t *testing.T, message map[string]any) any {
+	t.Helper()
+	result, ok := message["result"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected a result, got %v", message)
+	}
+	return result["observedId"]
+}
+
+// TestBadRequestNamesTheRefusal covers what a client is told when tailgate
+// refuses its message. The status alone leaves a caller with a tool call that
+// failed for no stated reason, and each of these sentinels names a mistake in
+// the request the caller itself wrote. What the caller is told is the
+// transport's own text: a sentinel's is written for the log, where the package
+// name that prefixes it belongs, and an internet-facing response is no place
+// to disclose it.
+func TestBadRequestNamesTheRefusal(t *testing.T) {
+	h := newHarness(t, Options{})
+
+	for sentinel, message := range badRequestMessages {
+		if strings.Contains(message, "stdiotransport") {
+			t.Errorf("the text answering %v carries the package name: %q", sentinel, message)
+		}
+	}
+
+	for _, tc := range []struct {
+		name     string
+		err      error
+		expected string
+	}{
+		{name: "invalid message", err: errInvalidMessage, expected: "invalid JSON-RPC message"},
+		{name: "missing session id", err: errMissingSessionID, expected: "Mcp-Session-Id is required"},
+		{name: "duplicate request id", err: errDuplicateRequestID, expected: "duplicate in-flight JSON-RPC id"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			h.transport.writeError(recorder, tc.err)
+
+			if recorder.Code != http.StatusBadRequest {
+				t.Fatalf("expected 400, got %d", recorder.Code)
+			}
+			var refusal struct {
+				Error struct {
+					Message string `json:"message"`
+				} `json:"error"`
+			}
+			if err := json.Unmarshal(recorder.Body.Bytes(), &refusal); err != nil {
+				t.Fatalf("decode refusal: %v", err)
+			}
+			if refusal.Error.Message != tc.expected {
+				t.Errorf("expected %q, got %q", tc.expected, refusal.Error.Message)
+			}
+		})
+	}
+}
+
+// TestRefusalAboveBadRequestStaysOpaque holds the other half: a status outside
+// the 400 family reports a failure of tailgate's own, whose detail names the
+// child command and other internals an internet-facing response must not carry.
+func TestRefusalAboveBadRequestStaysOpaque(t *testing.T) {
+	h := newHarness(t, Options{})
+
+	recorder := httptest.NewRecorder()
+	h.transport.writeError(recorder, errUnauthenticated)
+
+	if recorder.Code != http.StatusInternalServerError {
+		t.Fatalf("expected 500, got %d", recorder.Code)
+	}
+	if body := recorder.Body.String(); !strings.HasPrefix(body, http.StatusText(http.StatusInternalServerError)) {
+		t.Errorf("expected the status text alone, got %q", body)
 	}
 }
 
@@ -1419,6 +1621,10 @@ func TestMessagesOutsideTheJSONRPCShapesAreRejected(t *testing.T) {
 		{
 			name: "neither a method nor a usable id",
 			body: `{"jsonrpc":"2.0","id":null,"result":{}}`,
+		},
+		{
+			name: "neither a method nor an id at all",
+			body: `{"jsonrpc":"2.0","params":{}}`,
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

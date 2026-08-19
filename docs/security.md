@@ -56,7 +56,9 @@ Where the `2026-07-28` revision mirrors body fields into headers, tailgate refus
 
 ### JSON-RPC Refusals
 
-A `400` whose body is not a recognized JSON-RPC error tells a probing client the server predates the stateless revision, so every refusal tailgate originates at that status answers in the modern shape. Bare text talks callers into downgrading to revisions with weaker rules.
+A `400` whose body is not a recognized JSON-RPC error tells a probing client the server predates the stateless revision, so every refusal tailgate originates at that status on an MCP path answers in the modern shape. Bare text talks callers into downgrading to revisions with weaker rules. The OAuth endpoints answer in their own grammar, since no client probes those for an MCP revision.
+
+That error message names which validation the request failed. Each refusal at `400` describes a protocol mistake in the request the caller itself wrote, so naming the mistake discloses nothing about the upstream, the identity, or tailgate's internals. The wording is the transport's own. The internal error carries a package prefix that belongs in the log and never on the wire. Every other status on that path answers in status text alone, since each reports a failure whose detail names the child command, the caller's cap, or other internals.
 
 ## Token and Log Handling
 

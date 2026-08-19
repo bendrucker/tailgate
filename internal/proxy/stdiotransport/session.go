@@ -24,8 +24,9 @@ import (
 const maxLineBytes = 4 << 20
 
 // errDuplicateRequestID rejects a second in-flight request reusing a live
-// JSON-RPC id, which JSON-RPC forbids and which would otherwise let one
-// request steal another's response.
+// JSON-RPC id, which would let one request steal another's response. Every id
+// correlated on is minted here, so no caller can reach this: it is the
+// invariant the minting upholds.
 var errDuplicateRequestID = errors.New("stdiotransport: duplicate in-flight JSON-RPC id")
 
 // errStdinBlocked reports a child that is alive but has stopped reading its
@@ -238,10 +239,11 @@ func (s *session) logStderr(stderr io.Reader) {
 // request carries a caller's request to the child under an id tailgate mints,
 // and restores the caller's own id on the answer.
 //
-// Rewriting is what makes a stateless revision safe to serve: without the
-// session that used to give one caller a single id space, two independent
-// POSTs may both call themselves id 1, and correlating on the caller's id
-// would let either take the other's answer.
+// Every caller's request is rewritten, because a caller's id space is not
+// tailgate's to trust. Independent POSTs may all call themselves id 1, and a
+// caller that hangs up mid-request and retries reuses an id the child is still
+// working on. Correlating on the caller's id would let either request take the
+// other's answer.
 func (s *session) request(ctx context.Context, msg message, timeout time.Duration) ([]byte, error) {
 	line, key, err := s.substitute(msg.Line)
 	if err != nil {
@@ -255,13 +257,9 @@ func (s *session) request(ctx context.Context, msg message, timeout time.Duratio
 }
 
 // mintID returns an id no caller can collide with, and the correlation key for
-// it, so the two are always derived together.
-//
-// A caller's id reaches the child only after substitution, which is what makes
-// a stateless revision safe to serve: without the session that used to give one
-// caller a single id space, two independent POSTs may both call themselves id
-// 1, and correlating on the caller's id would let either take the other's
-// answer.
+// it, so the two are always derived together. Every id this transport
+// correlates on comes from here, whether it carries a caller's request or one
+// tailgate originates.
 func (s *session) mintID() (json.RawMessage, string) {
 	id := json.RawMessage(strconv.Quote("tailgate-" + strconv.FormatUint(s.ids.Add(1), 10)))
 	return id, correlationKey(id)

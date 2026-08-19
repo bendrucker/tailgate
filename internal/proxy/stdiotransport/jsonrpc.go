@@ -73,12 +73,9 @@ func (m message) WellFormed() bool {
 	return m.IsRequest() || m.IsResponse() || m.IsNotification()
 }
 
-// setID re-encodes a JSON-RPC message under a different id.
-//
-// It exists because a stateless revision gives up the shared id space a
-// session used to provide: each POST stands alone, so two concurrent requests
-// from one caller may both call themselves id 1. tailgate correlates on an id
-// it mints per message and restores the caller's own before answering.
+// setID re-encodes a JSON-RPC message under a different id. It is both halves
+// of substitution: tailgate correlates on an id it mints per message and
+// restores the caller's own before answering.
 func setID(raw []byte, id json.RawMessage) ([]byte, error) {
 	var fields map[string]json.RawMessage
 	if err := json.Unmarshal(raw, &fields); err != nil {
