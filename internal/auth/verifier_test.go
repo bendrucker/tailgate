@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 )
@@ -62,6 +63,7 @@ func TestVerify(t *testing.T) {
 			claims: map[string]any{
 				"active":   true,
 				"exp":      fresh,
+				"scope":    "openid email",
 				"sub":      "12345",
 				"username": "bendrucker@github",
 				"email":    "bvdrucker@gmail.com",
@@ -75,6 +77,7 @@ func TestVerify(t *testing.T) {
 			claims: map[string]any{
 				"active": true,
 				"exp":    fresh,
+				"scope":  "openid email",
 				"sub":    "12345",
 				"aud":    testResource,
 			},
@@ -182,6 +185,7 @@ func TestVerify(t *testing.T) {
 			claims: map[string]any{
 				"active": true,
 				"exp":    fresh,
+				"scope":  "openid email",
 				"aud":    testResource,
 			},
 			invalid: true,
@@ -322,6 +326,93 @@ func TestNewVerifierFailsClosed(t *testing.T) {
 			t.Cleanup(srv.Close)
 			if _, err := NewVerifier(context.Background(), srv.Client(), srv.URL); err == nil {
 				t.Fatal("expected construction to fail")
+			}
+		})
+	}
+}
+
+// TestNewVerifierRejectsIntrospectionEndpointWithUserinfo defends against a
+// discovery document whose endpoint carries credentials: net/http would turn
+// them into an Authorization header on every introspection, and the refusal
+// must not quote them.
+func TestNewVerifierRejectsIntrospectionEndpointWithUserinfo(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(w, `{"issuer":%q,"introspection_endpoint":%q}`,
+			"http://"+r.Host, "http://attacker:hunter2@"+r.Host+"/introspect")
+	}))
+	t.Cleanup(srv.Close)
+
+	_, err := NewVerifier(t.Context(), srv.Client(), srv.URL)
+	if err == nil {
+		t.Fatal("expected construction to fail for an introspection endpoint carrying userinfo")
+	}
+	if strings.Contains(err.Error(), "hunter2") {
+		t.Errorf("error names the credential: %v", err)
+	}
+}
+
+// Requiring the email scope restricts no client tsidp would otherwise admit:
+// any registered client can ask for it and be granted it. What the check buys
+// is that a client which omitted it learns so from a refusal naming the scope,
+// rather than from an opaque policy denial once introspection returns no email
+// for the allowlist to match.
+func TestVerifyRequiresScope(t *testing.T) {
+	now := time.Unix(1_800_000_000, 0)
+	fresh := float64(now.Add(5 * time.Minute).Unix())
+
+	for _, tc := range []struct {
+		name       string
+		scopeClaim any
+		sufficient bool
+	}{
+		{name: "required scope alone", scopeClaim: "email", sufficient: true},
+		{name: "required scope among several", scopeClaim: "openid profile email", sufficient: true},
+		{name: "runs of whitespace between scopes", scopeClaim: "  openid \t email  ", sufficient: true},
+		{name: "other scopes without the required one", scopeClaim: "openid profile", sufficient: false},
+		{name: "empty scope string", scopeClaim: "", sufficient: false},
+		{name: "whitespace only scope string", scopeClaim: "   ", sufficient: false},
+		{name: "scope claim absent", scopeClaim: nil, sufficient: false},
+		{name: "scope claim as an array", scopeClaim: []any{"openid", "email"}, sufficient: false},
+		{name: "scope claim as a number", scopeClaim: float64(1), sufficient: false},
+		{name: "scope substring of a granted scope", scopeClaim: "emailx openid", sufficient: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			claims := map[string]any{
+				"active": true,
+				"exp":    fresh,
+				"sub":    "12345",
+				"email":  "bvdrucker@gmail.com",
+				"aud":    testResource,
+			}
+			if tc.scopeClaim != nil {
+				claims["scope"] = tc.scopeClaim
+			}
+			issuer := fakeIssuer(t, map[string]map[string]any{"good": claims})
+			verifier, err := NewVerifier(context.Background(), issuer.Client(), issuer.URL)
+			if err != nil {
+				t.Fatalf("NewVerifier: %v", err)
+			}
+			verifier.now = func() time.Time { return now }
+			// The shipped set is empty, so the check is exercised against a
+			// requirement the test states rather than one the package default
+			// happens to hold.
+			verifier.requiredScopes = []string{"email"}
+
+			_, err = verifier.Verify(context.Background(), "good", testResource)
+			if tc.sufficient {
+				if err != nil {
+					t.Fatalf("Verify: %v", err)
+				}
+				return
+			}
+			if !errors.Is(err, ErrInsufficientScope) {
+				t.Fatalf("expected ErrInsufficientScope, got %v", err)
+			}
+			// A good credential missing a scope is a 403, so it must not be
+			// classified as a bearer to challenge or as an outage to retry.
+			if errors.Is(err, ErrInvalidToken) || errors.Is(err, ErrUnavailable) {
+				t.Errorf("insufficient scope must not also be invalid or unavailable: %v", err)
 			}
 		})
 	}

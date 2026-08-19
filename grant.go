@@ -48,7 +48,9 @@ func grantCommand(args []string, out, errOut io.Writer) error {
 	// they cannot drift from what grant.New falls back to.
 	src := flags.String("src", grant.DefaultSrc, "policy source, comma separated")
 	dst := flags.String("dst", grant.DefaultDst, "policy destination naming tsidp's node, comma separated")
-	users := flags.String("users", grant.DefaultUser, "tsidp rule users, comma separated")
+	// -users stays empty so an unset flag falls back to the identities the
+	// config's policy allows, which is a default PrintDefaults cannot render.
+	users := flags.String("users", "", "tsidp rule users, comma separated (default: the identities the config's policy allows)")
 	adminUI := flags.Bool("allow-admin-ui", false, "grant access to tsidp's admin UI")
 	dcr := flags.Bool("allow-dcr", false, "grant dynamic client registration")
 	flags.Usage = func() {
@@ -94,7 +96,7 @@ func grantCommand(args []string, out, errOut io.Writer) error {
 	g, err := grant.New(urls, names, grant.Options{
 		Src:          split(*src),
 		Dst:          split(*dst),
-		Users:        split(*users),
+		Users:        orPolicyUsers(split(*users), cfg.Policy),
 		AllowAdminUI: *adminUI,
 		AllowDCR:     *dcr,
 	})
@@ -108,6 +110,44 @@ func grantCommand(args []string, out, errOut io.Writer) error {
 	}
 	_, err = out.Write(rendered)
 	return err
+}
+
+// orPolicyUsers narrows the grant's users to the identities tailgate's own
+// policy allows, unless the caller named them itself.
+//
+// tsidp's users field and tailgate's policy gate the same thing from opposite
+// ends: who may mint a token whose audience names an upstream, and who may
+// reach that upstream with one. Leaving the first at the wildcard collapses the
+// two into one, so anyone on the tailnet holds a token tailgate would have to
+// deny by policy alone.
+//
+// A policy condition naming no identity leaves the grant at the wildcard rather
+// than at the subset it could enumerate. Such a rule allows an identity this
+// cannot name, and a grant narrower than the policy denies at the token request
+// instead, where nothing in tailgate's audit log accounts for it.
+func orPolicyUsers(explicit []string, policy []config.Rule) []string {
+	if len(explicit) > 0 {
+		return explicit
+	}
+
+	var users []string
+	seen := make(map[string]bool)
+	add := func(user string) {
+		if user != "" && !seen[user] {
+			seen[user] = true
+			users = append(users, user)
+		}
+	}
+	for _, rule := range policy {
+		for _, match := range rule.Allow {
+			if match.Email == "" && match.Subject == "" {
+				return nil
+			}
+			add(match.Email)
+			add(match.Subject)
+		}
+	}
+	return users
 }
 
 func split(csv string) []string {

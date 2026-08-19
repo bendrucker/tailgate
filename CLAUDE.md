@@ -5,7 +5,7 @@ tailgate is a single Go binary that fronts MCP servers behind Tailscale Funnel, 
 ## Locked Decisions
 
 - **Tailscale.** Embedded via `tsnet`. tailgate joins the tailnet as its own node and serves Funnel itself, with no dependency on a host `tailscaled`. The deployment target is `launchd`.
-- **Exposure.** Tailscale Funnel terminates TLS, and the ports it supports constrain `node.port`.
+- **Exposure.** Tailscale Funnel, whose supported ports constrain `node.port`. TLS terminates inside tailgate: `tsnet.ListenFunnel` returns a `tls.Listener` whose certificate `tsnet` obtains for the node, and the edge relays encrypted TCP. tailgate owns its own TLS configuration and private key.
 - **Identity.** tsidp is the sole issuer. Funnel strips tailnet identity, so the bearer token is the only identity signal a request carries.
 - **MCP auth.** tailgate is an OAuth Resource Server: RFC 9728 metadata, `401` with `WWW-Authenticate` naming the required scopes, and RFC 8707 audience validation. It never forwards a client's token to an upstream.
 - **Protocol revisions.** tailgate speaks every revision from `2024-11-05` through `2026-07-28` and chooses per request. It fronts servers and serves clients it does not control, so it can never cut over to a single revision. Every revision difference lives in `internal/protocol`.

@@ -60,8 +60,18 @@ func (m message) IsResponse() bool { return m.Method == "" && m.Key != "" }
 
 // IsNotification reports whether the message is a one-way message from the
 // child, which under a stateless revision is what a subscription stream
-// carries.
-func (m message) IsNotification() bool { return m.Method != "" && m.Key == "" }
+// carries. JSON-RPC tells a notification from a request by the absence of the
+// id member, not by whether the id it carries is usable, so an id that
+// correlates to nothing does not turn a request into one.
+func (m message) IsNotification() bool { return m.Method != "" && len(m.ID) == 0 }
+
+// WellFormed reports whether the message is one of the three shapes JSON-RPC
+// defines. An id present but uncorrelatable leaves a message that is none of
+// them, and passing one on would put a caller-chosen id into the child's own id
+// space under a message whose answer could never be routed back.
+func (m message) WellFormed() bool {
+	return m.IsRequest() || m.IsResponse() || m.IsNotification()
+}
 
 // setID re-encodes a JSON-RPC message under a different id.
 //

@@ -699,3 +699,52 @@ func TestClientAbortIsNotAnUpstreamError(t *testing.T) {
 		t.Fatalf("client abort logged as upstream error:\n%s", logs.String())
 	}
 }
+
+// TestUpstreamResponseHeadersAreFiltered covers what an upstream can state
+// about the shared Funnel origin. Every upstream, the authorization server
+// facade, the metadata documents, and the site answer on that one origin, so a
+// header naming the origin rather than the upstream reaches all of them.
+func TestUpstreamResponseHeadersAreFiltered(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		header   string
+		value    string
+		stripped bool
+	}{
+		{name: "a cookie for the origin", header: "Set-Cookie", value: "session=1; Path=/", stripped: true},
+		{name: "a lowercased cookie", header: "set-cookie", value: "session=1", stripped: true},
+		{name: "a cross origin allowance", header: "Access-Control-Allow-Origin", value: "https://attacker.example", stripped: true},
+		{name: "a credentialed cross origin allowance", header: "Access-Control-Allow-Credentials", value: "true", stripped: true},
+		{name: "an exposed header list", header: "Access-Control-Expose-Headers", value: "Mcp-Session-Id", stripped: true},
+		{name: "the session header the protocol owns", header: "Mcp-Session-Id", value: "abc123"},
+		{name: "an ordinary upstream header", header: "X-Upstream-Note", value: "kept"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Add(tc.header, tc.value)
+				w.WriteHeader(http.StatusAccepted)
+			}))
+			defer origin.Close()
+
+			target, err := url.Parse(origin.URL)
+			if err != nil {
+				t.Fatalf("parse: %v", err)
+			}
+			transport := New(target, slog.New(slog.NewTextHandler(io.Discard, nil)))
+			defer transport.Close()
+			gateway := httptest.NewServer(transport)
+			defer gateway.Close()
+
+			resp := postMessage(t, gateway.Client(), gateway.URL, "", `{"jsonrpc":"2.0","method":"notifications/initialized"}`)
+			defer resp.Body.Close()
+
+			got := resp.Header.Get(tc.header)
+			if tc.stripped && got != "" {
+				t.Fatalf("%s reached the client as %q", tc.header, got)
+			}
+			if !tc.stripped && got != tc.value {
+				t.Fatalf("%s = %q, want %q", tc.header, got, tc.value)
+			}
+		})
+	}
+}

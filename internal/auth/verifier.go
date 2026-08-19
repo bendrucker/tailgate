@@ -11,6 +11,8 @@ import (
 	"net/url"
 	"strings"
 	"time"
+
+	"github.com/bendrucker/tailgate/internal/resource"
 )
 
 // tsidp access tokens are opaque strings backed by in-memory state (pinned
@@ -25,6 +27,13 @@ var (
 	// expired, or not issued for the requested resource. Handlers map it to
 	// 401 with a WWW-Authenticate challenge.
 	ErrInvalidToken = errors.New("auth: invalid token")
+	// ErrInsufficientScope means the token verified but was not granted a scope
+	// tailgate requires. RFC 6750 section 3.1 answers it with 403 rather than a
+	// challenge: the credential is good, and re-authenticating under the same
+	// grant yields the same token. It deliberately does not wrap
+	// ErrInvalidToken: a handler that tested for the wrapped sentinel first
+	// would answer 401 to an insufficiently scoped token.
+	ErrInsufficientScope = errors.New("auth: insufficient scope")
 	// ErrUnavailable means verification could not run at all: the caller's
 	// token may be fine, tailgate just cannot prove it. Handlers map it to
 	// 503, never to a 401 challenge and never to an allow.
@@ -45,6 +54,13 @@ const (
 	// token store is a mutex-guarded map.
 	defaultIntrospectionConcurrency = 64
 	defaultIntrospectionTimeout     = 10 * time.Second
+	// defaultIntrospectionRate bounds the introspection round trips one client
+	// address can cause: a burst of this many, refilled one per interval.
+	defaultIntrospectionRateBurst    = 20
+	defaultIntrospectionRateInterval = time.Second
+	// defaultIntrospectionRateSize bounds the address table, which is keyed by
+	// whatever addresses reach the Funnel endpoint.
+	defaultIntrospectionRateSize = 4096
 	// maxTokenLength is far above tsidp's 32 hex characters and far below what
 	// is worth forwarding.
 	maxTokenLength = 512
@@ -57,17 +73,22 @@ type Verifier struct {
 	introspectURL string
 	now           func() time.Time
 
+	requiredScopes []string
+
 	active      *tokenCache[map[string]any]
 	inactive    *tokenCache[struct{}]
 	ttl         time.Duration
 	negativeTTL time.Duration
 	timeout     time.Duration
 	slots       chan struct{}
+	limiter     *addrLimiter
 	inflight    *inflightGroup
 }
 
-// VerifierOption adjusts the introspection path's caching and abuse controls.
-type VerifierOption func(*verifierOptions)
+// verifierOption adjusts the introspection path's caching and abuse controls.
+// The knobs are unexported because every one of them is a way to weaken token
+// verification, and the defaults are the ones tailgate is willing to run.
+type verifierOption func(*verifierOptions)
 
 type verifierOptions struct {
 	cacheSize         int
@@ -76,58 +97,68 @@ type verifierOptions struct {
 	negativeCacheTTL  time.Duration
 	concurrency       int
 	timeout           time.Duration
+	rateBurst         float64
+	rateInterval      time.Duration
 	now               func() time.Time
 }
 
-// WithCacheSize bounds how many verified tokens are held in memory. Zero or
+// withCacheSize bounds how many verified tokens are held in memory. Zero or
 // less disables the cache, making every request an introspection round trip.
-func WithCacheSize(n int) VerifierOption {
+func withCacheSize(n int) verifierOption {
 	return func(o *verifierOptions) { o.cacheSize = n }
 }
 
-// WithCacheTTL caps how long a verified token's claims are reused. An entry
+// withCacheTTL caps how long a verified token's claims are reused. An entry
 // never outlives the token's own exp regardless of this value, so raising it
 // past the issuer's token lifetime has no effect. The effective value is the
 // staleness window: a token revoked at tsidp keeps working until its cached
 // claims lapse.
-func WithCacheTTL(d time.Duration) VerifierOption {
+func withCacheTTL(d time.Duration) verifierOption {
 	return func(o *verifierOptions) { o.cacheTTL = d }
 }
 
-// WithNegativeCacheSize bounds how many rejected tokens are remembered. Zero or
+// withNegativeCacheSize bounds how many rejected tokens are remembered. Zero or
 // less disables the negative cache. The bound matters more than the size: these
 // entries are keyed by attacker-chosen strings.
-func WithNegativeCacheSize(n int) VerifierOption {
+func withNegativeCacheSize(n int) verifierOption {
 	return func(o *verifierOptions) { o.negativeCacheSize = n }
 }
 
-// WithNegativeCacheTTL sets how long a token the issuer reported inactive is
+// withNegativeCacheTTL sets how long a token the issuer reported inactive is
 // re-rejected without asking again. Zero or less disables the negative cache.
 // Only inactive verdicts are cached this way; a failure to reach the issuer
 // stays retryable.
-func WithNegativeCacheTTL(d time.Duration) VerifierOption {
+func withNegativeCacheTTL(d time.Duration) verifierOption {
 	return func(o *verifierOptions) { o.negativeCacheTTL = d }
 }
 
-// WithIntrospectionConcurrency bounds simultaneous introspection calls. Once
+// withIntrospectionConcurrency bounds simultaneous introspection calls. Once
 // the bound is reached, further calls are shed as ErrUnavailable rather than
 // queued. Zero or less removes the bound.
-func WithIntrospectionConcurrency(n int) VerifierOption {
+func withIntrospectionConcurrency(n int) verifierOption {
 	return func(o *verifierOptions) { o.concurrency = n }
 }
 
-// WithIntrospectionTimeout bounds a single introspection call, which bounds how
+// withIntrospectionTimeout bounds a single introspection call, which bounds how
 // long a stalled issuer can hold a concurrency slot.
-func WithIntrospectionTimeout(d time.Duration) VerifierOption {
+func withIntrospectionTimeout(d time.Duration) verifierOption {
 	return func(o *verifierOptions) { o.timeout = d }
 }
 
-// WithClock replaces the clock used for expiry and cache lifetimes.
-func WithClock(now func() time.Time) VerifierOption {
+// withIntrospectionRate sets the per-address token bucket: burst tokens
+// available at once, one refilled per interval. A caller that runs out is shed
+// as ErrUnavailable. Zero or less in either value removes the per-address
+// bound, leaving only the global concurrency gate.
+func withIntrospectionRate(burst float64, interval time.Duration) verifierOption {
+	return func(o *verifierOptions) { o.rateBurst, o.rateInterval = burst, interval }
+}
+
+// withClock replaces the clock used for expiry and cache lifetimes.
+func withClock(now func() time.Time) verifierOption {
 	return func(o *verifierOptions) { o.now = now }
 }
 
-func newVerifierOptions(opts []VerifierOption) verifierOptions {
+func newVerifierOptions(opts []verifierOption) verifierOptions {
 	o := verifierOptions{
 		cacheSize:         defaultCacheSize,
 		cacheTTL:          defaultCacheTTL,
@@ -135,6 +166,8 @@ func newVerifierOptions(opts []VerifierOption) verifierOptions {
 		negativeCacheTTL:  defaultNegativeCacheTTL,
 		concurrency:       defaultIntrospectionConcurrency,
 		timeout:           defaultIntrospectionTimeout,
+		rateBurst:         defaultIntrospectionRateBurst,
+		rateInterval:      defaultIntrospectionRateInterval,
 		now:               time.Now,
 	}
 	for _, opt := range opts {
@@ -154,7 +187,7 @@ func newVerifierOptions(opts []VerifierOption) verifierOptions {
 // introspection. For tsidp that means dialing over the tailnet. Construction
 // failure means no request can be verified, so callers must treat it as the
 // service being unavailable rather than skipping verification.
-func NewVerifier(ctx context.Context, client *http.Client, issuer string, opts ...VerifierOption) (*Verifier, error) {
+func NewVerifier(ctx context.Context, client *http.Client, issuer string, opts ...verifierOption) (*Verifier, error) {
 	issuer = strings.TrimSuffix(issuer, "/")
 	issuerURL, err := url.Parse(issuer)
 	if err != nil {
@@ -188,21 +221,29 @@ func NewVerifier(ctx context.Context, client *http.Client, issuer string, opts .
 	if err != nil {
 		return nil, fmt.Errorf("auth: discovery: parse introspection endpoint: %w", err)
 	}
+	// Userinfo would become an Authorization header on every introspection
+	// request. It is rejected ahead of the origin check, which quotes the
+	// endpoint, so a password there never reaches a log line.
+	if introspect.User != nil {
+		return nil, fmt.Errorf("auth: discovery: introspection endpoint carries userinfo")
+	}
 	if introspect.Scheme != issuerURL.Scheme || introspect.Host != issuerURL.Host {
 		return nil, fmt.Errorf("auth: discovery: introspection endpoint %q is not on issuer origin %q", doc.IntrospectionEndpoint, issuer)
 	}
 
 	o := newVerifierOptions(opts)
 	v := &Verifier{
-		client:        client,
-		introspectURL: doc.IntrospectionEndpoint,
-		now:           o.now,
-		active:        newTokenCache[map[string]any](o.cacheSize),
-		inactive:      newTokenCache[struct{}](o.negativeCacheSize),
-		ttl:           o.cacheTTL,
-		negativeTTL:   o.negativeCacheTTL,
-		timeout:       o.timeout,
-		inflight:      &inflightGroup{},
+		client:         client,
+		introspectURL:  doc.IntrospectionEndpoint,
+		now:            o.now,
+		requiredScopes: resource.RequiredScopes(),
+		active:         newTokenCache[map[string]any](o.cacheSize),
+		inactive:       newTokenCache[struct{}](o.negativeCacheSize),
+		ttl:            o.cacheTTL,
+		negativeTTL:    o.negativeCacheTTL,
+		timeout:        o.timeout,
+		limiter:        newAddrLimiter(defaultIntrospectionRateSize, o.rateBurst, o.rateInterval),
+		inflight:       &inflightGroup{},
 	}
 	if o.concurrency > 0 {
 		v.slots = make(chan struct{}, o.concurrency)
@@ -215,15 +256,16 @@ func NewVerifier(ctx context.Context, client *http.Client, issuer string, opts .
 // string must come from resource.URLs so the audience comparison is byte-exact
 // against what the client requested and tsidp granted.
 //
-// Any verification failure returns ErrInvalidToken. Failure to complete
-// introspection at all, including load shed by the abuse controls, returns
-// ErrUnavailable instead, so handlers can answer 503 rather than challenging
-// the client to re-authenticate.
-func (v *Verifier) Verify(ctx context.Context, token, resource string) (Identity, error) {
+// Any verification failure returns ErrInvalidToken, except a token the issuer
+// granted without a scope tailgate requires, which returns
+// ErrInsufficientScope. Failure to complete introspection at all, including
+// load shed by the abuse controls, returns ErrUnavailable instead, so handlers
+// can answer 503 rather than challenging the client to re-authenticate.
+func (v *Verifier) Verify(ctx context.Context, token, resourceURL string) (Identity, error) {
 	if err := validateTokenSyntax(token); err != nil {
 		return Identity{}, err
 	}
-	if resource == "" {
+	if resourceURL == "" {
 		return Identity{}, fmt.Errorf("%w: no audience to check the token against", ErrUnavailable)
 	}
 
@@ -231,12 +273,12 @@ func (v *Verifier) Verify(ctx context.Context, token, resource string) (Identity
 	if err != nil {
 		return Identity{}, err
 	}
-	return v.identityFromClaims(claims, resource)
+	return v.identityFromClaims(claims, resourceURL)
 }
 
 // identityFromClaims applies the checks that depend on the request rather than
 // on the token alone, so they run on every Verify including cache hits.
-func (v *Verifier) identityFromClaims(claims map[string]any, resource string) (Identity, error) {
+func (v *Verifier) identityFromClaims(claims map[string]any, resourceURL string) (Identity, error) {
 	now := v.now()
 	exp, ok := numericClaim(claims, "exp")
 	if !ok {
@@ -248,8 +290,11 @@ func (v *Verifier) identityFromClaims(claims map[string]any, resource string) (I
 	if nbf, ok := numericClaim(claims, "nbf"); ok && now.Before(time.Unix(nbf, 0)) {
 		return Identity{}, fmt.Errorf("%w: not yet valid", ErrInvalidToken)
 	}
-	if !audienceContains(claims["aud"], resource) {
-		return Identity{}, fmt.Errorf("%w: audience does not include %s", ErrInvalidToken, resource)
+	if !audienceContains(claims["aud"], resourceURL) {
+		return Identity{}, fmt.Errorf("%w: audience does not include %s", ErrInvalidToken, resourceURL)
+	}
+	if missing := missingScopes(claims["scope"], v.requiredScopes); len(missing) > 0 {
+		return Identity{}, fmt.Errorf("%w: token was not granted %s", ErrInsufficientScope, strings.Join(missing, " "))
 	}
 
 	sub, _ := claims["sub"].(string)
@@ -327,17 +372,38 @@ func numericClaim(claims map[string]any, name string) (int64, bool) {
 	return int64(f), true
 }
 
+// missingScopes returns the required scopes the RFC 7662 scope claim does not
+// carry. The claim is a space-delimited string, split on whitespace runs so a
+// doubled separator does not yield an empty scope. A claim that is absent or is
+// not a string carries no scopes at all, which makes every requirement missing
+// rather than assumed.
+func missingScopes(claim any, required []string) []string {
+	granted := make(map[string]bool)
+	if s, ok := claim.(string); ok {
+		for _, scope := range strings.Fields(s) {
+			granted[scope] = true
+		}
+	}
+	var missing []string
+	for _, scope := range required {
+		if !granted[scope] {
+			missing = append(missing, scope)
+		}
+	}
+	return missing
+}
+
 // audienceContains reports whether the RFC 7662 aud value, which may be a
 // single string or an array, contains resource exactly. Comparison is
 // byte-exact by design: tsidp matches grant resources the same way, and any
 // normalization here would let two spellings of one URI pass different checks.
-func audienceContains(aud any, resource string) bool {
+func audienceContains(aud any, resourceURL string) bool {
 	switch v := aud.(type) {
 	case string:
-		return v == resource
+		return v == resourceURL
 	case []any:
 		for _, entry := range v {
-			if s, ok := entry.(string); ok && s == resource {
+			if s, ok := entry.(string); ok && s == resourceURL {
 				return true
 			}
 		}

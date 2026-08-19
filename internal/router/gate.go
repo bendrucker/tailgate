@@ -32,7 +32,7 @@ func (rt *Router) authenticate(rec *responseRecorder, r *http.Request, up *upstr
 			opts = resource.ChallengeOptions{Error: "invalid_request"}
 		}
 		rt.audit.Deny(r.Context(), auth.Identity{}, up.name, reason)
-		rt.challenge(rec, up, opts)
+		rt.challenge(rec, up, http.StatusUnauthorized, opts)
 		return auth.Identity{}, false
 	}
 
@@ -40,9 +40,16 @@ func (rt *Router) authenticate(rec *responseRecorder, r *http.Request, up *upstr
 	switch {
 	case err == nil:
 		return id, true
+	case errors.Is(err, auth.ErrInsufficientScope):
+		// RFC 6750 section 3.1: the credential is good, so re-authenticating
+		// under the same grant would produce the same token. The challenge still
+		// rides along because a client reading only the status learns nothing
+		// about which scope to ask for next time.
+		rt.audit.Deny(r.Context(), auth.Identity{}, up.name, ReasonInsufficientScope)
+		rt.challenge(rec, up, http.StatusForbidden, resource.ChallengeOptions{Error: "insufficient_scope"})
 	case errors.Is(err, auth.ErrInvalidToken):
 		rt.audit.Deny(r.Context(), auth.Identity{}, up.name, ReasonInvalidToken)
-		rt.challenge(rec, up, resource.ChallengeOptions{Error: "invalid_token"})
+		rt.challenge(rec, up, http.StatusUnauthorized, resource.ChallengeOptions{Error: "invalid_token"})
 	default:
 		// auth.ErrUnavailable and anything unclassified: tailgate cannot prove
 		// the token either way, so it never challenges the client to
@@ -54,12 +61,14 @@ func (rt *Router) authenticate(rec *responseRecorder, r *http.Request, up *upstr
 	return auth.Identity{}, false
 }
 
-// challenge answers 401 with the WWW-Authenticate value that points the client
-// at the upstream's protected-resource metadata, which is how a client with no
-// prior configuration discovers where to obtain a token.
-func (rt *Router) challenge(rec *responseRecorder, up *upstream, opts resource.ChallengeOptions) {
+// challenge answers status with the WWW-Authenticate value that points the
+// client at the upstream's protected-resource metadata, which is how a client
+// with no prior configuration discovers where to obtain a token. The status is
+// a parameter because RFC 6750 answers a scope failure with 403 while every
+// other refusal here is a 401.
+func (rt *Router) challenge(rec *responseRecorder, up *upstream, status int, opts resource.ChallengeOptions) {
 	rec.Header().Set("WWW-Authenticate", rt.resources.Challenge(up.name, opts))
-	http.Error(rec, "unauthorized", http.StatusUnauthorized)
+	http.Error(rec, strings.ToLower(http.StatusText(status)), status)
 }
 
 // bearerToken extracts the RFC 6750 header credential. Repeated Authorization
@@ -88,12 +97,19 @@ func bearerToken(header http.Header) (string, error) {
 // originAllowed validates the browser origin against DNS rebinding. A request
 // with no Origin header is not from a browser and is allowed. A request that
 // carries one must name an origin tailgate is served from.
+//
+// Repeated headers are refused rather than resolved to the first. tailgate
+// forwards the header, so an upstream that reads the last one would execute
+// against an origin tailgate never validated.
 func (rt *Router) originAllowed(r *http.Request) bool {
-	origin := r.Header.Get("Origin")
-	if origin == "" {
+	origins := r.Header.Values("Origin")
+	if len(origins) > 1 {
+		return false
+	}
+	if len(origins) == 0 || origins[0] == "" {
 		return true
 	}
-	return rt.origins[normalizeOrigin(origin)]
+	return rt.origins[normalizeOrigin(origins[0])]
 }
 
 // normalizeOrigin reduces an origin to scheme and authority with the scheme's
@@ -145,7 +161,11 @@ func (rt *Router) limitBody(rec *responseRecorder, r *http.Request) ([]byte, boo
 		return nil, false
 	}
 
-	body, err := io.ReadAll(http.MaxBytesReader(rec, r.Body, rt.maxBody))
+	// MaxBytesReader marks the connection for close through an interface the
+	// recorder does not satisfy and does not forward, so the underlying writer
+	// is what gets handed over. Without it an overflowing request leaves the
+	// server draining the rest of the body for keep-alive reuse.
+	body, err := io.ReadAll(http.MaxBytesReader(rec.Unwrap(), r.Body, rt.maxBody))
 	if err != nil {
 		var tooLarge *http.MaxBytesError
 		if errors.As(err, &tooLarge) {

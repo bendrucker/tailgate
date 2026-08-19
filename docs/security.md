@@ -39,6 +39,10 @@ A session ID binds to the identity that minted it. Anyone else presenting the se
 
 Token verification and the policy decision gate session creation, so a stdio child is never spawned for an unauthorized caller. The cap is per identity per upstream and counts live processes rather than registrations, so one caller can neither starve others nor hold children past the cap by churning sessions.
 
+A stdio upstream takes `uid` and `gid`, applied before exec. A child left at tailgate's uid reads the node key out of `state_dir`, reads every other upstream's credentials out of the config file, and attaches to tailgate itself for a live bearer token, so withholding a variable from its environment buys nothing. Both are required together, and a tailgate that lacks the privilege to change a child's uid fails the spawn rather than starting it uncontained. The child drops tailgate's supplementary groups along with the uid, and it inherits tailgate's `HOME`, which it cannot write; name its own in `env`, whose entries are appended after tailgate's environment so the last value for a name wins.
+
+This is a uid boundary, not a sandbox. The child still shares tailgate's network namespace, filesystem, and process table, so it reaches the tailnet, reads whatever is world-readable, and sees what else is running.
+
 ### Resource Limits
 
 - `ReadHeaderTimeout` bounds the header phase against Slowloris.
@@ -69,4 +73,5 @@ A `400` whose body is not a recognized JSON-RPC error tells a probing client the
 - **Client secrets transit the token proxy.** `/token` is a reverse proxy. `client_secret_basic` and `client_secret_post` credentials transit tailgate in memory. They are never logged.
 - **A tsidp restart invalidates every outstanding token.** Tokens live in tsidp's memory. This is an availability gap, and clients recover through their refresh flow.
 - **Session bindings do not survive a restart.** The binding table is in memory. A restart forgets every session and answers `404`, the MCP signal to re-initialize. The failure is closed: a forgotten session can only be re-established by a caller whose token still verifies.
+- **On-disk credentials rest on file permissions.** The node key and the TLS private key sit in `state_dir` and the upstream credentials in the config file, each protected by owner-only modes tailgate checks at startup. A process running as tailgate's own uid is inside that boundary, which is what per-upstream `uid` exists to keep stdio children out of. `tsnet` cannot report state encryption on darwin regardless of the store, so encryption at rest is unavailable there.
 - **Process-group cleanup is Unix-only.** On other platforms, killing a stdio child does not reach grandchildren. A wrapper's real server can outlive its session. tailgate targets Unix deployments.

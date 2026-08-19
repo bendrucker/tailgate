@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/bendrucker/tailgate/internal/auth"
+	"github.com/bendrucker/tailgate/internal/protocol"
 	"github.com/bendrucker/tailgate/internal/proxy"
 )
 
@@ -15,6 +16,10 @@ import (
 // someone else, so the distinction lives only in the log, where a flood of
 // invented session IDs and an attempt on one live session read differently.
 const ReasonSessionUnrecognized = "session not recognized"
+
+// ReasonSessionAmbiguous is the audit reason for a request presenting the
+// session header more than once.
+const ReasonSessionAmbiguous = "request presents more than one session id"
 
 // claimSession enforces the MCP session-hijacking guidance for upstreams whose
 // transport passes the upstream's own sessions through. The upstream sees only
@@ -36,6 +41,22 @@ const ReasonSessionUnrecognized = "session not recognized"
 // A claim retains the binding for the life of the request, so the returned
 // release must run once the response is done.
 func (rt *Router) claimSession(rec *responseRecorder, r *http.Request, up *upstream, id auth.Identity) (release func(), ok bool) {
+	// Which copy an upstream reads is not decidable here, so a repeated session
+	// header is malformed rather than resolved to the first, on the same
+	// grounds as a repeated Authorization or MCP-Protocol-Version. Binding the
+	// first would let a caller lead with a session it holds and trail with one
+	// it does not, passing the binding check on the value tailgate reads while
+	// the upstream executes against the value it reads.
+	//
+	// The check precedes the binding waiver because it is not about binding: a
+	// transport managing its own sessions resolves the same header the same
+	// way, and the router is the only place that sees every copy of it.
+	if len(r.Header.Values(SessionHeader)) > 1 {
+		rt.audit.Deny(r.Context(), id, up.name, ReasonSessionAmbiguous)
+		protocol.WriteError(rec, http.StatusBadRequest, protocol.CodeInvalidRequest,
+			"Request presents more than one "+SessionHeader, nil)
+		return nil, false
+	}
 	if !up.bindSessions {
 		return func() {}, true
 	}

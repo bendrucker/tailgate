@@ -6,9 +6,11 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"math"
 	"net/http"
 	"os"
 	"os/exec"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -183,5 +185,89 @@ func TestReapingPrecedesTheExitBroadcast(t *testing.T) {
 	defer child.killMu.Unlock()
 	if !child.reaped {
 		t.Fatal("the child was announced as exited before its pid was retired")
+	}
+}
+
+// TestRunAs covers the credential a contained child starts under. Zero is what
+// the config spells "unset", so it can never reach a Credential: a child whose
+// gid fell through to zero would run in the root group.
+func TestRunAs(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		uid     int
+		gid     int
+		wantErr bool
+	}{
+		{name: "an ordinary uid and gid", uid: 501, gid: 20},
+		{name: "root uid is refused", uid: 0, gid: 20, wantErr: true},
+		{name: "root gid is refused", uid: 501, gid: 0, wantErr: true},
+		{name: "negative uid is refused", uid: -1, gid: 20, wantErr: true},
+		{name: "negative gid is refused", uid: 501, gid: -1, wantErr: true},
+		{name: "uid past a uid_t is refused", uid: math.MaxUint32 + 1, gid: 20, wantErr: true},
+		{name: "gid past a uid_t is refused", uid: 501, gid: math.MaxUint32 + 1, wantErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cmd := exec.Command("true")
+			isolateProcessGroup(cmd)
+
+			err := runAs(cmd, tc.uid, tc.gid)
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("runAs(%d, %d) = %v, wantErr %v", tc.uid, tc.gid, err, tc.wantErr)
+			}
+			if tc.wantErr {
+				if cmd.SysProcAttr.Credential != nil {
+					t.Errorf("a refused credential still reached the child")
+				}
+				return
+			}
+			credential := cmd.SysProcAttr.Credential
+			if credential == nil {
+				t.Fatal("runAs set no credential")
+			}
+			if credential.Uid != uint32(tc.uid) || credential.Gid != uint32(tc.gid) {
+				t.Errorf("credential = uid %d gid %d, want uid %d gid %d", credential.Uid, credential.Gid, tc.uid, tc.gid)
+			}
+			// An empty Groups with NoSetGroups clear is what makes the child
+			// call setgroups with an empty set, dropping tailgate's own.
+			if len(credential.Groups) != 0 || credential.NoSetGroups {
+				t.Errorf("child keeps supplementary groups: %+v", credential)
+			}
+			if !cmd.SysProcAttr.Setpgid {
+				t.Errorf("the credential displaced the process group isolation")
+			}
+		})
+	}
+}
+
+// TestSpawnRefusesAUIDTailgateCannotAssume covers the failure mode a silent
+// fallback would hide. Changing a child's uid is privileged, and an upstream
+// configured for containment that quietly runs at tailgate's own uid is worse
+// than one that never starts.
+func TestSpawnRefusesAUIDTailgateCannotAssume(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("running as root, which can assume any uid")
+	}
+	// One uid this process is certainly not, since it already is not root.
+	const unassumable = 1
+
+	transport := New(Options{
+		Command: os.Args[0],
+		Env:     []string{fakeChildEnv + "=1"},
+		Logger:  slog.New(slog.NewTextHandler(io.Discard, nil)),
+		UID:     unassumable,
+		GID:     unassumable,
+	})
+	t.Cleanup(func() { transport.Close() })
+
+	s, err := transport.spawn("session", "alice")
+	if err == nil {
+		s.kill()
+		t.Fatal("spawn started a child tailgate could not drop privilege for")
+	}
+	if !strings.Contains(err.Error(), "uid 1 gid 1") {
+		t.Errorf("error = %q, want it to name the uid and gid asked for", err)
+	}
+	if !strings.Contains(err.Error(), "privilege") {
+		t.Errorf("error = %q, want it to name why the start failed", err)
 	}
 }

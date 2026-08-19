@@ -5,6 +5,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
@@ -296,5 +297,38 @@ func TestDiscoveryFollowsChallenge(t *testing.T) {
 	}
 	if diff := cmp.Diff([]string{"https://idp.tail1234.ts.net"}, doc.AuthorizationServers); diff != "" {
 		t.Errorf("authorization_servers mismatch (-want +got):\n%s", diff)
+	}
+}
+
+// Every required scope must be advertised. Advertising less than is enforced
+// refuses a client that requested exactly what the metadata document and the
+// challenge told it to request, with nothing in either naming what it missed.
+func TestRequiredScopesAreAdvertised(t *testing.T) {
+	for _, scope := range RequiredScopes() {
+		if !slices.Contains(scopesSupported, scope) {
+			t.Errorf("required scope %q is not in scopes_supported %v", scope, scopesSupported)
+		}
+	}
+}
+
+// The shipped set is empty, so what is pinned is that the accessor copies
+// rather than aliases. A future entry must not be editable by a caller.
+func TestRequiredScopesCopiesRatherThanAliases(t *testing.T) {
+	scopesRequired = []string{"email"}
+	t.Cleanup(func() { scopesRequired = nil })
+
+	returned := RequiredScopes()
+	returned[0] = "mutated"
+	if got := RequiredScopes(); got[0] == "mutated" {
+		t.Error("a caller edited the required scopes through the returned slice")
+	}
+}
+
+// Nothing is required today. A change to that is a decision about which clients
+// can reach any upstream at all, so it fails here until this test is updated
+// alongside it.
+func TestNoScopeIsRequired(t *testing.T) {
+	if got := RequiredScopes(); len(got) != 0 {
+		t.Errorf("RequiredScopes() = %v, want none", got)
 	}
 }

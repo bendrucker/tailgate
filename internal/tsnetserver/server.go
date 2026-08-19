@@ -51,6 +51,9 @@ type Config struct {
 	StateDir string
 	// Port is the Funnel port: 443, 8443, or 10000.
 	Port int
+	// Tags are the ACL tags the node advertises on join. The control server
+	// decides whether the node may adopt them.
+	Tags []string
 	// AuthKey authenticates the node on first join. When empty, tsnet falls
 	// back to TS_AUTHKEY and then to an interactive login URL.
 	AuthKey string
@@ -87,11 +90,15 @@ func New(cfg Config) (*Server, error) {
 	if !funnelPorts[cfg.Port] {
 		return nil, fmt.Errorf("tsnetserver: port %d is not a Funnel port (443, 8443, 10000)", cfg.Port)
 	}
+	if err := ownerOnlyStateDir(cfg.StateDir); err != nil {
+		return nil, err
+	}
 
 	srv := &tsnet.Server{
-		Hostname: cfg.Hostname,
-		Dir:      cfg.StateDir,
-		AuthKey:  cfg.AuthKey,
+		Hostname:      cfg.Hostname,
+		Dir:           cfg.StateDir,
+		AuthKey:       cfg.AuthKey,
+		AdvertiseTags: cfg.Tags,
 	}
 	if cfg.Logger != nil {
 		// TAILGATE_TSNET_DEBUG surfaces tsnet's internal tailscaled logs,
@@ -110,6 +117,39 @@ func New(cfg Config) (*Server, error) {
 		}
 	}
 	return newServer(srv, cfg.Port), nil
+}
+
+// ownerOnlyStateDir refuses a state directory readable beyond its owner. It
+// holds tailscaled.state, which carries the node key that replaces the auth key
+// after the first join and is what lets anything holding it be tailgate on the
+// tailnet for as long as the node lives.
+//
+// tsnet creates the directory 0700, but the create is MkdirAll, which leaves an
+// existing directory at whatever mode it already had. A path pre-created by an
+// installer, a package, or a shell without a umask is therefore never narrowed,
+// and nothing downstream looks again.
+//
+// A path that does not exist yet is left alone, since that is the case tsnet's
+// own 0700 create covers. An unset path is tsnet's to choose, and it chooses a
+// fresh subdirectory of the user config directory, created the same way.
+func ownerOnlyStateDir(dir string) error {
+	if dir == "" {
+		return nil
+	}
+	info, err := os.Stat(dir)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("tsnetserver: stat state dir %s: %w", dir, err)
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("tsnetserver: state dir %s is not a directory", dir)
+	}
+	if perm := info.Mode().Perm(); perm&0o077 != 0 {
+		return fmt.Errorf("tsnetserver: state dir %s is mode %#o, readable beyond its owner, and it holds the node key", dir, perm)
+	}
+	return nil
 }
 
 func newServer(n node, port int) *Server {
@@ -168,11 +208,20 @@ func (s *Server) FQDN() string {
 }
 
 // ListenFunnel exposes the node on the public internet at the configured
-// Funnel port. Tailscale terminates TLS, so the listener yields plain HTTP
-// connections, and the tailnet policy must grant the node the funnel
-// attribute. The listener also serves tailnet peers dialing the same port.
-// Every request is authenticated by bearer token either way, since Funnel
-// strips tailnet identity and the token is the only identity signal.
+// Funnel port, which the tailnet policy must grant the node the funnel
+// attribute to reach.
+//
+// The Funnel edge relays encrypted TCP rather than terminating it. tsnet
+// returns a tls.Listener holding a certificate it obtains for the node, so TLS
+// terminates here in tailgate's own process and the caller serves an ordinary
+// http.Server over connections that are already decrypted. tailgate owns that
+// TLS configuration and the private key behind it. Nothing passes
+// tsnet.FunnelTLSConfig, so the minimum version and cipher suites are Go's
+// defaults.
+//
+// The listener also serves tailnet peers dialing the same port. Every request
+// is authenticated by bearer token either way, since Funnel strips tailnet
+// identity and the token is the only identity signal.
 //
 // The caller owns serving on the returned listener. StopAccepting closes it,
 // which keeps shutdown sequenced.

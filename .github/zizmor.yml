@@ -1,0 +1,8 @@
+# Every action must be pinned to a commit SHA. zizmor's default policy accepts a
+# mutable tag from a trusted publisher, which is the pin this repo is trying to
+# eliminate.
+rules:
+  unpinned-uses:
+    config:
+      policies:
+        "*": hash-pin

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -62,9 +63,12 @@ func (c *testClock) advance(d time.Duration) {
 	c.at = c.at.Add(d)
 }
 
-func newTestVerifier(t *testing.T, issuer *countingIssuer, clock *testClock, opts ...VerifierOption) *Verifier {
+func newTestVerifier(t *testing.T, issuer *countingIssuer, clock *testClock, opts ...verifierOption) *Verifier {
 	t.Helper()
-	opts = append([]VerifierOption{WithClock(clock.now)}, opts...)
+	// Every test drives one address against a clock that only advances when it
+	// says so, so the per-address bucket would shed once a test exceeded the
+	// burst. Tests that exercise it turn it back on.
+	opts = append([]verifierOption{withClock(clock.now), withIntrospectionRate(0, 0)}, opts...)
 	verifier, err := NewVerifier(t.Context(), issuer.Client(), issuer.URL, opts...)
 	if err != nil {
 		t.Fatalf("NewVerifier: %v", err)
@@ -76,6 +80,7 @@ func activeClaims(clock *testClock, lifetime time.Duration) map[string]any {
 	return map[string]any{
 		"active":   true,
 		"exp":      float64(clock.now().Add(lifetime).Unix()),
+		"scope":    "openid email",
 		"sub":      "12345",
 		"username": "bendrucker@github",
 		"email":    "bvdrucker@gmail.com",
@@ -247,7 +252,7 @@ func TestVerifyFailsClosedWhenIntrospectionStalls(t *testing.T) {
 	t.Cleanup(sync.OnceFunc(func() { close(release) }))
 
 	t.Run("introspection timeout", func(t *testing.T) {
-		verifier := newTestVerifier(t, issuer, newTestClock(), WithIntrospectionTimeout(20*time.Millisecond))
+		verifier := newTestVerifier(t, issuer, newTestClock(), withIntrospectionTimeout(20*time.Millisecond))
 		_, err := verifier.Verify(t.Context(), "deadbeef", testResource)
 		if !errors.Is(err, ErrUnavailable) || errors.Is(err, ErrInvalidToken) {
 			t.Fatalf("expected ErrUnavailable, got %v", err)
@@ -270,7 +275,7 @@ func TestVerifyCachesInactiveVerdictBriefly(t *testing.T) {
 		writeJSON(t, w, map[string]any{"active": false})
 	})
 	clock := newTestClock()
-	verifier := newTestVerifier(t, issuer, clock, WithNegativeCacheTTL(time.Minute))
+	verifier := newTestVerifier(t, issuer, clock, withNegativeCacheTTL(time.Minute))
 
 	for range 5 {
 		if _, err := verifier.Verify(t.Context(), "sprayed", testResource); !errors.Is(err, ErrInvalidToken) {
@@ -374,11 +379,12 @@ func TestVerifyCachesUntilTokenExpiry(t *testing.T) {
 				writeJSON(t, w, map[string]any{
 					"active": true,
 					"exp":    float64(issued.Add(tc.lifetime).Unix()),
+					"scope":  "openid email",
 					"sub":    "12345",
 					"aud":    []any{"client-id", testResource},
 				})
 			})
-			verifier := newTestVerifier(t, issuer, clock, WithCacheTTL(tc.ceiling), WithCacheSize(tc.size))
+			verifier := newTestVerifier(t, issuer, clock, withCacheTTL(tc.ceiling), withCacheSize(tc.size))
 
 			if _, err := verifier.Verify(t.Context(), "deadbeef", testResource); err != nil {
 				t.Fatalf("Verify: %v", err)
@@ -451,7 +457,7 @@ func TestVerifyCachesAreBounded(t *testing.T) {
 		issuer := newCountingIssuer(t, func(w http.ResponseWriter, r *http.Request) {
 			writeJSON(t, w, map[string]any{"active": false})
 		})
-		verifier := newTestVerifier(t, issuer, newTestClock(), WithNegativeCacheSize(8))
+		verifier := newTestVerifier(t, issuer, newTestClock(), withNegativeCacheSize(8))
 
 		for i := range 200 {
 			if _, err := verifier.Verify(t.Context(), fmt.Sprintf("sprayed-%d", i), testResource); !errors.Is(err, ErrInvalidToken) {
@@ -468,7 +474,7 @@ func TestVerifyCachesAreBounded(t *testing.T) {
 		issuer := newCountingIssuer(t, func(w http.ResponseWriter, r *http.Request) {
 			writeJSON(t, w, activeClaims(clock, 5*time.Minute))
 		})
-		verifier := newTestVerifier(t, issuer, clock, WithCacheSize(4))
+		verifier := newTestVerifier(t, issuer, clock, withCacheSize(4))
 
 		for i := range 50 {
 			if _, err := verifier.Verify(t.Context(), fmt.Sprintf("token-%d", i), testResource); err != nil {
@@ -497,7 +503,7 @@ func TestVerifyCollapsesConcurrentIntrospection(t *testing.T) {
 	closeRelease := sync.OnceFunc(func() { close(release) })
 	t.Cleanup(closeRelease)
 	// Caching is off so the round-trip count measures deduplication alone.
-	verifier := newTestVerifier(t, issuer, clock, WithCacheSize(0), WithNegativeCacheSize(0))
+	verifier := newTestVerifier(t, issuer, clock, withCacheSize(0), withNegativeCacheSize(0))
 
 	const callers = 32
 	results := make([]error, callers)
@@ -543,9 +549,9 @@ func TestVerifyShedsLoadPastConcurrencyLimit(t *testing.T) {
 	closeRelease := sync.OnceFunc(func() { close(release) })
 	t.Cleanup(closeRelease)
 	verifier := newTestVerifier(t, issuer, clock,
-		WithIntrospectionConcurrency(limit),
-		WithCacheSize(0),
-		WithNegativeCacheSize(0),
+		withIntrospectionConcurrency(limit),
+		withCacheSize(0),
+		withNegativeCacheSize(0),
 	)
 
 	holders := make([]error, limit)
@@ -582,5 +588,68 @@ func TestVerifyShedsLoadPastConcurrencyLimit(t *testing.T) {
 
 	if _, err := verifier.Verify(t.Context(), "shed-me", testResource); err != nil {
 		t.Fatalf("expected the gate to reopen once calls finished: %v", err)
+	}
+}
+
+// The per-address bucket is charged after the caches and before the in-flight
+// collapse, so a caller holding a verified token keeps working at any rate
+// while a caller spraying fresh ones is bounded to what its address is worth.
+func TestVerifyRateLimitsIntrospectionPerClientAddress(t *testing.T) {
+	clock := newTestClock()
+	issuer := newCountingIssuer(t, func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(t, w, activeClaims(clock, 5*time.Minute))
+	})
+	verifier := newTestVerifier(t, issuer, clock, withIntrospectionRate(1, time.Second))
+
+	spender := WithClientAddr(t.Context(), netip.MustParseAddr("203.0.113.7"))
+	if _, err := verifier.Verify(spender, "deadbeef", testResource); err != nil {
+		t.Fatalf("Verify: %v", err)
+	}
+
+	_, err := verifier.Verify(spender, "cafef00d", testResource)
+	if !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("a shed lookup must be ErrUnavailable, got %v", err)
+	}
+	// A caller the limit sheds gets 503, never a challenge to re-authenticate a
+	// credential tailgate never looked at.
+	if errors.Is(err, ErrInvalidToken) {
+		t.Errorf("a shed lookup must not be ErrInvalidToken, got %v", err)
+	}
+
+	if _, err := verifier.Verify(spender, "deadbeef", testResource); err != nil {
+		t.Fatalf("re-presenting a verified token after the shed: %v", err)
+	}
+	if hits := issuer.hits.Load(); hits != 1 {
+		t.Errorf("issuer saw %d round trips, want the one the cached token cost", hits)
+	}
+
+	other := WithClientAddr(t.Context(), netip.MustParseAddr("198.51.100.9"))
+	if _, err := verifier.Verify(other, "cafef00d", testResource); err != nil {
+		t.Fatalf("a second address must hold its own bucket, got %v", err)
+	}
+}
+
+// Caching describes the token, so the scope check must run against the cached
+// claims like the audience check does. A cache hit that skipped it would let
+// one lookup launder a refusal into an allow.
+func TestVerifyRechecksScopeOnCacheHit(t *testing.T) {
+	clock := newTestClock()
+	claims := activeClaims(clock, 5*time.Minute)
+	claims["scope"] = "openid"
+	issuer := newCountingIssuer(t, func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(t, w, claims)
+	})
+	verifier := newTestVerifier(t, issuer, clock)
+	// The shipped set is empty, so the recheck is exercised against a
+	// requirement the test states.
+	verifier.requiredScopes = []string{"email"}
+
+	for i := range 2 {
+		if _, err := verifier.Verify(t.Context(), "deadbeef", testResource); !errors.Is(err, ErrInsufficientScope) {
+			t.Fatalf("attempt %d: expected ErrInsufficientScope, got %v", i, err)
+		}
+	}
+	if hits := issuer.hits.Load(); hits != 1 {
+		t.Errorf("issuer saw %d round trips, want the one the cached claims cost", hits)
 	}
 }

@@ -1,5 +1,11 @@
 package stdiotransport
 
+import (
+	"fmt"
+
+	"github.com/bendrucker/tailgate/internal/proxy"
+)
+
 // notificationBuffer is how many notifications a subscription stream may fall
 // behind by. Beyond it the stream is closed rather than trimmed: this revision
 // removed stream resumption, so a client cannot ask for what it missed, and a
@@ -20,15 +26,30 @@ type listener struct {
 	closed     bool
 }
 
-// listen registers a subscription stream. The returned func unregisters it and
-// must run when the HTTP handler serving the stream returns.
-func (s *session) listen() (*listener, func()) {
+// listen registers a subscription stream, up to max of them on this child. The
+// returned func unregisters it and must run when the HTTP handler serving the
+// stream returns.
+//
+// max is the transport's MaxSessions, which bounds children per identity
+// everywhere else and bounds concurrent streams on one child here. The two
+// quantities differ: a stream costs no process, but it is exempt from the
+// exchange timeout and holds its child off the idle sweep for as long as it
+// stays open, so it needs a bound of its own.
+//
+// The registry is the count, which is what makes the bound hold on every way a
+// stream can end: a listener is deleted from it by the caller's handler
+// returning, by the child's output ending, and by the stream falling behind,
+// so a slot is free as soon as nothing can be delivered to it.
+func (s *session) listen(max int) (*listener, func(), error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if len(s.listeners) >= max {
+		return nil, nil, fmt.Errorf("%w: %d subscription streams", proxy.ErrCapExceeded, max)
+	}
 	s.nextKey++
 	l := &listener{key: s.nextKey, notifications: make(chan []byte, notificationBuffer)}
 	s.listeners[l.key] = l
-	return l, func() { s.unlisten(l) }
+	return l, func() { s.unlisten(l) }, nil
 }
 
 func (s *session) unlisten(l *listener) {

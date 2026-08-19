@@ -58,6 +58,8 @@ func upstreamRoute(cfg config.Upstream, logger *slog.Logger, auditor *audit.Logg
 				Args:        cfg.Args,
 				Env:         cfg.Env,
 				Dir:         cfg.Dir,
+				UID:         cfg.UID,
+				GID:         cfg.GID,
 				MaxSessions: cfg.MaxChildren,
 				IdleTimeout: idle,
 				Logger:      logger,

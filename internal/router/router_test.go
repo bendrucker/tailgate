@@ -2,12 +2,14 @@ package router
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"io"
 	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"net/url"
 	"strings"
 	"sync"
@@ -15,6 +17,7 @@ import (
 	"time"
 
 	"github.com/google/go-cmp/cmp"
+	"tailscale.com/ipn"
 
 	"github.com/bendrucker/tailgate/internal/audit"
 	"github.com/bendrucker/tailgate/internal/auth"
@@ -842,5 +845,86 @@ func TestNewRejectsIncompleteOptions(t *testing.T) {
 				t.Fatalf("New error = %v, wantErr = %v", err, tc.wantErr)
 			}
 		})
+	}
+}
+
+// remoteAddrConn is a connection that reports an address of the test's
+// choosing, standing in for a direct connection that never came over Funnel.
+type remoteAddrConn struct {
+	net.Conn
+	remote net.Addr
+}
+
+func (c *remoteAddrConn) RemoteAddr() net.Addr { return c.remote }
+
+// Funnel replaces the connection's RemoteAddr with the relaying tailnet node,
+// so an address read from there would charge every internet client to one
+// bucket. The client's own address rides on the FunnelConn the TLS listener
+// wraps.
+func TestClientAddr(t *testing.T) {
+	funnelSrc := netip.MustParseAddrPort("203.0.113.7:44321")
+	relay := &net.TCPAddr{IP: net.ParseIP("100.64.0.1"), Port: 41641}
+
+	for _, tc := range []struct {
+		name string
+		conn func(net.Conn) net.Conn
+		want netip.Addr
+	}{
+		{
+			name: "funnel connection behind tls",
+			conn: func(c net.Conn) net.Conn {
+				funnel := &ipn.FunnelConn{Conn: &remoteAddrConn{Conn: c, remote: relay}, Src: funnelSrc}
+				return tls.Server(funnel, &tls.Config{})
+			},
+			want: funnelSrc.Addr(),
+		},
+		{
+			name: "bare funnel connection",
+			conn: func(c net.Conn) net.Conn {
+				return &ipn.FunnelConn{Conn: &remoteAddrConn{Conn: c, remote: relay}, Src: funnelSrc}
+			},
+			want: funnelSrc.Addr(),
+		},
+		{
+			name: "direct connection",
+			conn: func(c net.Conn) net.Conn {
+				return &remoteAddrConn{Conn: c, remote: &net.TCPAddr{IP: net.ParseIP("198.51.100.9"), Port: 5555}}
+			},
+			want: netip.MustParseAddr("198.51.100.9"),
+		},
+		{
+			name: "connection with an unparseable address",
+			conn: func(c net.Conn) net.Conn { return c },
+			want: netip.Addr{},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			local, remote := net.Pipe()
+			t.Cleanup(func() {
+				local.Close()
+				remote.Close()
+			})
+			if got := clientAddr(tc.conn(local)); got != tc.want {
+				t.Errorf("clientAddr = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestServerRecordsTheClientAddress(t *testing.T) {
+	want := netip.MustParseAddr("203.0.113.7")
+	local, remote := net.Pipe()
+	t.Cleanup(func() {
+		local.Close()
+		remote.Close()
+	})
+	funnel := &ipn.FunnelConn{Conn: local, Src: netip.AddrPortFrom(want, 44321)}
+
+	server := Server(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	if server.ConnContext == nil {
+		t.Fatal("Server built an http.Server that records no client address")
+	}
+	if got := auth.ClientAddrFrom(server.ConnContext(context.Background(), funnel)); got != want {
+		t.Errorf("recorded client address = %v, want %v", got, want)
 	}
 }

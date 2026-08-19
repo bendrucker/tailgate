@@ -1,6 +1,7 @@
 package router
 
 import (
+	"encoding/json"
 	"log/slog"
 	"net/http"
 	"strconv"
@@ -12,6 +13,7 @@ import (
 
 	"github.com/bendrucker/tailgate/internal/audit"
 	"github.com/bendrucker/tailgate/internal/auth"
+	"github.com/bendrucker/tailgate/internal/protocol"
 )
 
 // mintSession makes the HTTP upstream answer every request with sessionID, the
@@ -471,4 +473,61 @@ func TestSessionBindingsAreConcurrencySafe(t *testing.T) {
 		}()
 	}
 	wg.Wait()
+}
+
+// Binding the first of several session headers would let a caller lead with a
+// session it holds and trail with one it does not, passing the binding check on
+// the value tailgate reads while the upstream executes against the value it
+// reads. The refusal precedes the binding waiver, so it also covers a transport
+// that manages its own sessions.
+func TestRepeatedSessionHeaderIsRefused(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		upstream string
+	}{
+		{name: "router binds the session", upstream: httpUpstream},
+		{name: "transport manages its own sessions", upstream: stdioUpstream},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHarness(t)
+			h.grant("good", "42", "user@example.com", httpUpstream, stdioUpstream)
+			mintSession(h, "mine")
+
+			if resp := h.serve(post("/mcp/"+httpUpstream, "good")); resp.StatusCode != http.StatusOK {
+				t.Fatalf("initialize status = %d, want 200", resp.StatusCode)
+			}
+			served := h.httpUp.count() + h.stdioUp.count()
+
+			req := post("/mcp/"+tc.upstream, "good")
+			req.Header.Add(SessionHeader, "mine")
+			req.Header.Add(SessionHeader, "theirs")
+			resp := h.serve(req)
+
+			if resp.StatusCode != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400", resp.StatusCode)
+			}
+			if contentType := resp.Header.Get("Content-Type"); contentType != "application/json" {
+				t.Errorf("Content-Type = %q, want application/json", contentType)
+			}
+
+			var body struct {
+				JSONRPC string `json:"jsonrpc"`
+				Error   struct {
+					Code int `json:"code"`
+				} `json:"error"`
+			}
+			if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+				t.Fatalf("decode: %v", err)
+			}
+			if body.JSONRPC != "2.0" {
+				t.Errorf("jsonrpc = %q, want 2.0", body.JSONRPC)
+			}
+			if body.Error.Code != protocol.CodeInvalidRequest {
+				t.Errorf("error code = %d, want %d", body.Error.Code, protocol.CodeInvalidRequest)
+			}
+			if got := h.httpUp.count() + h.stdioUp.count(); got != served {
+				t.Error("ambiguous session request reached a transport")
+			}
+		})
+	}
 }
