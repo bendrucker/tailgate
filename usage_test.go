@@ -13,8 +13,8 @@ import (
 )
 
 // wantRootUsage and wantGrantUsage are the published help text. They are spelled
-// out here rather than assembled from the constants so that a change to the
-// generated flag block shows up as a diff against what a user reads.
+// out here so that a change to the generated flag block shows up as a diff
+// against what a user reads.
 const wantRootUsage = `tailgate fronts MCP servers behind Tailscale Funnel. It joins the tailnet as
 its own node, validates tsidp OIDC tokens, and proxies authorized requests to
 HTTP and stdio MCP upstreams at /mcp/<name>.

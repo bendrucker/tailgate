@@ -54,7 +54,7 @@ func main() {
 	// Serving is the default, so a deployment's command line stays
 	// `tailgate -config ...` and the generator is the named mode. A leading
 	// argument that is not a flag has to name a command: falling through on a
-	// misspelled one starts serving instead of reporting the typo.
+	// misspelled one starts serving.
 	if len(os.Args) > 1 && !strings.HasPrefix(os.Args[1], "-") {
 		switch os.Args[1] {
 		case "grant":
