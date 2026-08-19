@@ -63,9 +63,9 @@ Each exchange gets a one-minute timeout, canceled the moment a response's `Conte
 
 A caller's JSON-RPC ID never reaches the child. The transport substitutes a monotonic ID of its own on the way in and restores the caller's on the way out, whichever era the caller speaks. Independent POSTs from one caller may each call themselves request `1`, and a caller that hangs up mid-request and retries reuses an ID the child is still working on. Correlating on the caller's ID would let either request take the other's answer.
 
-A notification is the one caller message that reaches the child unmodified, because it is the one carrying no ID. tailgate drops a child's server-initiated requests, so a client is never handed anything to answer. A POSTed response therefore answers nothing tailgate carried.
+A notification is the one caller message that reaches the child unmodified, because it is the one carrying no usable ID. tailgate drops a child's server-initiated requests, so a client is never handed anything to answer. A POSTed response therefore answers nothing tailgate carried.
 
-What such a response gets back differs by era. The stateful revisions make one legal, so it gets the `202` they specify and goes no further. The stateless revision left no server-initiated request to answer, so there it is a `400`. A message carrying neither a method nor an ID is a `400` on both, since it names nothing to dispatch and nothing to answer.
+What such a response gets back differs by era. The stateful revisions make one legal, so it gets the `202` they specify. The stateless revision left no server-initiated request to answer, so there it is a `400`. Neither era forwards it to the child, since a caller-chosen ID in the minted namespace would let the child's answer satisfy the wrong request. A message carrying neither a method nor an ID is a `400` on both, because it names nothing to dispatch and nothing to answer.
 
 ### Stateful Sessions
 
@@ -78,8 +78,6 @@ A caller on 2026-07-28 gets one child per identity, shared across its concurrent
 - An answer means the child speaks the revision.
 - An error in the MCP-reserved `-32020` to `-32099` range means it speaks the revision and declined, which fails the child as unavailable.
 - Any other error means a legacy child, for which tailgate runs the `initialize` handshake itself.
-
-A message carrying an ID but no method is refused rather than forwarded, since forwarding would inject a caller-chosen ID into the minted namespace and let a child's answer satisfy the wrong request.
 
 `subscriptions/listen` is the one response held open and the one exempt from the exchange timeout. A listener registers before the request is sent so no notification is lost in the gap, notifications flow as SSE frames with a comment keep-alive every thirty seconds, and the child's eventual JSON-RPC response to the listen request ends the stream. A listener that falls behind is closed rather than allowed to block the child's single reader.
 
