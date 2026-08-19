@@ -15,8 +15,9 @@ import (
 // client sprays at the Funnel endpoint would otherwise cost tsidp a round trip.
 // The path in this file is the load-bearing defense: reject malformed bearers
 // without asking tsidp, answer repeats from bounded caches, collapse concurrent
-// lookups of one token into a single call, and shed load past a fixed number of
-// concurrent calls. Every limit denies rather than admits when it trips.
+// lookups of one token into a single call, bound the rate any one client
+// address can spend, and shed load past a fixed number of concurrent calls.
+// Every limit denies rather than admits when it trips.
 
 // introspect returns the claim set tsidp reports for token, from cache when it
 // can. A token tsidp reports as inactive returns ErrInvalidToken; a lookup that
@@ -30,6 +31,13 @@ func (v *Verifier) introspect(ctx context.Context, token string) (map[string]any
 	}
 	if _, ok := v.inactive.get(key, now); ok {
 		return nil, fmt.Errorf("%w: not active", ErrInvalidToken)
+	}
+	// Charged after both caches miss, so a caller presenting an already-verified
+	// token spends nothing and the limit stays off the path legitimate traffic
+	// takes. Charged before the in-flight collapse, so callers piggybacking on
+	// one lookup are each charged rather than sharing the initiator's budget.
+	if !v.limiter.allow(ClientAddrFrom(ctx), now) {
+		return nil, fmt.Errorf("%w: introspection rate limit reached for the client address", ErrUnavailable)
 	}
 	return v.inflight.do(ctx, key, func(ctx context.Context) (map[string]any, error) {
 		return v.introspectUncached(ctx, token, key)

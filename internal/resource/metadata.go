@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"slices"
 	"strconv"
 	"strings"
 )
@@ -21,6 +22,31 @@ var bearerMethodsSupported = []string{"header"}
 // request from that client, so email is advertised as required rather than
 // optional.
 var scopesSupported = []string{"openid", "email"}
+
+// scopesRequired are the scopes a token must carry to reach any upstream. It is
+// empty, and adding to it excludes clients rather than protecting anything.
+//
+// Requiring a scope is not an access boundary here. The issuer filters a token
+// request against a fixed list of scopes it understands and applies no per-user
+// or per-client narrowing, so any registered client can ask for a scope and be
+// granted it. The only thing a requirement buys is a refusal that names what
+// the caller lacks.
+//
+// It costs more than that. A policy matching on sub works against a client that
+// requests no scope at all, since introspection always carries sub, and that is
+// the shape a policy takes precisely to avoid depending on a client's scope
+// request. Requiring email would deny those callers at the verifier, below the
+// policy that was written to accommodate them.
+//
+// Whatever is added here must also be in scopesSupported. Advertising less than
+// is enforced refuses a client that did exactly what the challenge told it to.
+var scopesRequired []string
+
+// RequiredScopes returns the scopes a token must carry, as a copy so a caller
+// cannot edit what the metadata documents advertise.
+func RequiredScopes() []string {
+	return slices.Clone(scopesRequired)
+}
 
 // Metadata is one upstream's RFC 9728 protected-resource metadata document.
 // Resource is the byte-exact canonical URI from URLs.ResourceURL, which is
