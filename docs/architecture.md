@@ -52,7 +52,7 @@ An `/mcp/<name>` request moves through these gates in order, inside panic recove
 
 Verification is layered to keep introspection cheap and every check live:
 
-- A syntax pre-check rejects anything outside the RFC 6750 token grammar before contacting tsidp.
+- A syntax pre-check rejects anything outside the [RFC 6750](https://www.rfc-editor.org/rfc/rfc6750) token grammar before contacting tsidp.
 - Positive results cache until the token's own `exp`, capped at five minutes. Negative results cache for thirty seconds, a deliberately shorter window since those entries are keyed by attacker-chosen strings. Cache keys are SHA-256 digests, never the bearer itself.
 - Concurrent lookups of the same token collapse into a single introspection call, and an overall concurrency gate of 64 sheds excess load as `503` rather than queuing.
 - `exp`, `nbf`, byte-exact `aud` membership, and a non-empty `sub` are re-checked on every call, including cache hits. A cached allow can never widen scope.
@@ -63,7 +63,7 @@ The authorizer walks the upstream's rules in configured order and the first matc
 
 Some clients, claude.ai among them, never read the RFC 9728 discovery document and assume the authorization server shares the MCP server's origin. The facade meets them there, and the protected-resource metadata points spec-following clients at the same place, since tsidp's real `/authorize` refuses requests arriving over Funnel.
 
-- `/.well-known/oauth-authorization-server` and `/.well-known/openid-configuration` serve the same RFC 8414 document, since clients probe either name. It advertises tailgate's own `/authorize` and `/token`, S256 PKCE, and resource indicators.
+- `/.well-known/oauth-authorization-server` and `/.well-known/openid-configuration` serve the same [RFC 8414](https://www.rfc-editor.org/rfc/rfc8414) document, since clients probe either name. It advertises tailgate's own `/authorize` and `/token`, S256 PKCE, and resource indicators.
 - `/authorize` is a `302` redirect to tsidp with the query preserved byte-for-byte. It cannot be a proxy: tsidp identifies the authorizing person by the connection's tailnet identity, which proxying would replace with tailgate's own.
 - `/token` is a true reverse proxy over the tailnet, bounded to 64 KiB in each direction, forwarding only `Authorization`, `Content-Type`, and `Accept`. Client credentials transit it and are never logged.
 - `/register` is deliberately absent. tsidp resolves its app-capability grant from the caller's tailnet identity. Proxied registrations would arrive as tailgate's node and couple serving any traffic to an `allow_dcr` grant on that node. Clients are registered tailnet-side instead.
@@ -82,27 +82,33 @@ Shared machinery on the seam:
 
 `httptransport` wraps `httputil.ReverseProxy`. Construction never dials. An unreachable upstream shows up per-request as `502`. Compression is disabled and every write is flushed immediately, keeping SSE bytes intact and prompt. The rewrite pins the outbound path to exactly the configured target path, since URL joining would turn `/mcp` into `/mcp/` and exact-path upstreams reject that.
 
-Each exchange gets a one-minute timeout that is canceled the moment a response's `Content-Type` confirms `text/event-stream`. The exemption is per-response-type-detected: a slow upstream can still time out before its headers arrive, and only a confirmed SSE response becomes unbounded.
+Each exchange gets a one-minute timeout that is canceled the moment a response's `Content-Type` confirms `text/event-stream`. The exemption depends on the response type actually observed: a slow upstream can still time out before its headers arrive, and only a confirmed SSE response becomes unbounded.
 
 ## stdio Transport
 
 `stdiotransport` implements the server side of streamable HTTP over a child process. Which lifecycle a caller gets depends on its era.
 
-#### Stateful Sessions
+### Stateful Sessions
 
 A caller on a revision through 2025-11-25 gets one child per session. `initialize` reserves a cap slot, mints a cryptographically random session ID, spawns the child, and runs the handshake. The session ID is bound to both the child and the identity that created it. A request presenting a session bound to a different identity gets the same `404` as an unknown session, confirming nothing to a hijacker. `DELETE` terminates the session. The binding check applies to whatever session header is presented, regardless of the revision the request declares. A caller cannot shed it by claiming the stateless revision.
 
-#### Stateless Children
+### Stateless Children
 
-A caller on 2026-07-28 gets one child per identity, shared across its concurrent requests. The first request spawns the child while concurrent arrivals wait on the same ready signal rather than each spawning a process. The transport settles the child's era with a `server/discover` probe: an answer means the child speaks the revision, an error in the MCP-reserved `-32020` to `-32099` range means it speaks the revision and refused, and any other error means a legacy child, for which tailgate runs the `initialize` handshake itself. The fallback is deliberately not keyed to one error code, because legacy SDKs disagree on what they return.
+A caller on 2026-07-28 gets one child per identity, shared across its concurrent requests. The first request spawns the child while concurrent arrivals wait on the same ready signal rather than each spawning a process. The transport settles the child's era with a `server/discover` probe:
+
+- An answer means the child speaks the revision.
+- An error in the MCP-reserved `-32020` to `-32099` range means it speaks the revision and refused.
+- Any other error means a legacy child, for which tailgate runs the `initialize` handshake itself.
+
+The fallback is deliberately not keyed to one error code, because legacy SDKs disagree on what they return.
 
 Because independent POSTs from one caller may each call themselves request `1`, the transport substitutes its own monotonic JSON-RPC IDs on the way in and restores the caller's on the way out. A message carrying an ID but no method is refused rather than forwarded, since forwarding would inject a caller-chosen ID into the minted namespace and let a child's answer satisfy the wrong request.
 
 `subscriptions/listen` is the one response held open and the one exempt from the exchange timeout. A listener registers before the request is sent so no notification is lost in the gap, notifications flow as SSE frames with a comment keep-alive every thirty seconds, and the child's eventual JSON-RPC response to the listen request is what ends the stream. A listener that falls behind is closed rather than allowed to block the child's single reader.
 
-#### Caps, Reaping, and the Child Environment
+### Caps, Reaping, and the Child Environment
 
-The concurrency cap is per identity per upstream, defaulting to 4, and counts live processes: a slot releases only when the child has actually exited. Looping initialize and delete cannot hold processes past the cap. A reaper terminates sessions idle past the configured timeout, defaulting to five minutes. Children inherit tailgate's environment minus `TS_AUTHKEY` and `TS_AUTH_KEY`, since a stdio upstream is third-party code that must never see the credential that joins the tailnet, plus whatever the upstream's config adds.
+The concurrency cap is per identity per upstream, defaulting to 4, and counts live processes: a slot releases only when the child has actually exited. Looping initialize and delete cannot hold processes past the cap. A reaper terminates sessions idle past the configured timeout, defaulting to five minutes. Children inherit tailgate's environment minus `TS_AUTHKEY` and `TS_AUTH_KEY`, plus whatever the upstream's config adds. A stdio upstream is third-party code that must never see the credential that joins the tailnet.
 
 Termination closes stdin, gives the child two seconds to exit itself, then kills its whole process group. Wrappers like `npx` and `uv` do not orphan the real server. A child whose stdout framing breaks, or that stops reading stdin, is torn down immediately, since nothing it says afterward can be trusted to be a whole message.
 

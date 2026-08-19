@@ -26,7 +26,7 @@ A request travels through tailgate in four stages:
 3. **Validation and authorization.** tailgate validates the bearer token against tsidp by [RFC 7662](https://www.rfc-editor.org/rfc/rfc7662) introspection over the tailnet, checks that the token's audience names the requested upstream, then authorizes the identity against the configured policy. Every allow and deny is logged.
 4. **Upstream.** An authorized request routes by path prefix to the named upstream, over HTTP or stdio. The client's token is stripped before forwarding and never reaches an upstream.
 
-[docs/architecture.md](docs/architecture.md) maps the internals: the request pipeline, the transport seam, the stdio child lifecycle, session binding, and protocol-revision handling.
+[`docs/architecture.md`](docs/architecture.md) maps the internals: the request pipeline, the transport seam, the stdio child lifecycle, session binding, and protocol-revision handling.
 
 ## Getting a Token
 
@@ -58,7 +58,8 @@ sequenceDiagram
   T->>I: introspect over the tailnet
   T->>T: audience and policy checks
   T->>U: forward, token stripped
-  U-->>C: response, JSON or SSE
+  U-->>T: response, JSON or SSE
+  T-->>C: response, JSON or SSE
 ```
 
 Clients like claude.ai that skip discovery and probe `/.well-known/oauth-authorization-server` at the MCP origin directly land on the same facade at step 5. Dynamic client registration is deliberately not proxied: tsidp gates it on the caller's tailnet identity. Register clients tailnet-side instead.
@@ -84,7 +85,7 @@ Because Funnel strips tailnet identity, the token is the only identity signal ta
 
 ## Security
 
-tailgate is an internet-facing authorization boundary and its request path fails closed: any verification, introspection, or policy error denies the request. The client's bearer token never reaches an upstream. Sessions bind to the identity that minted them, and a session presented by anyone else gets a `404` that does not confirm the session exists. [docs/security.md](docs/security.md) covers the trust boundaries, the full set of request-path defenses, and the known limitations.
+tailgate is an internet-facing authorization boundary and its request path fails closed: any verification, introspection, or policy error denies the request. The client's bearer token never reaches an upstream. Sessions bind to the identity that minted them, and a session presented by anyone else gets a `404` that does not confirm the session exists. [`docs/security.md`](docs/security.md) covers the trust boundaries, the full set of request-path defenses, and the known limitations.
 
 ## Configuration
 
@@ -119,23 +120,23 @@ tailgate reads a [HuJSON](https://github.com/tailscale/hujson) file, the same fo
 }
 ```
 
-#### node
+### node
 
 `hostname` and `port` are required, and `port` must be a Funnel-supported port: 443, 8443, or 10000. `state_dir` holds the persistent node key. `tailnet` is the [MagicDNS](https://tailscale.com/kb/1081/magicdns) suffix. It is optional, but setting it lets `tailgate grant` build resource URIs offline and makes startup verify that the joined FQDN matches, since a control server that silently renames the node would shift every resource URI away from the grant.
 
-#### oidc
+### oidc
 
 `issuer` is tsidp's base URL. tailgate discovers the introspection endpoint from it and requires the discovered document to stay on the issuer's origin.
 
-#### upstreams
+### upstreams
 
 Every upstream needs a unique lowercase `name`, which becomes its path segment and its audience, and a `transport` of `http` or `stdio`. An HTTP upstream needs a `url`. A stdio upstream needs a `command` and takes optional `args`, `env`, `dir`, `max_children` (concurrent children per identity, default 4), and `idle_timeout` (a Go duration after which an idle child is reaped, default 5m).
 
-#### policy
+### policy
 
 Each rule names an `upstream` and a non-empty `allow` list. An entry can match on `email`, `sub` (tsidp's bare decimal user ID), or `claim`, a map of introspection claim names to required string values. Conditions within one entry must all hold. Entries, and multiple rules for the same upstream, are alternatives: the first match allows. An upstream with no rules denies everyone, and a condition that cannot be evaluated denies rather than being skipped.
 
-#### favicon
+### favicon
 
 An optional top-level `favicon` names an icon image to serve at `/favicon.ico`, along with a root page linking it. Icon crawlers index it for the origin, which is where clients like claude.ai get a custom connector's icon. Without it, those crawlers fall back to the parent domain's icon, which for a `*.ts.net` node is Tailscale's logo.
 
@@ -143,7 +144,7 @@ An optional top-level `favicon` names an icon image to serve at `/favicon.ico`, 
 
 tailgate runs as a single binary under launchd:
 
-```
+```sh
 tailgate -config /etc/tailgate.hujson
 ```
 
@@ -153,7 +154,7 @@ It needs:
 
   Node keys expire on the tailnet's [key expiry](https://tailscale.com/kb/1028/key-expiry) schedule, six months by default. A long-lived deployment wants expiry disabled for the node, or an [auth key](https://tailscale.com/kb/1085/auth-keys) scoped to a tag, since an expired key takes tailgate off the internet until someone reauthorizes it by hand.
 - **The `funnel` node attribute** granted to tailgate's node in the tailnet policy. Without it, Funnel fails at the public edge.
-- **A tsidp app-capability grant** that authorizes each upstream's resource URI and populates any claims the policy matches on. Generate it with `tailgate grant` rather than writing it by hand.
+- **A tsidp app-capability grant** that authorizes each upstream's resource URI and populates any claims the policy matches on. Generate it with [`tailgate grant`](#the-tsidp-grant) rather than writing it by hand.
 - **Registered MCP clients.** tsidp's dynamic registration and admin UI are tailnet-only, so register each client tailnet-side as a confidential client and instruct it to send `resource` on the token request. Clients must request the `email` scope: introspection omits `email` without it, and an email-allowlist policy then denies every request. The `401` challenge and the metadata documents both name the scope, so a client that reads either discovers this without being told.
 
 `SIGINT` and `SIGTERM` stop the listener, drain in-flight requests and open streams for up to 30 seconds, close whatever connections remain, then leave the tailnet. Setting `TAILGATE_TSNET_DEBUG` to any value surfaces tsnet's internal logs when a join or Funnel problem needs diagnosing.
@@ -162,7 +163,7 @@ It needs:
 
 tsidp matches an RFC 8707 `resource` parameter against its app-capability [grant](https://tailscale.com/kb/1324/acl-grants) byte-for-byte, with no canonicalization. The same resource string therefore has to appear identically in the client's token request, in tailgate's audience check, and in the tailnet policy. tailgate already owns the first two, so it generates the third:
 
-```
+```sh
 tailgate grant -config /etc/tailgate.hujson
 ```
 
@@ -170,11 +171,11 @@ The output is one entry of the policy's `grants` array, ready to commit to whate
 
 Generating the grant needs `node.tailnet`, the MagicDNS suffix, because the canonical URIs are built from the node's FQDN and nothing else supplies it before the node joins. Setting it also makes tailgate check the name the join actually reports: if the control server hands back a suffixed hostname because the name was taken, every resource URI would shift away from the grant, so tailgate refuses to serve instead of denying every request at the audience check.
 
-`-src`, `-dst`, and `-users` shape the grant envelope. `-dst` defaults to the issuer's host, which is right when tsidp is reachable by that MagicDNS name and wrong when it is addressed by tag. `-allow-dcr` and `-allow-admin-ui` add the corresponding tsidp capabilities to the generated rule for tailnets that want dynamic registration or the admin UI enabled.
+`-src`, `-dst`, and `-users` shape the grant envelope. `-dst` defaults to `*`, since tailgate cannot derive tsidp's node name from the issuer URL. Narrow it when tsidp is addressed by tag. `-allow-dcr` and `-allow-admin-ui` add the corresponding tsidp capabilities to the generated rule for tailnets that want dynamic registration or the admin UI enabled.
 
 ## Development
 
-```
+```sh
 make build   # compile
 make test    # go test -race
 make vet     # go vet
