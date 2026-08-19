@@ -37,9 +37,12 @@ Example:
 `
 
 // grantCommand implements `tailgate grant`, which grantUsageHeader documents.
-func grantCommand(args []string, out io.Writer) error {
+func grantCommand(args []string, out, errOut io.Writer) error {
 	flags := flag.NewFlagSet("grant", flag.ContinueOnError)
-	flags.SetOutput(out)
+	// Only the generated grant goes to out. The usage footer documents appending
+	// that stream to a policy file, so a diagnostic written there lands in the
+	// policy instead of in front of the operator.
+	flags.SetOutput(errOut)
 	configPath := flags.String("config", "tailgate.hujson", "path to the tailgate config file")
 	// The flag defaults are the package's, so PrintDefaults renders them and
 	// they cannot drift from what grant.New falls back to.
@@ -49,9 +52,10 @@ func grantCommand(args []string, out io.Writer) error {
 	adminUI := flags.Bool("allow-admin-ui", false, "grant access to tsidp's admin UI")
 	dcr := flags.Bool("allow-dcr", false, "grant dynamic client registration")
 	flags.Usage = func() {
-		fmt.Fprint(out, grantUsageHeader)
+		w := flags.Output()
+		fmt.Fprint(w, grantUsageHeader)
 		flags.PrintDefaults()
-		fmt.Fprint(out, grantUsageFooter)
+		fmt.Fprint(w, grantUsageFooter)
 	}
 	if err := flags.Parse(args); err != nil {
 		// ContinueOnError writes the failure and the usage before returning it,
@@ -59,6 +63,11 @@ func grantCommand(args []string, out io.Writer) error {
 		if errors.Is(err, flag.ErrHelp) {
 			return nil
 		}
+		return errReported
+	}
+	if flags.NArg() > 0 {
+		fmt.Fprintf(errOut, "tailgate grant: unexpected argument %q\n", flags.Arg(0))
+		fmt.Fprintln(errOut, "Run 'tailgate grant -h' for usage.")
 		return errReported
 	}
 

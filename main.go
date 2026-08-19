@@ -37,6 +37,15 @@ persists in node.state_dir, so later starts do not log in again.
 Run "tailgate grant -h" for its flags.
 `
 
+// refuse reports a bad invocation and exits. Both entry points to it are usage
+// errors rather than runtime failures, so they share an exit code distinct from
+// the one a failed serve returns.
+func refuse(format string, args ...any) {
+	fmt.Fprintf(os.Stderr, format+"\n", args...)
+	fmt.Fprintln(os.Stderr, "Run 'tailgate -h' for usage.")
+	os.Exit(2)
+}
+
 // usage brackets PrintDefaults so the flag list is generated from the flags
 // main registers and cannot drift from them.
 func usage() {
@@ -58,7 +67,7 @@ func main() {
 	if len(os.Args) > 1 && !strings.HasPrefix(os.Args[1], "-") {
 		switch os.Args[1] {
 		case "grant":
-			if err := grantCommand(os.Args[2:], os.Stdout); err != nil {
+			if err := grantCommand(os.Args[2:], os.Stdout, os.Stderr); err != nil {
 				if !errors.Is(err, errReported) {
 					fmt.Fprintln(os.Stderr, err)
 				}
@@ -67,12 +76,10 @@ func main() {
 			return
 		case "help":
 			flag.CommandLine.SetOutput(os.Stdout)
-			flag.CommandLine.Usage()
+			usage()
 			return
 		default:
-			fmt.Fprintf(os.Stderr, "tailgate: unknown command %q\n", os.Args[1])
-			fmt.Fprintln(os.Stderr, "Run 'tailgate -h' for usage.")
-			os.Exit(2)
+			refuse("tailgate: unknown command %q", os.Args[1])
 		}
 	}
 
@@ -82,9 +89,7 @@ func main() {
 	// stops at the first non-flag rather than reporting it, so one written after
 	// the flags would otherwise fall through and start serving.
 	if flag.NArg() > 0 {
-		fmt.Fprintf(os.Stderr, "tailgate: unexpected argument %q\n", flag.Arg(0))
-		fmt.Fprintln(os.Stderr, "Run 'tailgate -h' for usage.")
-		os.Exit(2)
+		refuse("tailgate: unexpected argument %q", flag.Arg(0))
 	}
 
 	logger := slog.New(slog.NewJSONHandler(os.Stderr, nil))

@@ -70,23 +70,46 @@ Example:
 `
 
 func TestGrantCommandHelp(t *testing.T) {
-	var out bytes.Buffer
-	if err := grantCommand([]string{"-h"}, &out); err != nil {
+	var out, errOut bytes.Buffer
+	if err := grantCommand([]string{"-h"}, &out, &errOut); err != nil {
 		t.Fatalf("grantCommand: %v", err)
 	}
-	if diff := cmp.Diff(wantGrantUsage, out.String()); diff != "" {
+	if diff := cmp.Diff(wantGrantUsage, errOut.String()); diff != "" {
 		t.Errorf("grant usage differs:\n%s", diff)
+	}
+	if out.String() != "" {
+		t.Errorf("usage reached the grant stream:\n%s", out.String())
 	}
 }
 
 func TestGrantCommandParseError(t *testing.T) {
-	var out bytes.Buffer
-	err := grantCommand([]string{"-nope"}, &out)
+	var out, errOut bytes.Buffer
+	err := grantCommand([]string{"-nope"}, &out, &errOut)
 	if !errors.Is(err, errReported) {
 		t.Fatalf("grantCommand error = %v, want errReported", err)
 	}
-	if !strings.Contains(out.String(), "flag provided but not defined: -nope") {
-		t.Errorf("expected the FlagSet to report the bad flag itself, got:\n%s", out.String())
+	if !strings.Contains(errOut.String(), "flag provided but not defined: -nope") {
+		t.Errorf("expected the FlagSet to report the bad flag itself, got:\n%s", errOut.String())
+	}
+	if out.String() != "" {
+		t.Errorf("a diagnostic reached the grant stream, which the usage tells operators to append to their policy:\n%s", out.String())
+	}
+}
+
+// TestGrantCommandTrailingArgument covers a word that lost its leading dash. The
+// flag it meant to set keeps its default, and for -users that default authorizes
+// every user, so accepting it silently widens the grant.
+func TestGrantCommandTrailingArgument(t *testing.T) {
+	var out, errOut bytes.Buffer
+	err := grantCommand([]string{"-config", "tailgate.hujson", "users", "alice"}, &out, &errOut)
+	if !errors.Is(err, errReported) {
+		t.Fatalf("grantCommand error = %v, want errReported", err)
+	}
+	if !strings.Contains(errOut.String(), `unexpected argument "users"`) {
+		t.Errorf("expected the stray argument to be named, got:\n%s", errOut.String())
+	}
+	if out.String() != "" {
+		t.Errorf("a grant was written despite the bad invocation:\n%s", out.String())
 	}
 }
 
@@ -104,8 +127,8 @@ func TestGrantCommandDefaults(t *testing.T) {
 		t.Fatalf("write config: %v", err)
 	}
 
-	var out bytes.Buffer
-	if err := grantCommand([]string{"-config", path}, &out); err != nil {
+	var out, errOut bytes.Buffer
+	if err := grantCommand([]string{"-config", path}, &out, &errOut); err != nil {
 		t.Fatalf("grantCommand: %v", err)
 	}
 	for _, want := range []string{`"autogroup:member"`, `"src"`, `"dst"`, `"users"`, `https://tailgate.example.ts.net/mcp/docs`} {
@@ -141,7 +164,7 @@ func TestDispatch(t *testing.T) {
 		{
 			name:   "grant help prints grant usage",
 			args:   []string{"grant", "-h"},
-			stdout: wantGrantUsage,
+			stderr: wantGrantUsage,
 		},
 		{
 			name:   "unknown command is refused",

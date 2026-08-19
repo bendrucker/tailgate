@@ -55,7 +55,7 @@ Restart=always
 TimeoutStopSec=60
 ```
 
-SIGINT and SIGTERM drain in-flight requests and open SSE streams for up to 30 seconds before the node leaves the tailnet. The supervisor's kill timeout must exceed that.
+`SIGINT` and `SIGTERM` drain in-flight requests and open SSE streams for up to 30 seconds before the node leaves the tailnet. The supervisor's kill timeout must exceed that.
 
 ## Node keys
 
