@@ -177,18 +177,18 @@ func joinTailnet(ctx context.Context, node joiner, timeout time.Duration) (strin
 // names, when it names one.
 //
 // The control server decides the node's name: a hostname already taken comes
-// back with a suffix appended. Every canonical resource URI is built
-// from that name, so an unexpected one silently shifts every audience away from
-// what the tsidp grant authorizes, and each request fails at the audience check
-// with nothing pointing at the cause. Refusing to serve reports it once, at
-// startup, against the name a reviewer can compare to the policy.
+// back with a suffix appended. Every canonical resource URI is built from that
+// name, so an unexpected one silently shifts every audience away from the URL
+// each client was configured with, and each request fails at the audience
+// check with nothing pointing at the cause. Refusing to serve reports it once,
+// at startup, against the name a reviewer can compare to the config.
 func expectedFQDN(node config.Node, joined string) error {
 	expected := node.FQDN()
 	if expected == "" {
 		return nil
 	}
 	if actual := strings.ToLower(strings.TrimSuffix(joined, ".")); actual != strings.ToLower(expected) {
-		return fmt.Errorf("joined the tailnet as %q, but the config expects %q: every resource URI would differ from the one the tsidp grant authorizes", actual, expected)
+		return fmt.Errorf("joined the tailnet as %q, but the config expects %q: every resource URI would differ from the one clients were configured with", actual, expected)
 	}
 	return nil
 }

@@ -14,18 +14,12 @@ import (
 	"github.com/bendrucker/tailgate/internal/config"
 )
 
-// errReported marks a failure the command already wrote to its own output.
-// A FlagSet reports a parse error before returning it, so main exits on one
-// without printing it a second time.
-var errReported = errors.New("reported")
-
 const usageHeader = `tailgate fronts MCP servers behind Tailscale Funnel. It joins the tailnet as
-its own node, validates tsidp OIDC tokens, and proxies authorized requests to
-HTTP and stdio MCP upstreams at /mcp/<name>.
+its own node, issues and verifies the OAuth tokens its clients present, and
+proxies authorized requests to HTTP and stdio MCP upstreams at /mcp/<name>.
 
 Usage:
-  tailgate [flags]        serve the configured upstreams
-  tailgate grant [flags]  print the tsidp policy grant authorizing those upstreams
+  tailgate [flags]  serve the configured upstreams
 
 Flags:
 `
@@ -33,8 +27,6 @@ Flags:
 const usageFooter = `
 Set TS_AUTHKEY to join the tailnet on the first start. The node key then
 persists in node.state_dir, so later starts do not log in again.
-
-Run "tailgate grant -h" for its flags.
 `
 
 // refuse reports a bad invocation and exits. Both entry points to it are usage
@@ -61,19 +53,10 @@ func main() {
 	flag.CommandLine.Usage = usage
 
 	// Serving is the default, so a deployment's command line stays
-	// `tailgate -config ...` and the generator is the named mode. A leading
-	// argument that is not a flag has to name a command: falling through on a
-	// misspelled one starts serving.
+	// `tailgate -config ...`. A leading argument that is not a flag has to name
+	// a command: falling through on a misspelled one starts serving.
 	if len(os.Args) > 1 && !strings.HasPrefix(os.Args[1], "-") {
 		switch os.Args[1] {
-		case "grant":
-			if err := grantCommand(os.Args[2:], os.Stdout, os.Stderr); err != nil {
-				if !errors.Is(err, errReported) {
-					fmt.Fprintln(os.Stderr, err)
-				}
-				os.Exit(1)
-			}
-			return
 		case "help":
 			flag.CommandLine.SetOutput(os.Stdout)
 			usage()

@@ -25,11 +25,10 @@ type ChallengeOptions struct {
 //
 // The scope parameter states what the client must ask for, which a client
 // otherwise has to be told out of band. It matters here beyond the
-// specification's SHOULD: tsidp omits email from introspection unless the
-// token carries the email scope, and the shipped email-allowlist policy then
-// denies every request from a client that did not request it. Naming the scope
-// in the challenge turns that from an onboarding step into something a client
-// discovers from the refusal itself.
+// specification's SHOULD: the shipped email-allowlist policy matches on the
+// email claim, and naming the scope in the challenge turns requesting it from
+// an onboarding step into something a client discovers from the refusal
+// itself.
 func (u *URLs) Challenge(name string, opts ChallengeOptions) string {
 	scope := opts.Scope
 	if len(scope) == 0 {
