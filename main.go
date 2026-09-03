@@ -87,7 +87,7 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	if err := serve(ctx, logger, cfg, options{OpenLoginURL: *openLogin}); err != nil {
+	if err := serve(ctx, logger, cfg, options{OpenLoginURL: *openLogin, ConfigPath: *configPath}); err != nil {
 		// A canceled context is the signal that asked tailgate to stop, so it
 		// reports the shutdown it completed rather than a failure.
 		if errors.Is(err, context.Canceled) {

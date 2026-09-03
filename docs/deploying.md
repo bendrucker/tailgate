@@ -46,12 +46,27 @@ The systemd equivalent:
 ```ini
 [Service]
 ExecStart=/usr/local/bin/tailgate -config /etc/tailgate.hujson
+ExecReload=/bin/kill -HUP $MAINPID
 Environment=TS_AUTHKEY=tskey-auth-...
 Restart=always
 TimeoutStopSec=60
 ```
 
 `SIGINT` and `SIGTERM` stop the listener, drain in-flight requests and open SSE streams for up to 30 seconds, then wait up to 10 more for connections that never reached a transport. The supervisor's kill timeout must exceed the 40-second total.
+
+## Reloading
+
+`SIGHUP` reloads the config file in place, so editing it never restarts the process or invalidates a token:
+
+```sh
+launchctl kill SIGHUP system/com.bendrucker.tailgate
+```
+
+A reload rebuilds the routes from the file. Upstreams added appear, upstreams removed answer `404`, and every upstream gets a fresh transport while the previous ones drain in the background for up to 30 seconds. `policy` and `favicon` take effect on the next request.
+
+Everything under `node` is fixed for the life of the process, since the tailnet node is joined once. A reload whose `node` section differs is refused, and so is a file that fails to load or a configuration whose routes fail to build. Each refusal is logged with its reason and leaves the running configuration in service, so a mistyped file never takes tailgate down.
+
+Tokens survive a reload, because the store holding them is outside what a reload rebuilds. Sessions do not. A stateful client's next request answers `404`, the MCP signal to re-initialize, and a stdio child of the previous configuration is terminated once its in-flight requests finish.
 
 ## Startup Failures
 
