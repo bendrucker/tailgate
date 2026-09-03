@@ -1,12 +1,15 @@
-// Package auth verifies OIDC tokens and authorizes identities against policy.
+// Package auth issues and verifies tailgate's bearer tokens and authorizes
+// identities against policy.
 //
-// tsidp access tokens are opaque, so verification is RFC 7662 introspection
-// over tsnet. No token is verified locally anywhere in this package, and no
-// JOSE or JWT dependency belongs here.
+// tailgate is its own issuer. Tokens are opaque random strings looked up in
+// memory, so nothing is signed, nothing is parsed, and no JOSE or JWT
+// dependency belongs here. A restart forgets every token, and clients recover
+// through the ordinary 401 challenge.
 package auth
 
-// Identity is the validated caller extracted from a tsidp token. It carries the
-// stable identifiers plus the full claim set, so policy can match on any claim
+// Identity is the person a token was issued to. Subject is the bare decimal
+// tailnet user ID and Email the tailnet login name. Claims carries both plus
+// the grant's scope, client, and audience, so policy can match on any of them
 // without changing this contract.
 type Identity struct {
 	Subject string

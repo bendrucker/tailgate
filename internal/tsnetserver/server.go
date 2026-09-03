@@ -17,11 +17,13 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
-	"net/http"
+	"net/netip"
 	"os"
 	"strconv"
 	"sync"
 
+	"tailscale.com/client/local"
+	"tailscale.com/client/tailscale/apitype"
 	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/tsnet"
 )
@@ -38,7 +40,7 @@ var funnelPorts = map[int]bool{443: true, 8443: true, 10000: true}
 type node interface {
 	Up(ctx context.Context) (*ipnstate.Status, error)
 	ListenFunnel(network, addr string, opts ...tsnet.FunnelOption) (net.Listener, error)
-	HTTPClient() *http.Client
+	LocalClient() (*local.Client, error)
 	Close() error
 }
 
@@ -219,9 +221,10 @@ func (s *Server) FQDN() string {
 // tsnet.FunnelTLSConfig, so the minimum version and cipher suites are Go's
 // defaults.
 //
-// The listener also serves tailnet peers dialing the same port. Every request
+// The listener also serves tailnet peers dialing the same port, and those are
+// the only connections WhoIs can put a person behind. Every upstream request
 // is authenticated by bearer token either way, since Funnel strips tailnet
-// identity and the token is the only identity signal.
+// identity and the token is the only identity signal a public request carries.
 //
 // The caller owns serving on the returned listener. StopAccepting closes it,
 // which keeps shutdown sequenced.
@@ -281,10 +284,35 @@ func (s *Server) Close() error {
 	return err
 }
 
-// HTTPClient returns a client that dials over the tailnet. The auth verifier
-// introspects tsidp through it: tsidp authenticates that path by tailnet node
-// identity (WhoIs), so tailgate needs no stored client secret, and a client
-// dialing the public internet would fail that check.
-func (s *Server) HTTPClient() *http.Client {
-	return s.node.HTTPClient()
+// WhoIs resolves a tailnet peer address to the node and user behind it, which
+// is how the authorization server learns who is approving a client. The
+// address must be the peer's own tailnet address, which is what a direct
+// connection to the Funnel listener reports. A Funnel connection reports the
+// ingress relay instead, so the router never offers one here.
+//
+// The lookup goes to the embedded node's own map of peers, so a public
+// address, or any address the tailnet has not assigned to a single node, is an
+// error rather than a guess.
+func (s *Server) WhoIs(ctx context.Context, peer netip.AddrPort) (*apitype.WhoIsResponse, error) {
+	if !peer.IsValid() {
+		return nil, fmt.Errorf("tsnetserver: no peer address to resolve")
+	}
+	s.mu.Lock()
+	closed := s.closed
+	s.mu.Unlock()
+	if closed {
+		return nil, ErrClosed
+	}
+	lc, err := s.node.LocalClient()
+	if err != nil {
+		return nil, fmt.Errorf("tsnetserver: local client: %w", err)
+	}
+	resp, err := lc.WhoIs(ctx, peer.String())
+	if err != nil {
+		return nil, fmt.Errorf("tsnetserver: whois %s: %w", peer, err)
+	}
+	if resp == nil || resp.Node == nil || resp.UserProfile == nil {
+		return nil, fmt.Errorf("tsnetserver: whois %s: no node or user behind the address", peer)
+	}
+	return resp, nil
 }

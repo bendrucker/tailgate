@@ -111,7 +111,7 @@ const (
 )
 
 // Verifier validates a bearer token against an upstream's canonical resource
-// URI. *auth.Verifier implements it.
+// URI. *auth.Tokens implements it.
 type Verifier interface {
 	Verify(ctx context.Context, token, resource string) (auth.Identity, error)
 }
@@ -122,12 +122,10 @@ type Authorizer interface {
 	Authorize(id auth.Identity, upstream string) auth.Decision
 }
 
-// AuthServer serves the authorization-server endpoints tailgate presents at
-// its own origin for clients that never read the RFC 9728 metadata document.
-// It owns its own path set, so the router asks rather than restating it.
-// *authserver.Facade implements it.
+// AuthServer serves the authorization-server endpoints at tailgate's own
+// origin: metadata, /authorize, and /token. It owns its own path set, so
+// the router asks. *authserver.Server implements it.
 type AuthServer interface {
-	// Handles reports whether the path belongs to the facade.
 	Handles(path string) bool
 	http.Handler
 }
@@ -169,8 +167,8 @@ type Options struct {
 	// 404 there, which breaks discovery but never routes to an upstream.
 	Metadata http.Handler
 	// AuthServer serves the authorization-server surface at tailgate's own
-	// origin. Nil leaves those paths unrouted, which is correct for a
-	// deployment whose clients all follow RFC 9728 discovery.
+	// origin. Nil leaves those paths unrouted, so no client can obtain a
+	// token. Tests use that to exercise the resource surface alone.
 	AuthServer AuthServer
 	// Site serves the unauthenticated origin surface: the root page and the
 	// favicon. Nil leaves those paths unrouted, which only costs the origin an
@@ -316,23 +314,33 @@ func Server(h http.Handler) *http.Server {
 	}
 }
 
-// connContext puts the address the connection came from where the abuse
-// controls can charge it. It belongs to [Server] for the same reason the
-// header-phase limits do: an unpopulated address is not an error anywhere
-// downstream, it silently charges every request to one shared bucket.
+// connContext puts the address the connection came from where logs and the
+// authorization server can read it. It belongs to [Server] for the same reason
+// the header-phase limits do: an unpopulated address is not an error anywhere
+// downstream, it silently degrades what the request can be attributed to.
 func connContext(ctx context.Context, c net.Conn) context.Context {
-	return auth.WithClientAddr(ctx, clientAddr(c))
+	ctx = auth.WithClientAddr(ctx, clientAddr(c))
+	if peer, ok := peerAddr(c); ok {
+		ctx = auth.WithPeerAddr(ctx, peer)
+	}
+	return ctx
+}
+
+// unwrap strips the TLS layer the Funnel listener adds so the connection
+// underneath can be inspected.
+func unwrap(c net.Conn) net.Conn {
+	if tc, ok := c.(*tls.Conn); ok {
+		return tc.NetConn()
+	}
+	return c
 }
 
 // clientAddr recovers the address the request originated from. Over Funnel the
 // connection's RemoteAddr is the relaying tailnet node, and the client's own
 // address is carried on the [ipn.FunnelConn] the TLS listener wraps. An address
-// that cannot be recovered comes back as the zero Addr, which is charged like
-// any other rather than exempted.
+// that cannot be recovered comes back as the zero Addr.
 func clientAddr(c net.Conn) netip.Addr {
-	if tc, ok := c.(*tls.Conn); ok {
-		c = tc.NetConn()
-	}
+	c = unwrap(c)
 	if fc, ok := c.(*ipn.FunnelConn); ok {
 		return fc.Src.Addr()
 	}
@@ -340,6 +348,22 @@ func clientAddr(c net.Conn) netip.Addr {
 		return ap.Addr()
 	}
 	return netip.Addr{}
+}
+
+// peerAddr recovers the tailnet address a direct connection came from, which
+// WhoIs can resolve to a person. A Funnel connection yields nothing: its
+// RemoteAddr is the Tailscale ingress relay, itself a tailnet peer, and
+// resolving it would name the relay as the person authorizing a client.
+func peerAddr(c net.Conn) (netip.AddrPort, bool) {
+	c = unwrap(c)
+	if _, ok := c.(*ipn.FunnelConn); ok {
+		return netip.AddrPort{}, false
+	}
+	ap, err := netip.ParseAddrPort(c.RemoteAddr().String())
+	if err != nil || !ap.IsValid() {
+		return netip.AddrPort{}, false
+	}
+	return ap, true
 }
 
 // ServeHTTP runs the request pipeline. The panic recovery is outermost, so a
@@ -405,9 +429,11 @@ func (rt *Router) route(rec *responseRecorder, r *http.Request) {
 		return
 	}
 
-	// The facade's endpoints are unauthenticated by nature: discovery is public,
-	// and a token exchange is what the client does before it has a token. They
-	// resolve ahead of upstream routing and can never reach one.
+	// The authorization server's endpoints are unauthenticated by nature:
+	// discovery is public, a token exchange is what the client does before it
+	// has a token, and consent is authenticated by the tailnet connection
+	// rather than a bearer. They resolve ahead of upstream routing and can
+	// never reach one.
 	if rt.authServer != nil && rt.authServer.Handles(r.URL.Path) {
 		rt.logger.Info("authorization server request", "method", r.Method, "path", r.URL.EscapedPath())
 		rt.authServer.ServeHTTP(rec, r)

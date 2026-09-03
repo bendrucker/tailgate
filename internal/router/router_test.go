@@ -911,20 +911,118 @@ func TestClientAddr(t *testing.T) {
 	}
 }
 
-func TestServerRecordsTheClientAddress(t *testing.T) {
-	want := netip.MustParseAddr("203.0.113.7")
-	local, remote := net.Pipe()
-	t.Cleanup(func() {
-		local.Close()
-		remote.Close()
-	})
-	funnel := &ipn.FunnelConn{Conn: local, Src: netip.AddrPortFrom(want, 44321)}
+// A Funnel connection's own RemoteAddr is the Tailscale ingress relay, itself
+// a tailnet peer. Resolving it with WhoIs would name the relay as the person
+// authorizing a client, so a Funnel connection must yield no peer address at
+// all, whatever tailnet address it reports.
+func TestPeerAddr(t *testing.T) {
+	relay := &net.TCPAddr{IP: net.ParseIP("100.64.0.1"), Port: 41641}
+	peer := netip.MustParseAddrPort("100.101.102.103:52000")
 
+	for _, tc := range []struct {
+		name string
+		conn func(net.Conn) net.Conn
+		want netip.AddrPort
+		ok   bool
+	}{
+		{
+			name: "funnel connection behind tls",
+			conn: func(c net.Conn) net.Conn {
+				funnel := &ipn.FunnelConn{Conn: &remoteAddrConn{Conn: c, remote: relay}, Src: netip.MustParseAddrPort("203.0.113.7:44321")}
+				return tls.Server(funnel, &tls.Config{})
+			},
+		},
+		{
+			name: "bare funnel connection",
+			conn: func(c net.Conn) net.Conn {
+				return &ipn.FunnelConn{Conn: &remoteAddrConn{Conn: c, remote: relay}, Src: netip.MustParseAddrPort("203.0.113.7:44321")}
+			},
+		},
+		{
+			name: "funnel connection whose source looks like a tailnet address",
+			conn: func(c net.Conn) net.Conn {
+				return &ipn.FunnelConn{Conn: &remoteAddrConn{Conn: c, remote: relay}, Src: peer}
+			},
+		},
+		{
+			name: "direct tailnet connection behind tls",
+			conn: func(c net.Conn) net.Conn {
+				return tls.Server(&remoteAddrConn{Conn: c, remote: net.TCPAddrFromAddrPort(peer)}, &tls.Config{})
+			},
+			want: peer,
+			ok:   true,
+		},
+		{
+			name: "bare direct connection",
+			conn: func(c net.Conn) net.Conn {
+				return &remoteAddrConn{Conn: c, remote: net.TCPAddrFromAddrPort(peer)}
+			},
+			want: peer,
+			ok:   true,
+		},
+		{
+			name: "connection with an unparseable address",
+			conn: func(c net.Conn) net.Conn { return c },
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			local, remote := net.Pipe()
+			t.Cleanup(func() {
+				local.Close()
+				remote.Close()
+			})
+			got, ok := peerAddr(tc.conn(local))
+			if ok != tc.ok || got != tc.want {
+				t.Errorf("peerAddr = %v, %v, want %v, %v", got, ok, tc.want, tc.ok)
+			}
+		})
+	}
+}
+
+func TestServerRecordsTheConnectionAddresses(t *testing.T) {
 	server := Server(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
 	if server.ConnContext == nil {
 		t.Fatal("Server built an http.Server that records no client address")
 	}
-	if got := auth.ClientAddrFrom(server.ConnContext(context.Background(), funnel)); got != want {
-		t.Errorf("recorded client address = %v, want %v", got, want)
+	relay := &net.TCPAddr{IP: net.ParseIP("100.64.0.1"), Port: 41641}
+	peer := netip.MustParseAddrPort("100.101.102.103:52000")
+	public := netip.MustParseAddrPort("203.0.113.7:44321")
+
+	for _, tc := range []struct {
+		name       string
+		conn       func(net.Conn) net.Conn
+		wantClient netip.Addr
+		wantPeer   netip.AddrPort
+	}{
+		{
+			name: "funnel connection",
+			conn: func(c net.Conn) net.Conn {
+				return &ipn.FunnelConn{Conn: &remoteAddrConn{Conn: c, remote: relay}, Src: public}
+			},
+			wantClient: public.Addr(),
+		},
+		{
+			name: "tailnet connection",
+			conn: func(c net.Conn) net.Conn {
+				return &remoteAddrConn{Conn: c, remote: net.TCPAddrFromAddrPort(peer)}
+			},
+			wantClient: peer.Addr(),
+			wantPeer:   peer,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			local, remote := net.Pipe()
+			t.Cleanup(func() {
+				local.Close()
+				remote.Close()
+			})
+			ctx := server.ConnContext(context.Background(), tc.conn(local))
+			if got := auth.ClientAddrFrom(ctx); got != tc.wantClient {
+				t.Errorf("recorded client address = %v, want %v", got, tc.wantClient)
+			}
+			if got := auth.PeerAddrFrom(ctx); got != tc.wantPeer {
+				t.Errorf("recorded peer address = %v, want %v", got, tc.wantPeer)
+			}
+		})
 	}
 }

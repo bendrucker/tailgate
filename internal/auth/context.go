@@ -9,6 +9,8 @@ type identityKey struct{}
 
 type clientAddrKey struct{}
 
+type peerAddrKey struct{}
+
 // WithIdentity returns a context carrying the authorized caller. The router
 // sets it after verification and authorization succeed, so downstream code can
 // treat its presence as proof the request was authorized.
@@ -24,8 +26,8 @@ func IdentityFrom(ctx context.Context) (Identity, bool) {
 }
 
 // WithClientAddr returns a context carrying the address the request arrived
-// from, which the introspection rate limit is charged against. Funnel replaces
-// RemoteAddr with the relaying node, so the address must be recovered from the
+// from, for logs and any per-client accounting. Funnel replaces RemoteAddr
+// with the relaying node, so the address must be recovered from the
 // connection and put here before the handler runs.
 func WithClientAddr(ctx context.Context, addr netip.Addr) context.Context {
 	return context.WithValue(ctx, clientAddrKey{}, addr)
@@ -39,5 +41,23 @@ func WithClientAddr(ctx context.Context, addr netip.Addr) context.Context {
 // bucket and a plumbing gap costs throughput rather than the limit.
 func ClientAddrFrom(ctx context.Context) netip.Addr {
 	addr, _ := ctx.Value(clientAddrKey{}).(netip.Addr)
+	return addr
+}
+
+// WithPeerAddr returns a context carrying the tailnet address the connection
+// came from, which the authorization server resolves to a person with WhoIs.
+// The router sets it only on a connection that is not Funnel ingress: a
+// Funnel connection's RemoteAddr is the Tailscale relay, itself a tailnet
+// peer, and WhoIs on it would name the relay as the person.
+func WithPeerAddr(ctx context.Context, addr netip.AddrPort) context.Context {
+	return context.WithValue(ctx, peerAddrKey{}, addr)
+}
+
+// PeerAddrFrom returns the tailnet peer address, or the zero AddrPort when
+// the request arrived over Funnel or the context carries none. A zero value
+// means the person cannot be identified, never that identification may be
+// skipped.
+func PeerAddrFrom(ctx context.Context) netip.AddrPort {
+	addr, _ := ctx.Value(peerAddrKey{}).(netip.AddrPort)
 	return addr
 }

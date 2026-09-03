@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/google/go-cmp/cmp"
+	"tailscale.com/client/local"
 	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/tsnet"
 )
@@ -21,7 +22,8 @@ import (
 type fakeNode struct {
 	up        func(context.Context) (*ipnstate.Status, error)
 	listen    func(network, addr string) (net.Listener, error)
-	client    *http.Client
+	local     *local.Client
+	localErr  error
 	closeErr  error
 	listenErr error
 
@@ -60,7 +62,7 @@ func (f *fakeNode) ListenFunnel(network, addr string, _ ...tsnet.FunnelOption) (
 	return &recordingListener{Listener: ln, record: f.record}, nil
 }
 
-func (f *fakeNode) HTTPClient() *http.Client { return f.client }
+func (f *fakeNode) LocalClient() (*local.Client, error) { return f.local, f.localErr }
 
 func (f *fakeNode) Close() error {
 	f.mu.Lock()
@@ -602,13 +604,5 @@ func TestAfterClose(t *testing.T) {
 				t.Errorf("call after Close = %v, want %v", err, ErrClosed)
 			}
 		})
-	}
-}
-
-func TestHTTPClient(t *testing.T) {
-	client := &http.Client{}
-	srv := newServer(&fakeNode{client: client}, 443)
-	if got := srv.HTTPClient(); got != client {
-		t.Errorf("HTTPClient = %p, want the node's client %p", got, client)
 	}
 }
