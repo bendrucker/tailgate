@@ -48,6 +48,13 @@ func RequiredScopes() []string {
 	return slices.Clone(scopesRequired)
 }
 
+// SupportedScopes returns the scopes a client may request, as a copy. The
+// authorization server grants no scope outside this set, and the
+// protected-resource metadata advertises exactly it.
+func SupportedScopes() []string {
+	return slices.Clone(scopesSupported)
+}
+
 // Metadata is one upstream's RFC 9728 protected-resource metadata document.
 // Resource is the byte-exact canonical URI from URLs.ResourceURL, which is
 // also the resource value the client sends on the token request and the aud

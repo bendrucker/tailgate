@@ -3,17 +3,21 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"strings"
 	"sync"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
+	"tailscale.com/client/tailscale/apitype"
 
 	"github.com/bendrucker/tailgate/internal/audit"
 	"github.com/bendrucker/tailgate/internal/auth"
 	"github.com/bendrucker/tailgate/internal/authserver"
+	"github.com/bendrucker/tailgate/internal/cimd"
 	"github.com/bendrucker/tailgate/internal/config"
 	"github.com/bendrucker/tailgate/internal/resource"
 )
@@ -103,7 +107,20 @@ func testHandler(t *testing.T, respond http.HandlerFunc) (http.Handler, *fakeVer
 	}}
 
 	logger := discardLogger()
-	rt, err := handler(cfg, urls, verifier, http.DefaultClient, logger, audit.New(logger))
+	authServer, err := authserver.New(authserver.Options{
+		Resources: urls,
+		Upstreams: []string{testUpstream},
+		Tokens:    auth.NewTokens(),
+		Identify: func(context.Context, netip.AddrPort) (*apitype.WhoIsResponse, error) {
+			return nil, errors.New("no tailnet in this test")
+		},
+		Clients: cimd.NewFetcher(http.DefaultClient),
+		Logger:  logger,
+	})
+	if err != nil {
+		t.Fatalf("authserver.New: %v", err)
+	}
+	rt, err := handler(cfg, urls, verifier, authServer, logger, audit.New(logger))
 	if err != nil {
 		t.Fatalf("handler: %v", err)
 	}
@@ -319,10 +336,9 @@ func TestHandlerStreamsSSE(t *testing.T) {
 	}
 }
 
-// The facade's endpoints must resolve on the assembled surface, unauthenticated
-// and ahead of upstream routing. A client that skips RFC 9728 discovery reaches
-// tailgate with no token and no knowledge of the issuer, so a 404 or a 401 here
-// is the failure this package exists to prevent.
+// The authorization server's endpoints must resolve on the assembled surface,
+// unauthenticated and ahead of upstream routing. A client reaches them with no
+// token, so a 404 or a 401 here is the failure this wiring exists to prevent.
 func TestHandlerServesAuthorizationServerSurface(t *testing.T) {
 	rt, _, _ := testHandler(t, respondJSON)
 
@@ -352,15 +368,30 @@ func TestHandlerServesAuthorizationServerSurface(t *testing.T) {
 		}
 	})
 
-	t.Run("authorize redirects to the issuer", func(t *testing.T) {
+	// A request that reaches /authorize with no tailnet peer address, which is
+	// every request over Funnel, is refused before anything about the client
+	// is examined.
+	t.Run("authorize refuses a request with no tailnet peer", func(t *testing.T) {
 		rec := httptest.NewRecorder()
 		rt.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, authserver.AuthorizePath+"?client_id=abc&state=xyz", nil))
-		if rec.Code != http.StatusFound {
-			t.Fatalf("expected 302, got %d", rec.Code)
+		if rec.Code != http.StatusForbidden {
+			t.Fatalf("expected 403, got %d", rec.Code)
 		}
-		want := testIssuer + authserver.AuthorizePath + "?client_id=abc&state=xyz"
-		if got := rec.Header().Get("Location"); got != want {
-			t.Errorf("Location = %q, want %q", got, want)
+		if got := rec.Header().Get("Content-Type"); !strings.HasPrefix(got, "text/html") {
+			t.Errorf("Content-Type = %q, want an HTML page for the browser", got)
+		}
+	})
+
+	t.Run("token refuses a request with no grant", func(t *testing.T) {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, authserver.TokenPath, strings.NewReader("grant_type=authorization_code&client_id=https%3A%2F%2Fclient.example.com%2Fclient&code=abc"))
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		rt.ServeHTTP(rec, req)
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("expected 400, got %d", rec.Code)
+		}
+		if !strings.Contains(rec.Body.String(), `"invalid_grant"`) {
+			t.Errorf("body = %s, want an invalid_grant error", rec.Body.String())
 		}
 	})
 }

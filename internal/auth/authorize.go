@@ -88,8 +88,7 @@ func matchesIdentity(match config.Match, id Identity) bool {
 		conditions++
 	}
 	if match.Email != "" {
-		// tsidp omits email from introspection unless the client requested the
-		// email scope, so an absent email denies an email rule.
+		// An identity with no email denies an email rule.
 		if match.Email != id.Email {
 			return false
 		}

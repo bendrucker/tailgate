@@ -11,6 +11,8 @@ import (
 
 	"github.com/bendrucker/tailgate/internal/audit"
 	"github.com/bendrucker/tailgate/internal/auth"
+	"github.com/bendrucker/tailgate/internal/authserver"
+	"github.com/bendrucker/tailgate/internal/cimd"
 	"github.com/bendrucker/tailgate/internal/config"
 	"github.com/bendrucker/tailgate/internal/resource"
 	"github.com/bendrucker/tailgate/internal/router"
@@ -23,10 +25,10 @@ const (
 	// hang.
 	drainTimeout = 30 * time.Second
 	// closeTimeout bounds the wait for the connections the transport drain does
-	// not cover: a request still verifying its token has reached no transport,
-	// and introspection is the longest it can be waiting. The clock is separate
-	// so a transport that spends the entire drain budget still leaves those
-	// connections a window to close cleanly rather than being severed.
+	// not cover: a request at the authorization server, which may be waiting
+	// on a client metadata fetch, has reached no transport. The clock is
+	// separate so a transport that spends the entire drain budget still leaves
+	// those connections a window to close cleanly rather than being severed.
 	closeTimeout = 10 * time.Second
 	// joinTimeout bounds an unattended join. A node with no auth key and no
 	// saved state cannot authenticate itself, and tsnet's fallback is to print
@@ -51,10 +53,10 @@ type options struct {
 // serve runs tailgate until ctx is canceled or the listener fails.
 //
 // The order is forced by what each step learns from the one before it: the
-// canonical resource URLs need the FQDN the join reports, the verifier needs a
-// client that dials the tailnet, and the router needs both. Nothing serves
-// until every one of them succeeds, so a startup failure is downtime rather
-// than an unauthenticated window.
+// canonical resource URLs need the FQDN the join reports, the authorization
+// server needs those URLs and the node's WhoIs, and the router needs all of
+// it. Nothing serves until every one of them succeeds, so a startup failure
+// is downtime rather than an unauthenticated window.
 func serve(ctx context.Context, logger *slog.Logger, cfg *config.Config, opts options) error {
 	node, err := tsnetserver.New(tsnetserver.Config{
 		Hostname:     cfg.Node.Hostname,
@@ -84,14 +86,23 @@ func serve(ctx context.Context, logger *slog.Logger, cfg *config.Config, opts op
 		return err
 	}
 
-	// Introspection goes over the tailnet, where tsidp authenticates tailgate
-	// by node identity and no client secret is stored anywhere.
-	verifier, err := auth.NewVerifier(ctx, node.HTTPClient(), cfg.OIDC.Issuer)
+	// tailgate issues its own tokens, from memory. The store and the
+	// authorization server around it are built once here: they hold every
+	// token a client has, so nothing that reloads may rebuild them.
+	tokens := auth.NewTokens()
+	authServer, err := authserver.New(authserver.Options{
+		Resources: urls,
+		Upstreams: upstreamNames(cfg),
+		Tokens:    tokens,
+		Identify:  node.WhoIs,
+		Clients:   cimd.NewFetcher(cimd.NewClient()),
+		Logger:    logger,
+	})
 	if err != nil {
-		return fmt.Errorf("discover issuer %s: %w", cfg.OIDC.Issuer, err)
+		return err
 	}
 
-	rt, err := handler(cfg, urls, verifier, node.HTTPClient(), logger, audit.New(logger))
+	rt, err := handler(cfg, urls, tokens, authServer, logger, audit.New(logger))
 	if err != nil {
 		return err
 	}

@@ -8,8 +8,8 @@ import (
 
 // tokenCache maps a token digest to a value that expires. Entries are evicted
 // least-recently-used once the cache holds max of them, which bounds the memory
-// an unauthenticated client can cause tailgate to allocate by spraying distinct
-// tokens at the Funnel endpoint. A max of zero or less disables the cache.
+// the tables can hold however many tokens are issued. A max of zero or less
+// disables the cache.
 type tokenCache[T any] struct {
 	mu    sync.Mutex
 	max   int
@@ -73,6 +73,47 @@ func (c *tokenCache[T]) put(key string, value T, expires, now time.Time) {
 		c.remove(c.order.Back())
 	}
 	c.items[key] = c.order.PushFront(&cacheEntry[T]{key: key, value: value, expires: expires})
+}
+
+// take returns and forgets the value stored for key if it has not expired by
+// now and consume accepts it. It is the single-use read: two callers racing on
+// one key see one hit. consume sees the live value under the lock, and a value
+// it declines stays stored and is not returned. An expired entry is forgotten
+// without consulting consume.
+func (c *tokenCache[T]) take(key string, now time.Time, consume func(T) bool) (T, bool) {
+	var zero T
+	if c.max <= 0 {
+		return zero, false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	el, ok := c.items[key]
+	if !ok {
+		return zero, false
+	}
+	entry := el.Value.(*cacheEntry[T])
+	if !now.Before(entry.expires) {
+		c.remove(el)
+		return zero, false
+	}
+	if !consume(entry.value) {
+		return zero, false
+	}
+	c.remove(el)
+	return entry.value, true
+}
+
+func (c *tokenCache[T]) deleteWhere(match func(T) bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for el := c.order.Front(); el != nil; {
+		next := el.Next()
+		if match(el.Value.(*cacheEntry[T]).value) {
+			c.remove(el)
+		}
+		el = next
+	}
 }
 
 func (c *tokenCache[T]) remove(el *list.Element) {
