@@ -21,7 +21,7 @@ const ReasonSessionUnrecognized = "session not recognized"
 // session header more than once.
 const ReasonSessionAmbiguous = "request presents more than one session id"
 
-// claimSession enforces the MCP session-hijacking guidance for upstreams whose
+// sessionStep enforces the MCP session-hijacking guidance for upstreams whose
 // transport passes the upstream's own sessions through. The upstream sees only
 // the header, so without this any authorized caller who learns another
 // caller's session ID takes over that live session.
@@ -38,9 +38,13 @@ const ReasonSessionAmbiguous = "request presents more than one session id"
 // recovery path when a tailgate restart drops the table while upstream
 // sessions are still live.
 //
-// A claim retains the binding for the life of the request, so the returned
-// release must run once the response is done.
-func (rt *Router) claimSession(rec *responseRecorder, r *http.Request, up *upstream, id auth.Identity) (release func(), ok bool) {
+// A claim retains the binding for the life of the request, so the exchange
+// carries the release the router runs once the response is done.
+type sessionStep struct{ rt *Router }
+
+func (s sessionStep) name() string { return "session" }
+
+func (s sessionStep) check(ex *exchange) *refusal {
 	// Which copy an upstream reads is not decidable here, so a repeated session
 	// header is malformed rather than resolved to the first, on the same
 	// grounds as a repeated Authorization or MCP-Protocol-Version. Binding the
@@ -51,32 +55,34 @@ func (rt *Router) claimSession(rec *responseRecorder, r *http.Request, up *upstr
 	// The check precedes the binding waiver because it is not about binding: a
 	// transport managing its own sessions resolves the same header the same
 	// way, and the router is the only place that sees every copy of it.
-	if len(r.Header.Values(SessionHeader)) > 1 {
-		rt.audit.Deny(r.Context(), id, up.name, ReasonSessionAmbiguous)
-		protocol.WriteError(rec, http.StatusBadRequest, protocol.CodeInvalidRequest,
-			"Request presents more than one "+SessionHeader, nil)
-		return nil, false
+	if len(ex.r.Header.Values(SessionHeader)) > 1 {
+		return denyProtocol(
+			protocol.ErrorObject{
+				Code:    protocol.CodeInvalidRequest,
+				Message: "Request presents more than one " + SessionHeader,
+			},
+			denied(ex.identity, ex.up.name, ReasonSessionAmbiguous))
 	}
-	if !up.bindSessions {
-		return func() {}, true
+	if !ex.up.bindSessions {
+		return nil
 	}
-	session := r.Header.Get(SessionHeader)
+	session := ex.r.Header.Get(SessionHeader)
 	if session == "" {
-		return func() {}, true
+		return nil
 	}
-	key := sessionKey(up.name, session)
-	allowed, bound := rt.sessions.holds(key, id.Subject)
+	key := sessionKey(ex.up.name, session)
+	allowed, bound := s.rt.sessions.holds(key, ex.identity.Subject)
 	if allowed {
-		return func() { rt.sessions.releaseHold(key) }, true
+		ex.release = func() { s.rt.sessions.releaseHold(key) }
+		return nil
 	}
 
 	reason := ReasonSessionUnrecognized
 	if bound {
 		reason = ReasonSessionBound
 	}
-	rt.audit.Deny(r.Context(), id, up.name, reason)
-	http.Error(rec, "session not found", proxy.StatusOf(proxy.ErrSessionNotFound))
-	return nil, false
+	return deny(proxy.StatusOf(proxy.ErrSessionNotFound), "session not found",
+		denied(ex.identity, ex.up.name, reason))
 }
 
 // recordSession binds a session the upstream just minted to the identity that

@@ -80,6 +80,10 @@ func (rt *Router) recoverPanic(rec *responseRecorder, r *http.Request) {
 		"stack", string(debug.Stack()),
 	)
 	if !rec.wroteHeader {
-		http.Error(rec, "internal server error", http.StatusInternalServerError)
+		// The panic may have escaped before the request reached a pipeline
+		// step, so there is no exchange to answer on. One is assembled here
+		// rather than writing the refusal directly, so [Router.answer] stays
+		// the only place a refusal reaches the wire.
+		rt.answer(&exchange{rec: rec, r: r}, refuse(http.StatusInternalServerError, "internal server error"))
 	}
 }

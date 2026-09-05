@@ -18,15 +18,21 @@ The router dispatches in a fixed order, after the origin check:
 
 ## Request Pipeline
 
-An `/mcp/<name>` request moves through these gates in order, inside panic recovery:
+Panic recovery is outermost. Inside it the origin check runs, then routing. Origin validation guards every path tailgate serves rather than upstreams alone, which is why it sits ahead of routing rather than in the pipeline: a present `Origin` must normalize to the canonical Funnel origin, and denials audit the upstream name only when the path already resolved to a configured one, keeping attacker-chosen path segments out of the audit log.
 
-1. **Origin validation.** A present `Origin` must normalize to the canonical Funnel origin. Denials audit the upstream name only when the path already resolved to a configured one, keeping attacker-chosen path segments out of the audit log.
-2. **Authentication.** The bearer token is extracted and verified against the upstream's canonical resource URI.
-3. **Authorization.** The policy decision, audited on every allow and deny.
-4. **Session claim.** If the caller presented `Mcp-Session-Id` and the transport does not manage its own sessions, the binding table checks it.
-5. **Body limit.** The body is buffered rather than wrapped, so an overflow answers `413` instead of surfacing mid-stream. Running after authorization keeps auth decisions independent of the body.
-6. **Protocol checks.** The revision is parsed from `MCP-Protocol-Version` and, for the header-mirroring era, the mirrored headers are validated against the body. This runs last so an unauthenticated caller learns nothing about the upstream's protocol shape from a mismatch refusal.
-7. **Dispatch.** The request is cloned with the identity injected into context, credentials stripped, and `URL.Path` reset to `/`. The upstream never sees the `/mcp/<name>` prefix.
+A request that resolves to an upstream then enters the pipeline: an ordered slice of steps in `internal/router`, each returning either nothing or a refusal that ends the request. `newPipeline` is the order and `TestPipelineOrder` pins it.
+
+- **Authentication** extracts the bearer token and verifies it against the upstream's canonical resource URI.
+- **Authorization** runs the policy decision, audited on every allow and deny.
+- **Session claim** refuses a repeated `Mcp-Session-Id` outright, and checks a single one against the binding table when the caller presented one and the transport does not manage its own sessions.
+- **Body limit** buffers the body rather than wrapping it, so an overflow answers `413` instead of surfacing mid-stream.
+- **Protocol checks** parse the revision from `MCP-Protocol-Version` and, for the header-mirroring era, validate the mirrored headers against the body.
+
+Dispatch runs last, once every step above has returned nothing. The request is cloned with the identity injected into context, credentials stripped, and `URL.Path` reset to `/`, so the upstream never sees the `/mcp/<name>` prefix.
+
+Two of those positions carry a security argument nothing else enforces, and `TestAuthenticationPrecedesEveryOtherCheck` holds them by driving every later step's refusal at an unauthenticated caller. Body limiting follows authentication, so a caller who never authenticates never has a body buffered on its behalf, and no authentication decision can turn on a body the caller chose. Protocol validation follows authentication, so an unauthenticated caller learns nothing about the upstream's protocol era from a mismatch refusal. Protocol validation also follows body limiting, because it reads the body that step buffered.
+
+A refusal is a single value. It carries its status, its body, and the authorization decision to record, where one was reached. `Router.answer` is the only place one is written, so a decision a refusal carries can never be dropped before the response goes out. Its body format follows from its status: see [JSON-RPC Refusals](security.md#json-rpc-refusals).
 
 ## Token Verification
 
