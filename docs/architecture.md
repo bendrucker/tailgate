@@ -103,7 +103,7 @@ For the header-mirroring era, `ValidateMirrored` parses the JSON-RPC envelope an
 
 ## Startup and Shutdown
 
-`main` runs a forced sequence: load config, join the tailnet, seed resource URLs from the joined FQDN, build the token store and the authorization server over the node's `WhoIs`, assemble the router, then serve Funnel. Nothing serves until every step succeeds.
+`main` loads the config and configures the tailnet node, then hands the node to `serve`, which runs a forced sequence: join the tailnet, seed resource URLs from the joined FQDN, build the token store and the authorization server over the node's `WhoIs`, assemble the router, then serve Funnel. Nothing serves until every step succeeds. `serve` takes the node as a `tsnetserver.Node`, so the sequence and the shutdown that reverses it run without a control server.
 
 The join is bounded, because tsnet reprints a login URL forever for a node that cannot authenticate and an unbounded wait under launchd looks healthy while serving nothing. [deploying.md](deploying.md#startup-failures) covers the windows and the other startup checks.
 
