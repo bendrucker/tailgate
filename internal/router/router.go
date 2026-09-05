@@ -2,12 +2,13 @@
 //
 // # Pipeline
 //
-// Every request runs the same sequence, and each step must pass before the
-// next observes anything: recover, Origin validation, routing, token
-// extraction, verification, authorization, session binding, body limiting,
-// protocol validation, and finally dispatch to the upstream's proxy.Transport.
-// Authorization precedes dispatch unconditionally, so a Transport never sees
-// an unauthenticated request and never spawns work for one.
+// Panic recovery is outermost, then the Origin check, then routing. A request
+// that resolves to an upstream passes an ordered slice of steps, each of which
+// must pass before the next observes anything, and dispatch to the upstream's
+// proxy.Transport is what survives them. [newPipeline] is the order and states
+// what each position turns on. Authorization is one of those steps, so a
+// Transport never sees an unauthenticated request and never spawns work for
+// one.
 //
 // # Protocol revisions
 //
@@ -215,6 +216,11 @@ type Router struct {
 	maxBody    int64
 	sessions   *sessionBindings
 	logger     *slog.Logger
+
+	// origin guards every path tailgate serves, so it runs ahead of routing
+	// rather than as part of the upstream pipeline.
+	origin   step
+	pipeline []step
 }
 
 // upstream is one configured route with its precomputed audience.
@@ -279,7 +285,7 @@ func New(opts Options) (*Router, error) {
 		logger = slog.Default()
 	}
 
-	return &Router{
+	rt := &Router{
 		upstreams:  upstreams,
 		resources:  opts.Resources,
 		metadata:   opts.Metadata,
@@ -292,7 +298,10 @@ func New(opts Options) (*Router, error) {
 		maxBody:    maxBody,
 		sessions:   newSessionBindings(opts.MaxSessions, opts.SessionTTL, opts.Clock),
 		logger:     logger,
-	}, nil
+	}
+	rt.origin = originStep{rt}
+	rt.pipeline = newPipeline(rt)
+	return rt, nil
 }
 
 // Server returns an http.Server serving h with the header-phase limits every
@@ -404,19 +413,14 @@ func (rt *Router) Close() error {
 
 func (rt *Router) route(rec *responseRecorder, r *http.Request) {
 	name, routed := upstreamName(r.URL)
-	up, ok := rt.upstreams[name]
+	ex := &exchange{rec: rec, r: r, up: rt.upstreams[name]}
 
-	if !rt.originAllowed(r) {
-		// The audit record names an upstream only once the path resolved to a
-		// configured one. The segment is caller-supplied, so auditing it
-		// unresolved would let an unauthenticated client write arbitrary values
-		// into the decision log.
-		refused := ""
-		if ok {
-			refused = up.name
-		}
-		rt.audit.Deny(r.Context(), auth.Identity{}, refused, ReasonOriginNotAllowed)
-		http.Error(rec, "forbidden origin", http.StatusForbidden)
+	// The origin check guards every path tailgate serves, not upstreams alone,
+	// so it runs here rather than in the pipeline. The upstream is resolved
+	// first all the same, because a denial audits the name only when the path
+	// named a configured one.
+	if ref := rt.origin.check(ex); ref != nil {
+		rt.answer(ex, ref)
 		return
 	}
 
@@ -455,58 +459,35 @@ func (rt *Router) route(rec *responseRecorder, r *http.Request) {
 		return
 	}
 
-	if !routed || !ok {
+	if !routed || ex.up == nil {
 		// Unrouted requests are the internet's background noise, so they are
 		// not audit decisions: nothing was authorized or refused. They log at
 		// Info because the alternative is a client probing paths tailgate does
 		// not serve, which is invisible at any lower level and is exactly how a
 		// client that guesses its endpoints fails.
 		rt.logger.Info("no route", "method", r.Method, "path", r.URL.EscapedPath())
-		http.Error(rec, "not found", proxy.StatusOf(proxy.ErrUnknownUpstream))
+		rt.answer(ex, refuse(proxy.StatusOf(proxy.ErrUnknownUpstream), "not found"))
 		return
 	}
-	rt.serveUpstream(rec, r, up)
-}
-
-func (rt *Router) serveUpstream(rec *responseRecorder, r *http.Request, up *upstream) {
-	id, ok := rt.authenticate(rec, r, up)
-	if !ok {
-		return
-	}
-
-	decision := rt.authorizer.Authorize(id, up.name)
-	rt.audit.Record(r.Context(), decision)
-	if !decision.Allow {
-		http.Error(rec, "forbidden", http.StatusForbidden)
-		return
-	}
-
-	release, ok := rt.claimSession(rec, r, up, id)
-	if !ok {
-		return
-	}
-	defer release()
-	body, ok := rt.limitBody(rec, r)
-	if !ok {
-		return
-	}
-	if !rt.checkProtocol(rec, r, up, body) {
-		return
-	}
-	rt.dispatch(rec, r, up, id)
+	rt.serveUpstream(ex)
 }
 
 // dispatch hands the request to the transport with the caller's credentials
 // removed and their identity moved into the context, which is the only channel
 // an upstream can trust.
-func (rt *Router) dispatch(rec *responseRecorder, r *http.Request, up *upstream, id auth.Identity) {
-	if up.bindSessions {
-		rec.onHeader = func(status int, header http.Header) {
+func (rt *Router) dispatch(ex *exchange) {
+	if ex.up.bindSessions {
+		// The callback outlives the request the recorder holds it for, and a
+		// stream can hold it open for the life of a session. Capturing the
+		// fields rather than the exchange keeps the buffered body out of what
+		// stays reachable for that whole time.
+		r, up, id := ex.r, ex.up, ex.identity
+		ex.rec.onHeader = func(status int, header http.Header) {
 			rt.recordSession(r, up, id, status, header)
 		}
 	}
 
-	outbound := r.Clone(auth.WithIdentity(r.Context(), id))
+	outbound := ex.r.Clone(auth.WithIdentity(ex.r.Context(), ex.identity))
 	proxy.StripRequest(outbound)
 	outbound.URL.Path = "/"
 	outbound.URL.RawPath = ""
@@ -516,7 +497,7 @@ func (rt *Router) dispatch(rec *responseRecorder, r *http.Request, up *upstream,
 	outbound.URL.RawQuery = ""
 	outbound.URL.ForceQuery = false
 
-	up.transport.ServeHTTP(rec, outbound)
+	ex.up.transport.ServeHTTP(ex.rec, outbound)
 }
 
 // isMetadataPath reports whether the request addresses the RFC 9728 well-known
