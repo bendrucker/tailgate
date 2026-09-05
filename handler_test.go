@@ -25,7 +25,6 @@ import (
 const (
 	testFQDN     = "tailgate.example.ts.net"
 	testPort     = 443
-	testIssuer   = "https://idp.example.ts.net"
 	testOrigin   = "https://tailgate.example.ts.net"
 	testUpstream = "docs"
 	testResource = "https://tailgate.example.ts.net/mcp/docs"
@@ -35,7 +34,7 @@ const (
 )
 
 // fakeVerifier resolves the tokens the test registers, standing in for the
-// issuer the real verifier introspects against.
+// token store the authorization server fills.
 type fakeVerifier struct {
 	mu         sync.Mutex
 	identities map[string]auth.Identity
@@ -83,7 +82,6 @@ func testHandler(t *testing.T, respond http.HandlerFunc) (http.Handler, *fakeVer
 
 	cfg := &config.Config{
 		Node: config.Node{Hostname: "tailgate", Port: testPort},
-		OIDC: config.OIDC{Issuer: testIssuer},
 		Upstreams: []config.Upstream{
 			{Name: testUpstream, Transport: config.TransportHTTP, URL: upstream.URL},
 		},
@@ -149,8 +147,8 @@ func TestHandlerServesMetadata(t *testing.T) {
 	if doc.Resource != testResource {
 		t.Errorf("expected resource %s, got %s", testResource, doc.Resource)
 	}
-	// The document names tailgate, not the issuer: clients obtain tokens from the
-	// facade, which is the only authorization surface reachable from off-tailnet.
+	// tailgate is its own authorization server, so the document names its
+	// origin and nothing else.
 	if diff := cmp.Diff([]string{testOrigin}, doc.AuthorizationServers); diff != "" {
 		t.Errorf("authorization servers differ:\n%s", diff)
 	}

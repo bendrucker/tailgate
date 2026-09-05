@@ -1,10 +1,10 @@
 # tailgate
 
-tailgate fronts [Model Context Protocol](https://modelcontextprotocol.io) servers behind Tailscale. It embeds a Tailscale node with [tsnet](https://tailscale.com/kb/1244/tsnet), exposes itself over [Funnel](https://tailscale.com/kb/1223/funnel), authenticates every request against a [tsidp](https://tailscale.com/docs/features/tsidp) OIDC token, and forwards only authorized calls to the MCP servers behind it. The name is the job: it stops identities tailgating their way into servers you exposed to the internet on purpose.
+tailgate fronts [Model Context Protocol](https://modelcontextprotocol.io) servers behind Tailscale. It embeds a Tailscale node with [tsnet](https://tailscale.com/kb/1244/tsnet), exposes itself over [Funnel](https://tailscale.com/kb/1223/funnel), issues the OAuth tokens its clients present, and forwards only authorized calls to the MCP servers behind it. It stops identities tailgating their way into servers you exposed to the internet on purpose.
 
 ## Status
 
-tailgate works end to end and fronts the author's own MCP servers for Claude and other clients. It is pre-1.0 because tsidp, which Tailscale ships as experimental, may still change its token claims and app-capability schema, and those changes can require lockstep changes here.
+tailgate works end to end and fronts the author's own MCP servers for Claude and other clients. It is pre-1.0 because the [Client ID Metadata Document](https://datatracker.ietf.org/doc/draft-ietf-oauth-client-id-metadata-document/) draft and MCP's authorization specification are still moving, and a change there can require a change here.
 
 ## How It Works
 
@@ -12,12 +12,13 @@ tailgate works end to end and fronts the author's own MCP servers for Claude and
 flowchart LR
   client[MCP client] -->|HTTPS via Funnel| edge[Tailscale edge]
   edge -->|relayed TCP| tg[tailgate node]
-  tg -->|OAuth endpoints, introspection| idp[tsidp]
+  person[browser on the tailnet] -->|/authorize| tg
+  tg -->|fetches client metadata| origin[client's origin]
   tg -->|/mcp/github| u1[HTTP MCP server]
   tg -->|/mcp/files| u2[stdio MCP server]
 ```
 
-The Funnel edge relays encrypted TCP and TLS terminates inside tailgate, on a listener whose certificate `tsnet` obtains for the node. tailgate answers an unauthenticated request with a `401` naming the metadata and scopes the client needs. It validates the bearer token by [RFC 7662](https://www.rfc-editor.org/rfc/rfc7662) introspection against tsidp over the tailnet, checks that the token's audience names the requested upstream, and applies the configured policy. It logs every allow and deny, and strips the client's token before forwarding. Clients that assume OAuth lives at the MCP origin rather than reading the discovery document, claude.ai among them, get an authorization server fronted there too.
+The Funnel edge relays encrypted TCP and TLS terminates inside tailgate, on a listener whose certificate `tsnet` obtains for the node. tailgate answers an unauthenticated request with a `401` naming the metadata and scopes the client needs, and it is the authorization server that metadata points at. A client identifies itself with a Client ID Metadata Document, so nothing is registered and no secret exists anywhere. The person approving the client does so on a consent page reached from a device on the tailnet, where the connection itself says who they are. The tokens tailgate issues live in its memory. On every request it looks the bearer token up, checks that the token's audience names the requested upstream, and applies the configured policy. It logs every allow and deny, and strips the client's token before forwarding.
 
 tailgate speaks every MCP revision from [2024-11-05](https://modelcontextprotocol.io/specification/2024-11-05) through [2026-07-28](https://modelcontextprotocol.io/specification/2026-07-28), resolving each request's revision from its `MCP-Protocol-Version` header, because it controls neither the clients it serves nor the servers it fronts.
 
@@ -44,9 +45,6 @@ tailgate reads a [HuJSON](https://github.com/tailscale/hujson) file, the same fo
     // Optional. Tagging moves the node's identity into policy and turns off
     // key expiry along with it. See Deployment.
     // "tags": ["tag:tailgate"],
-  },
-  "oidc": {
-    "issuer": "https://idp.example.ts.net",
   },
   "upstreams": [
     { "name": "github", "transport": "http", "url": "http://127.0.0.1:9000/mcp" },

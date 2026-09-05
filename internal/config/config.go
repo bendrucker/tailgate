@@ -32,7 +32,6 @@ var funnelPorts = map[int]bool{443: true, 8443: true, 10000: true}
 // Config is the parsed tailgate configuration.
 type Config struct {
 	Node      Node       `json:"node"`
-	OIDC      OIDC       `json:"oidc"`
 	Upstreams []Upstream `json:"upstreams"`
 	Policy    []Rule     `json:"policy"`
 	// Favicon is the path to an icon image served at /favicon.ico, along with
@@ -48,12 +47,10 @@ type Node struct {
 	StateDir string `json:"state_dir"`
 	Port     int    `json:"port"`
 	// Tailnet is the MagicDNS suffix the node joins under, such as
-	// "example-name.ts.net". Setting it makes every canonical resource URI
-	// derivable without contacting the control server, which is what lets the
-	// tsidp grant be generated and reviewed before tailgate ever runs. It is
-	// also checked against the name the join actually reports, so a node that
-	// lands on a different name than the grant was written for fails to serve
-	// rather than serving URIs no grant covers.
+	// "example-name.ts.net". Setting it pins the name the node must join
+	// under. Every canonical resource URI is built from that name, and a
+	// client's tokens carry it as their audience, so a node that lands on a
+	// different name fails to serve.
 	Tailnet string `json:"tailnet,omitempty"`
 
 	// Tags are the ACL tags the node advertises when it joins, such as
@@ -71,11 +68,6 @@ func (n Node) FQDN() string {
 		return ""
 	}
 	return n.Hostname + "." + n.Tailnet
-}
-
-// OIDC configures the tsidp issuer whose tokens tailgate validates.
-type OIDC struct {
-	Issuer string `json:"issuer"`
 }
 
 // Upstream is one MCP server tailgate fronts, addressed at /mcp/<name>.
@@ -112,11 +104,9 @@ type Rule struct {
 }
 
 // Match is a single allow condition. An identity matches when every non-empty
-// field equals the corresponding claim from token introspection. tsidp's
-// introspection response carries sub, username, scope, and email (the last
-// only when the token was granted the email scope), so arbitrary claim
-// matches are limited to those until tsidp exposes extra claims there, and
-// email rules require clients to request the email scope.
+// field equals the corresponding claim on the token. A token carries sub (the
+// tailnet user's decimal ID), email (the login name), name, scope, client_id,
+// and aud, so arbitrary claim matches are limited to those.
 type Match struct {
 	Subject string            `json:"sub,omitempty"`
 	Email   string            `json:"email,omitempty"`
@@ -207,12 +197,9 @@ func (c *Config) Validate() error {
 	if !funnelPorts[c.Node.Port] {
 		return fmt.Errorf("config: node.port %d is not a Funnel port (443, 8443, 10000)", c.Node.Port)
 	}
-	if c.OIDC.Issuer == "" {
-		return fmt.Errorf("config: oidc.issuer is required")
-	}
 	// The suffix joins the hostname to form a bare host, so anything that
 	// would make the result something other than one host would mint resource
-	// URIs no grant could match.
+	// URIs no client could be configured with.
 	if c.Node.Tailnet != "" && strings.ContainsAny(c.Node.Tailnet, "/:?# ") {
 		return fmt.Errorf("config: node.tailnet %q must be a bare DNS suffix", c.Node.Tailnet)
 	}
@@ -230,7 +217,7 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("config: upstream name is required")
 		}
 		// The name becomes a single path segment of the canonical resource
-		// URI, matched byte-for-byte against grants and routes. Anything
+		// URI, matched byte-for-byte against token audiences and routes. Anything
 		// outside this set (slashes, dots, URL metacharacters, uppercase)
 		// would mint an aliased, unroutable, or divergently escaped URI.
 		if !upstreamName.MatchString(u.Name) {

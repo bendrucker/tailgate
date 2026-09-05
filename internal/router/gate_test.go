@@ -133,7 +133,7 @@ func TestVerifierOutageIsUnavailableWithoutChallenge(t *testing.T) {
 		err  error
 	}{
 		{name: "issuer unreachable", err: auth.ErrUnavailable},
-		{name: "wrapped unavailable", err: fmt.Errorf("%w: introspection load shed", auth.ErrUnavailable)},
+		{name: "wrapped unavailable", err: fmt.Errorf("%w: token store unavailable", auth.ErrUnavailable)},
 		{name: "unclassified verifier failure", err: errors.New("boom")},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

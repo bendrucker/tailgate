@@ -5,10 +5,6 @@
     "state_dir": "/var/lib/tailgate",
     "port": 443, // Funnel: 443, 8443, or 10000
   },
-  "oidc": {
-    // tsidp issuer for this tailnet
-    "issuer": "https://idp.tail-scale.ts.net",
-  },
   "upstreams": [
     {
       "name": "github",

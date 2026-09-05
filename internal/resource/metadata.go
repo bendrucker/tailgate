@@ -16,25 +16,22 @@ import (
 // for them.
 var bearerMethodsSupported = []string{"header"}
 
-// scopesSupported are the scopes a client must request for tailgate to
-// authorize it. tsidp omits email from introspection unless the token carries
-// the email scope, and the shipped email-allowlist policy then denies every
-// request from that client, so email is advertised as required rather than
-// optional.
+// scopesSupported are the scopes a client may request. Both are advertised so
+// a client that mirrors the challenge asks for what the shipped email-allowlist
+// policy matches on.
 var scopesSupported = []string{"openid", "email"}
 
 // scopesRequired are the scopes a token must carry to reach any upstream. It is
 // empty, and adding to it excludes clients rather than protecting anything.
 //
-// Requiring a scope is not an access boundary here. The issuer filters a token
-// request against a fixed list of scopes it understands and applies no per-user
-// or per-client narrowing, so any registered client can ask for a scope and be
-// granted it. The only thing a requirement buys is a refusal that names what
-// the caller lacks.
+// Requiring a scope is not an access boundary here. The authorization server
+// grants any supported scope to any client the person approves, with no
+// per-user or per-client narrowing, so the only thing a requirement buys is a
+// refusal that names what the caller lacks.
 //
 // It costs more than that. A policy matching on sub works against a client that
-// requests no scope at all, since introspection always carries sub, and that is
-// the shape a policy takes precisely to avoid depending on a client's scope
+// requests no scope at all, since every token carries sub, and that is the
+// shape a policy takes precisely to avoid depending on a client's scope
 // request. Requiring email would deny those callers at the verifier, below the
 // policy that was written to accommodate them.
 //
@@ -58,7 +55,7 @@ func SupportedScopes() []string {
 // Metadata is one upstream's RFC 9728 protected-resource metadata document.
 // Resource is the byte-exact canonical URI from URLs.ResourceURL, which is
 // also the resource value the client sends on the token request and the aud
-// value tsidp grants.
+// value the token carries.
 type Metadata struct {
 	Resource               string   `json:"resource"`
 	AuthorizationServers   []string `json:"authorization_servers"`

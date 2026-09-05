@@ -32,7 +32,6 @@ func TestLoad(t *testing.T) {
 	}
 	want := &Config{
 		Node: Node{Hostname: "tailgate", StateDir: "/var/lib/tailgate", Port: 443},
-		OIDC: OIDC{Issuer: "https://idp.tail-scale.ts.net"},
 		Upstreams: []Upstream{
 			{Name: "github", Transport: "http", URL: "http://127.0.0.1:9000/mcp"},
 		},
@@ -48,7 +47,6 @@ func TestLoad(t *testing.T) {
 func TestValidateRejectsNonFunnelPort(t *testing.T) {
 	c := &Config{
 		Node: Node{Hostname: "tailgate", Port: 8080},
-		OIDC: OIDC{Issuer: "https://idp.tail-scale.ts.net"},
 	}
 	if err := c.Validate(); err == nil {
 		t.Fatal("expected error for non-Funnel port")
@@ -58,7 +56,6 @@ func TestValidateRejectsNonFunnelPort(t *testing.T) {
 func TestValidateRejectsUnknownPolicyUpstream(t *testing.T) {
 	c := &Config{
 		Node:   Node{Hostname: "tailgate", Port: 443},
-		OIDC:   OIDC{Issuer: "https://idp.tail-scale.ts.net"},
 		Policy: []Rule{{Upstream: "ghost"}},
 	}
 	if err := c.Validate(); err == nil {
@@ -91,7 +88,6 @@ func TestValidateRejectsFailOpenPolicy(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			c := &Config{
 				Node:      Node{Hostname: "tailgate", Port: 443},
-				OIDC:      OIDC{Issuer: "https://idp.tail-scale.ts.net"},
 				Upstreams: []Upstream{{Name: "github", Transport: "http", URL: "http://127.0.0.1:9000/mcp"}},
 				Policy:    []Rule{{Upstream: "github", Allow: tc.allow}},
 			}
@@ -122,7 +118,6 @@ func TestValidateRejectsUnevaluableClaimCondition(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			c := &Config{
 				Node:      Node{Hostname: "tailgate", Port: 443},
-				OIDC:      OIDC{Issuer: "https://idp.tail-scale.ts.net"},
 				Upstreams: []Upstream{{Name: "github", Transport: "http", URL: "http://127.0.0.1:9000/mcp"}},
 				Policy:    []Rule{{Upstream: "github", Allow: []Match{tc.match}}},
 			}
@@ -150,7 +145,6 @@ func TestValidateRejectsUpstreamName(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			c := &Config{
 				Node:      Node{Hostname: "tailgate", Port: 443},
-				OIDC:      OIDC{Issuer: "https://idp.tail-scale.ts.net"},
 				Upstreams: []Upstream{{Name: tc.upstream, Transport: "http", URL: "http://127.0.0.1:9000/mcp"}},
 			}
 			if err := c.Validate(); err == nil {
@@ -165,7 +159,6 @@ func TestLoadRejectsUnknownFields(t *testing.T) {
 	// would leave an empty match that allows every identity.
 	raw := `{
 		"node": {"hostname": "tailgate", "state_dir": "/tmp", "port": 443},
-		"oidc": {"issuer": "https://idp.tail-scale.ts.net"},
 		"upstreams": [{"name": "github", "transport": "http", "url": "http://127.0.0.1:9000/mcp"}],
 		"policy": [{"upstream": "github", "allow": [{"group": "eng"}]}],
 	}`
@@ -195,7 +188,6 @@ func TestValidateNodeTags(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			c := &Config{
 				Node: Node{Hostname: "tailgate", Port: 443, Tags: tc.tags},
-				OIDC: OIDC{Issuer: "https://idp.tail-scale.ts.net"},
 			}
 			if err := c.Validate(); (err != nil) != tc.wantErr {
 				t.Fatalf("Validate error = %v, wantErr %v", err, tc.wantErr)
@@ -260,7 +252,6 @@ func TestValidateStdioCredential(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			c := &Config{
 				Node:      Node{Hostname: "tailgate", Port: 443},
-				OIDC:      OIDC{Issuer: "https://idp.tail-scale.ts.net"},
 				Upstreams: []Upstream{tc.upstream},
 			}
 			if err := c.Validate(); (err != nil) != tc.wantErr {

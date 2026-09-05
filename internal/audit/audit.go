@@ -55,9 +55,8 @@ func (l *Logger) Record(ctx context.Context, d auth.Decision) {
 	if d.Allow {
 		outcome, level = OutcomeAllow, slog.LevelInfo
 	}
-	// Identity.Claims is deliberately not logged: it is the raw introspection
-	// response, which carries scope and profile claims tailgate has no reason
-	// to retain in an audit record.
+	// Identity.Claims is deliberately not logged: it carries scope and profile
+	// claims tailgate has no reason to retain in an audit record.
 	l.logger().LogAttrs(ctx, level, Message,
 		slog.String(KeyOutcome, outcome),
 		slog.String(KeySubject, d.Identity.Subject),

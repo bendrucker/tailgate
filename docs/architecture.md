@@ -9,7 +9,7 @@ The router dispatches in a fixed order, after the origin check:
 | Path | Handler |
 |---|---|
 | `/.well-known/oauth-protected-resource[/mcp/<name>]` | RFC 9728 protected-resource metadata (`internal/resource`) |
-| `/.well-known/oauth-authorization-server`, `/.well-known/openid-configuration`, `/authorize`, `/token` | Authorization-server facade (`internal/authserver`) |
+| `/.well-known/oauth-authorization-server`, `/.well-known/openid-configuration`, `/authorize`, `/token` | Authorization server (`internal/authserver`) |
 | `/`, `/favicon.ico` | Root page and icon (`internal/site`) |
 | `/mcp/<name>` | The named upstream's transport, behind the full auth pipeline |
 | anything else | `404`, logged but not audited, since no authorization decision was made |
@@ -30,20 +30,22 @@ An `/mcp/<name>` request moves through these gates in order, inside panic recove
 
 ## Token Verification
 
-`auth.NewVerifier` discovers tsidp's introspection endpoint from `/.well-known/openid-configuration` and [pins it to the issuer's origin](security.md#trust-boundaries). It dials through the tsnet node's HTTP client, which lets tsidp authenticate tailgate by tailnet node identity with no stored secret.
-
-`Verify` rejects anything outside the [RFC 6750](https://www.rfc-editor.org/rfc/rfc6750) token grammar before contacting tsidp, serves positive and negative results from separate caches, collapses concurrent lookups of one token into a single introspection call, and gates introspection at 64 concurrent calls.
+`auth.Tokens` holds every access and refresh token tailgate has issued, in memory, keyed by the SHA-256 digest of the token. `Verify` is a lookup. It rejects anything outside the [RFC 6750](https://www.rfc-editor.org/rfc/rfc6750) token grammar, an unknown or expired token, a token whose audience is not the requested upstream's canonical URI, and one missing a required scope. Access tokens live an hour and refresh tokens thirty days. Each table holds 16,384 entries and evicts the oldest when full, and a restart empties both.
 
 The authorizer walks the upstream's rules in configured order and the first matching `allow` entry wins. Conditions within an entry are conjunctive.
 
-## Authorization-Server Facade
+## Authorization Server
 
-Some clients, claude.ai among them, never read the RFC 9728 discovery document and assume the authorization server shares the MCP server's origin. `internal/authserver` serves those endpoints at tailgate's own origin, and the protected-resource metadata points spec-following clients at the same place, since tsidp's own `/authorize` refuses requests over Funnel.
+tailgate issues the tokens its own resources accept. `internal/authserver` serves the OAuth endpoints at tailgate's origin, which is where the protected-resource metadata sends a spec-following client and where a client that assumes same-origin OAuth, claude.ai among them, looks first.
 
-- `/.well-known/oauth-authorization-server` and `/.well-known/openid-configuration` serve the same [RFC 8414](https://www.rfc-editor.org/rfc/rfc8414) document, since clients probe either name. It advertises tailgate's own `/authorize` and `/token`, S256 PKCE, and resource indicators.
-- `/authorize` is a `302` to tsidp with the query preserved. It cannot be a proxy: tsidp identifies the authorizing person by the connection's tailnet identity, which proxying would replace with tailgate's own.
-- `/token` is a bounded reverse proxy over the tailnet.
-- `/register` is absent. tsidp resolves its app-capability grant from the caller's tailnet identity, so a proxied registration would arrive as tailgate's node and couple serving any traffic to an `allow_dcr` grant on it. Clients register tailnet-side instead.
+- `/.well-known/oauth-authorization-server` and `/.well-known/openid-configuration` serve the same [RFC 8414](https://www.rfc-editor.org/rfc/rfc8414) document, since clients probe either name. It advertises `/authorize` and `/token`, the `code` response type, the authorization-code and refresh-token grants, no client authentication, S256 PKCE, resource indicators, and Client ID Metadata Document support.
+- A client's `client_id` is an HTTPS URL. `internal/cimd` fetches the document there, through an egress-guarded client that refuses every non-global address and both tailnet ranges, follows no redirects, and caps the document at 16 KiB. The document must name the same `client_id`, list at least one redirect URI, and carry no secret. Documents cache for the lifetime their origin asks for, clamped between a minute and a day, and a failed fetch is never cached.
+- `GET /authorize` answers only a connection from a tailnet peer, whose address the node resolves to a user with `WhoIs`. A Funnel connection carries no peer address, so a public browser gets a page saying to open the link from a tailnet device. The request must name a registered redirect URI, an S256 challenge, supported scopes, and a configured upstream's canonical URI as its `resource`. The consent page names the client, the host publishing its document, the redirect host, the upstream, and the person, and holds a pending entry for ten minutes.
+- `POST /authorize` is the consent decision. It identifies the peer again, refuses a different person, and on approval mints a single-use code that lives five minutes and is bound to the client, redirect URI, challenge, scopes, resource, and identity.
+- `POST /token` redeems a code against its PKCE verifier and issues an access and refresh pair, or rotates a refresh token. A replayed code revokes the pair it first issued. A refresh token presented by another client is consumed and refused. Any `client_secret` is refused, since no client has one.
+- `/register` is absent. CIMD is the registration mechanism.
+
+Every table is in memory and capped: pending authorizations, codes, redeemed codes, and tokens. Restarting tailgate forgets them all, and clients recover through the ordinary `401`.
 
 ## `proxy.Transport`
 
@@ -101,7 +103,7 @@ For the header-mirroring era, `ValidateMirrored` parses the JSON-RPC envelope an
 
 ## Startup and Shutdown
 
-`main` runs a forced sequence: load config, join the tailnet, seed resource URLs from the joined FQDN, build the verifier on the tsnet HTTP client, assemble the router, then serve Funnel. Nothing serves until every step succeeds.
+`main` runs a forced sequence: load config, join the tailnet, seed resource URLs from the joined FQDN, build the token store and the authorization server over the node's `WhoIs`, assemble the router, then serve Funnel. Nothing serves until every step succeeds.
 
 The join is bounded, because tsnet reprints a login URL forever for a node that cannot authenticate and an unbounded wait under launchd looks healthy while serving nothing. [deploying.md](deploying.md#startup-failures) covers the windows and the other startup checks.
 
