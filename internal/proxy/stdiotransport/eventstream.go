@@ -4,13 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"net/http"
-	"time"
 )
-
-// keepAliveInterval is how often a quiet subscription stream emits an SSE
-// comment. Intermediaries and client idle timeouts close a connection that
-// says nothing, and a subscription is silent whenever nothing has changed.
-const keepAliveInterval = 30 * time.Second
 
 // errStreamClosed reports a client that is no longer reading the stream.
 var errStreamClosed = errors.New("stdiotransport: subscription stream closed")

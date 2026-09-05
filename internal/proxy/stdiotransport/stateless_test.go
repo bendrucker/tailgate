@@ -4,20 +4,49 @@ import (
 	"bufio"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
-	"strconv"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/bendrucker/tailgate/internal/audit"
+	"github.com/bendrucker/tailgate/internal/auth"
 	"github.com/bendrucker/tailgate/internal/protocol"
 	"github.com/google/go-cmp/cmp"
 )
 
 const stateless = string(protocol.Rev20260728)
+
+// acknowledgement is the notification a conforming child sends first on a
+// subscription, which is what opens it.
+const acknowledgement = `{"jsonrpc":"2.0","method":"notifications/subscriptions/acknowledged","params":{}}`
+
+// heldSubscriptions answers like the echo server, except on subscriptions/
+// listen: that request is acknowledged with the notification the revision
+// requires and then held, since the response to it is what ends the
+// subscription rather than what opens it.
+//
+// The acknowledgement is also what a client waits on. Nothing is written to a
+// stream that has said nothing, so a caller's POST does not return until the
+// child has spoken.
+type heldSubscriptions struct{ *heldRequests }
+
+func holdingSubscriptions() *heldSubscriptions {
+	return &heldSubscriptions{holding(listenMethod)}
+}
+
+func (h *heldSubscriptions) answer(c *scriptedChild, msg message) {
+	if msg.Method != listenMethod {
+		echoServer(c, msg)
+		return
+	}
+	c.emit(acknowledgement)
+	h.held <- msg
+}
 
 // statelessBody is a request as a stateless client sends it: no session, and
 // its protocol version restated in the params _meta.
@@ -61,9 +90,11 @@ func TestStatelessRequest(t *testing.T) {
 
 // A stateless client has no session to carry an id space, so nothing stops two
 // concurrent requests from both calling themselves id 1. Each must still get
-// its own answer.
+// its own answer, and the child answers them here in the reverse of the order
+// it received them.
 func TestStatelessConcurrentRequestsReuseOneID(t *testing.T) {
-	h := newHarness(t, Options{})
+	held := holding("tools/call")
+	h := newScriptedHarness(t, Options{}, held.answer)
 
 	const requests = 8
 	var wait sync.WaitGroup
@@ -72,8 +103,7 @@ func TestStatelessConcurrentRequestsReuseOneID(t *testing.T) {
 		wait.Add(1)
 		go func() {
 			defer wait.Done()
-			echo := fmt.Sprintf("echo-%d", i)
-			body := statelessBody(1, "tools/call", fmt.Sprintf(`{"echo":%q,"delay_ms":%d}`, echo, (requests-i)*5))
+			body := statelessBody(1, "tools/call", fmt.Sprintf(`{"echo":"echo-%d"}`, i))
 			response := h.do(t, call{subject: "alice", protocol: stateless, body: body})
 			defer response.Body.Close()
 			if response.StatusCode != http.StatusOK {
@@ -87,6 +117,16 @@ func TestStatelessConcurrentRequestsReuseOneID(t *testing.T) {
 			result, _ := message["result"].(map[string]any)
 			echoes[i], _ = result["echo"].(string)
 		}()
+	}
+
+	child := h.children.next(t)
+	inflight := make([]message, 0, requests)
+	for range requests {
+		inflight = append(inflight, held.next(t))
+	}
+	slices.Reverse(inflight)
+	for _, msg := range inflight {
+		child.result(msg, fmt.Sprintf(`{"echo":%q}`, echoParam(msg)))
 	}
 	wait.Wait()
 
@@ -122,6 +162,45 @@ func TestStatelessChildIsPerIdentity(t *testing.T) {
 	}
 	if count := h.transport.perIdentity["alice"]; count != 1 {
 		t.Errorf("alice's two requests cost %d children, expected 1", count)
+	}
+}
+
+// TestStatelessChildRecoversFromARemovedSession covers what a child that dies
+// before it is published leaves behind. Unregistering it cannot delete a name
+// the starting request has not yet written, so the entry outlives the session,
+// and the next caller finds one whose session is already gone. It must start a
+// fresh child rather than adopt a dead one.
+func TestStatelessChildRecoversFromARemovedSession(t *testing.T) {
+	h := newHarness(t, Options{})
+	identity := auth.Identity{Subject: "alice"}
+
+	dead, err := h.transport.statelessSession(t.Context(), identity)
+	if err != nil {
+		t.Fatalf("start the first child: %v", err)
+	}
+	dead.finish()
+	h.children.next(t)
+
+	stale := &statelessChild{ready: make(chan struct{}), s: dead}
+	close(stale.ready)
+	h.transport.mu.Lock()
+	dead.removed = true
+	h.transport.stateless[identity.Subject] = stale
+	h.transport.mu.Unlock()
+
+	live, err := h.transport.statelessSession(t.Context(), identity)
+	if err != nil {
+		t.Fatalf("recover from a removed child: %v", err)
+	}
+	defer live.finish()
+	if live == dead {
+		t.Fatal("the caller was handed the session that had already been removed")
+	}
+
+	h.transport.mu.Lock()
+	defer h.transport.mu.Unlock()
+	if entry := h.transport.stateless[identity.Subject]; entry == stale {
+		t.Error("the stale entry outlived the child it named")
 	}
 }
 
@@ -280,37 +359,47 @@ func TestUnsupportedRevisionAnswersInJSONRPC(t *testing.T) {
 func TestStatelessHandshakeAcrossEras(t *testing.T) {
 	for _, tc := range []struct {
 		name    string
-		refusal string
+		answers bool
+		refusal int
 		status  int
 	}{
 		{
 			name:    "child that answers the probe is left alone",
-			refusal: fakeChildDiscoverAnswers,
+			answers: true,
 			status:  http.StatusOK,
 		},
 		{
 			name:    "child that reports the method unknown gets initialize",
-			refusal: strconv.Itoa(codeMethodNotFound),
+			refusal: codeMethodNotFound,
 			status:  http.StatusOK,
 		},
 		{
 			name:    "child that reports invalid params gets initialize",
-			refusal: strconv.Itoa(codeInvalidParams),
+			refusal: codeInvalidParams,
 			status:  http.StatusOK,
 		},
 		{
 			name:    "child that reports a code JSON-RPC does not define gets initialize",
-			refusal: strconv.Itoa(codeUndefined),
+			refusal: codeUndefined,
 			status:  http.StatusOK,
 		},
 		{
 			name:    "child that refuses with a revision code is unavailable",
-			refusal: strconv.Itoa(protocol.CodeUnsupportedProtocolVersion),
+			refusal: protocol.CodeUnsupportedProtocolVersion,
 			status:  http.StatusBadGateway,
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			h := newHarness(t, Options{Env: []string{fakeChildDiscover + "=" + tc.refusal}})
+			h := newScriptedHarness(t, Options{}, func(c *scriptedChild, msg message) {
+				switch {
+				case msg.Method != discoverMethod:
+					echoServer(c, msg)
+				case tc.answers:
+					c.result(msg, `{"protocolVersions":["2026-07-28"],"serverInfo":{"name":"scripted-stdio-server","version":"0.0.1"}}`)
+				default:
+					c.failure(msg, tc.refusal, "Refused")
+				}
+			})
 			response := h.do(t, call{subject: "alice", protocol: stateless, body: statelessBody(1, "tools/list", "")})
 			defer response.Body.Close()
 
@@ -324,6 +413,20 @@ func TestStatelessHandshakeAcrossEras(t *testing.T) {
 			result, _ := message["result"].(map[string]any)
 			if method, _ := result["method"].(string); method != "tools/list" {
 				t.Errorf("expected the caller's own request to reach the child, got %v", result)
+			}
+
+			child := h.children.next(t)
+			handshake := []string{discoverMethod}
+			if !tc.answers {
+				handshake = append(handshake, initializeMethod, "notifications/initialized")
+			}
+			handshake = append(handshake, "tools/list")
+			var sent []string
+			for _, msg := range child.messagesSent() {
+				sent = append(sent, msg.Method)
+			}
+			if diff := cmp.Diff(handshake, sent); diff != "" {
+				t.Errorf("unexpected handshake (-want +got):\n%s", diff)
 			}
 		})
 	}
@@ -353,14 +456,22 @@ func TestStatelessProbeCarriesMeta(t *testing.T) {
 // The child acknowledges with a notification and answers the request only to
 // end the subscription, so a transport that waited for that answer before
 // writing any headers would hold every conforming child past the deadline and
-// then refuse it. The timeout here is far shorter than the stream lives.
+// then refuse it. The timeout here is far shorter than the stream lives, and
+// the child answers nothing until the assertions below are done.
 func TestStatelessSubscriptionStream(t *testing.T) {
-	h := newHarness(t, Options{RequestTimeout: 500 * time.Millisecond})
+	held := holdingSubscriptions()
+	h := newScriptedHarness(t, Options{RequestTimeout: 50 * time.Millisecond}, held.answer)
 
-	body := statelessBody("listen-1", listenMethod, `{"echo":"tick","notify":3}`)
-	response := h.do(t, call{subject: "alice", protocol: stateless, body: body})
+	body := statelessBody("listen-1", listenMethod, "")
+	responses := make(chan *http.Response, 1)
+	go func() {
+		responses <- h.do(t, call{subject: "alice", protocol: stateless, body: body})
+	}()
+	child := h.children.next(t)
+	listen := held.next(t)
+
+	response := <-responses
 	defer response.Body.Close()
-
 	if response.StatusCode != http.StatusOK {
 		t.Fatalf("expected 200, got %d", response.StatusCode)
 	}
@@ -369,6 +480,10 @@ func TestStatelessSubscriptionStream(t *testing.T) {
 	}
 	if buffering := response.Header.Get("X-Accel-Buffering"); buffering != "no" {
 		t.Errorf("expected buffering disabled for intermediaries, got %q", buffering)
+	}
+
+	for i := range 3 {
+		child.notify(i, "tick")
 	}
 
 	events := readEvents(t, response, 4)
@@ -384,27 +499,42 @@ func TestStatelessSubscriptionStream(t *testing.T) {
 			t.Errorf("expected notification %d, got %v", i, params["seq"])
 		}
 	}
+
+	t.Run("the child's answer ends the stream under the caller's own id", func(t *testing.T) {
+		child.result(listen, `{"ended":true}`)
+		final := readEvents(t, response, 1)[0]
+		if id, _ := final["id"].(string); id != "listen-1" {
+			t.Errorf("expected the final result to carry the caller's id, got %v", final["id"])
+		}
+		result, _ := final["result"].(map[string]any)
+		if ended, _ := result["ended"].(bool); !ended {
+			t.Errorf("expected the child's closing result, got %v", final)
+		}
+	})
 }
 
-// The child answers the listen request to end the subscription, and that answer
-// closes the stream carrying the caller's own id rather than the minted one it
-// was correlated on.
-func TestStatelessSubscriptionEnds(t *testing.T) {
-	h := newHarness(t, Options{RequestTimeout: 500 * time.Millisecond})
+// A quiet subscription says something on its own, since intermediaries and
+// client idle timeouts close a connection that does not.
+func TestSubscriptionStreamKeepsItselfAlive(t *testing.T) {
+	held := holding(listenMethod)
+	h := newScriptedHarness(t, Options{KeepAliveInterval: 5 * time.Millisecond}, held.answer)
 
-	body := statelessBody("listen-1", listenMethod, `{"echo":"tick","notify":1,"end":true}`)
+	body := statelessBody("listen-1", listenMethod, "")
 	response := h.do(t, call{subject: "alice", protocol: stateless, body: body})
 	defer response.Body.Close()
+	held.next(t)
 
-	events := readEvents(t, response, 3)
-	final := events[2]
-	if id, _ := final["id"].(string); id != "listen-1" {
-		t.Errorf("expected the final result to carry the caller's id, got %v", final["id"])
-	}
-	result, _ := final["result"].(map[string]any)
-	if ended, _ := result["ended"].(bool); !ended {
-		t.Errorf("expected the child's closing result, got %v", final)
-	}
+	comments := make(chan struct{})
+	go func() {
+		defer close(comments)
+		scanner := bufio.NewScanner(response.Body)
+		for scanner.Scan() {
+			if scanner.Text() == ":" {
+				return
+			}
+		}
+	}()
+	awaitClose(t, comments, "the quiet stream to emit a keep-alive comment")
 }
 
 // readEvents reads count SSE data events off an open stream. A stream that
@@ -427,7 +557,7 @@ func readEvents(t *testing.T, response *http.Response, count int) []map[string]a
 			t.Fatalf("read %d of %d events: %v", len(got.events), count, got.err)
 		}
 		return got.events
-	case <-time.After(10 * time.Second):
+	case <-time.After(testDeadline):
 		response.Body.Close()
 		t.Fatalf("stream produced fewer than %d events", count)
 		return nil
@@ -466,7 +596,8 @@ func scanEvents(response *http.Response, count int) ([]map[string]any, error) {
 // host's goroutines and connections against every other caller.
 func TestSubscriptionStreamsAreCappedPerChild(t *testing.T) {
 	const capacity = 4
-	h := newHarness(t, Options{MaxSessions: capacity, IdleTimeout: time.Hour})
+	held := holdingSubscriptions()
+	h := newScriptedHarness(t, Options{MaxSessions: capacity, IdleTimeout: time.Hour}, held.answer)
 	// The default client caps its own connections well below what this opens.
 	client := &http.Client{Transport: &http.Transport{MaxIdleConnsPerHost: 128}}
 	t.Cleanup(client.CloseIdleConnections)
@@ -541,26 +672,35 @@ func TestSubscriptionStreamsAreCappedPerChild(t *testing.T) {
 }
 
 // A child that goes away takes its streams with it, which is the other way a
-// slot comes back: the handlers holding them are released by the registry
-// emptying rather than by their callers.
+// slot comes back: the handlers holding them are released by the child's
+// output ending rather than by their callers.
 func TestChildExitReleasesSubscriptionSlots(t *testing.T) {
-	h := newHarness(t, Options{IdleTimeout: time.Hour})
-	response := h.do(t, call{subject: "alice", protocol: stateless, body: statelessBody(1, listenMethod, "")})
+	held := holdingSubscriptions()
+	h := newScriptedHarness(t, Options{IdleTimeout: time.Hour}, held.answer)
+
+	responses := make(chan *http.Response, 1)
+	go func() {
+		responses <- h.do(t, call{subject: "alice", protocol: stateless, body: statelessBody(1, listenMethod, "")})
+	}()
+	child := h.children.next(t)
+	held.next(t)
+
+	response := <-responses
 	defer response.Body.Close()
 	if response.StatusCode != http.StatusOK {
 		t.Fatalf("expected the stream to open, got %d", response.StatusCode)
 	}
-	waitFor(t, "the stream to register", func() bool { return h.transport.listenerCount() == 1 })
-
-	h.transport.mu.Lock()
-	var child *session
-	for _, s := range h.transport.sessions {
-		child = s
+	if count := h.transport.listenerCount(); count != 1 {
+		t.Fatalf("expected the stream to be registered, got %d", count)
 	}
-	h.transport.mu.Unlock()
-	h.transport.removeSession(child)
 
-	waitFor(t, "the child's exit to release its streams", func() bool {
-		return h.transport.listenerCount() == 0
-	})
+	child.Kill()
+	// The stream ends when the handler returns, which is after it has
+	// unregistered the listener it held.
+	if _, err := io.ReadAll(response.Body); err != nil {
+		t.Fatalf("read the ended stream: %v", err)
+	}
+	if count := h.transport.listenerCount(); count != 0 {
+		t.Errorf("the child's exit left %d streams registered", count)
+	}
 }

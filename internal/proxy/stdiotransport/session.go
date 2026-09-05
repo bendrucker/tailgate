@@ -1,15 +1,11 @@
 package stdiotransport
 
 import (
-	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
-	"os"
-	"os/exec"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -18,48 +14,22 @@ import (
 	"github.com/bendrucker/tailgate/internal/proxy"
 )
 
-// maxLineBytes bounds one JSON-RPC message read from the child. A child that
-// emits a longer line ends its own session rather than growing tailgate's heap
-// without limit.
-const maxLineBytes = 4 << 20
-
 // errDuplicateRequestID rejects a second in-flight request reusing a live
 // JSON-RPC id, which would let one request steal another's response. Every id
 // correlated on is minted here, so no caller can reach this: it is the
 // invariant the minting upholds.
 var errDuplicateRequestID = errors.New("stdiotransport: duplicate in-flight JSON-RPC id")
 
-// errStdinBlocked reports a child that is alive but has stopped reading its
-// stdin, so the pipe buffer filled and the write hit its deadline. It ends the
-// session: the child cannot serve anything later either, and the framing of
-// whatever partially reached it is already broken.
-var errStdinBlocked = fmt.Errorf("%w: stdio child stopped reading stdin", proxy.ErrUpstreamTimeout)
-
-// session is one MCP session and the child process serving it. The session id
-// is bound to the identity that created it: the child is that caller's, and no
-// other caller can reach it.
+// session is one MCP session and the child serving it. The session id is bound
+// to the identity that created it: the child is that caller's, and no other
+// caller can reach it.
 type session struct {
 	id      string
 	subject string
-	grace   time.Duration
 	logger  *slog.Logger
 
-	cmd *exec.Cmd
-	// stdin is the write end of a pipe this package creates itself, rather
-	// than exec.Cmd.StdinPipe, because only an *os.File exposes the write
-	// deadline that bounds send.
-	stdin  *os.File
-	pipes  sync.WaitGroup
+	child  Child
 	exited chan struct{}
-
-	writeMu sync.Mutex
-
-	// killMu guards reaped, which records that cmd.Wait has collected the
-	// child. Signaling is unsafe from that moment: the kill path targets the
-	// process group by raw pid, and the pid is free for the OS to hand to an
-	// unrelated process.
-	killMu sync.Mutex
-	reaped bool
 
 	mu      sync.Mutex
 	pending map[string]chan []byte
@@ -83,38 +53,11 @@ type session struct {
 	removed bool
 }
 
-// spawn starts the child and its pipe readers. The caller owns supervision:
-// nothing reaps the process until the transport starts it.
-func (t *Transport) spawn(id string, subject string) (_ *session, err error) {
-	cmd := exec.Command(t.options.Command, t.options.Args...)
-	cmd.Dir = t.options.Dir
-	cmd.Env = t.childEnv()
-	isolateProcessGroup(cmd)
-	if t.options.UID != 0 {
-		if err := runAs(cmd, t.options.UID, t.options.GID); err != nil {
-			return nil, err
-		}
-	}
-
-	stdinRead, stdin, err := os.Pipe()
-	if err != nil {
-		return nil, err
-	}
-	cmd.Stdin = stdinRead
-	defer func() {
-		// The parent's copy of the read end goes once the child holds its own,
-		// or closing stdin never reaches the child as EOF.
-		stdinRead.Close()
-		if err != nil {
-			stdin.Close()
-		}
-	}()
-
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		return nil, err
-	}
-	stderr, err := cmd.StderrPipe()
+// spawn starts the child and the goroutine draining its output. The caller owns
+// supervision: nothing reaps the child until the transport starts it.
+func (t *Transport) spawn(id string, subject string) (*session, error) {
+	logger := t.logger.With("session", id, "sub", subject)
+	child, err := t.options.StartChild(logger)
 	if err != nil {
 		return nil, err
 	}
@@ -122,68 +65,33 @@ func (t *Transport) spawn(id string, subject string) (_ *session, err error) {
 	s := &session{
 		id:        id,
 		subject:   subject,
-		grace:     t.shutdownGrace,
-		logger:    t.logger.With("session", id, "sub", subject),
-		cmd:       cmd,
-		stdin:     stdin,
+		logger:    logger,
+		child:     child,
 		exited:    make(chan struct{}),
 		pending:   make(map[string]chan []byte),
 		listeners: make(map[int64]*listener),
 	}
 	s.touch()
-
-	if err := cmd.Start(); err != nil {
-		return nil, t.startError(err)
-	}
-
-	// Both pipes must reach EOF before cmd.Wait runs, or Wait closes them out
-	// from under the readers.
-	s.pipes.Add(2)
-	go func() {
-		defer s.pipes.Done()
-		// The child's output is the only source a subscription stream has, so
-		// its end is theirs: the handlers holding them are released here rather
-		// than left waiting on a channel nothing will write to again.
-		defer s.closeAllListeners()
-		if err := s.readMessages(stdout); err != nil {
-			// Nothing can correlate a response any more, so the session is
-			// over. Leaving it registered would strand every later request on
-			// the request timeout and hold the caller's cap slot.
-			s.logger.Warn("stdio child output ended in error", "err", err)
-			t.removeSession(s)
-		}
-	}()
-	go func() {
-		defer s.pipes.Done()
-		s.logStderr(stderr)
-	}()
+	go t.readChild(s)
 	return s, nil
 }
 
-// startError names the cause a configured uid makes likely and the error text
-// does not: changing a child's uid is privileged, and a tailgate that does not
-// hold that privilege can never start this upstream. The upstream is
-// unavailable rather than uncontained, since nothing falls back to tailgate's
-// own uid.
-func (t *Transport) startError(err error) error {
-	if t.options.UID == 0 {
-		return err
+// readChild fans the child's output out to the requests waiting on it, and
+// ends the session when that output ends in error: nothing can correlate a
+// response any more, so leaving the session registered would strand every later
+// request on the request timeout and hold the caller's cap slot.
+func (t *Transport) readChild(s *session) {
+	// The child's output is the only source a subscription stream has, so its
+	// end is theirs: the handlers holding them are released here rather than
+	// left waiting on a channel nothing will write to again.
+	defer s.closeAllListeners()
+	for line := range s.child.Messages() {
+		s.deliver(line)
 	}
-	return fmt.Errorf("start as uid %d gid %d, which requires privilege tailgate may not hold: %w", t.options.UID, t.options.GID, err)
-}
-
-// readMessages fans the child's newline-delimited output out to the requests
-// waiting on it. It returns nil at EOF and the scan error otherwise, which
-// ends the session: a child past maxLineBytes or a broken pipe leaves the
-// stream unframed, so no later message can be trusted to be a whole one.
-func (s *session) readMessages(stdout io.Reader) error {
-	scanner := bufio.NewScanner(stdout)
-	scanner.Buffer(make([]byte, 0, 64<<10), maxLineBytes)
-	for scanner.Scan() {
-		// Scanner reuses its buffer, so the delivered response must be a copy.
-		s.deliver(append([]byte(nil), scanner.Bytes()...))
+	if err := s.child.Err(); err != nil {
+		s.logger.Warn("stdio child output ended in error", "err", err)
+		t.removeSession(s)
 	}
-	return scanner.Err()
 }
 
 func (s *session) deliver(line []byte) {
@@ -217,22 +125,6 @@ func (s *session) deliver(line []byte) {
 	s.mu.Unlock()
 	if !ok {
 		s.logger.Debug("stdio child answered an unknown request id")
-	}
-}
-
-func (s *session) logStderr(stderr io.Reader) {
-	scanner := bufio.NewScanner(stderr)
-	scanner.Buffer(make([]byte, 0, 4<<10), maxLineBytes)
-	for scanner.Scan() {
-		s.logger.Debug("stdio child stderr", "line", scanner.Text())
-	}
-	if err := scanner.Err(); err != nil {
-		// Past maxLineBytes nothing further can be framed as a line, but the
-		// child goes on writing, and a pipe no one drains stops it on its next
-		// write with the session otherwise healthy. Reading the rest away costs
-		// the diagnostics and keeps the child running.
-		s.logger.Warn("stdio child stderr ended in error", "err", err)
-		_, _ = io.Copy(io.Discard, stderr)
 	}
 }
 
@@ -383,67 +275,19 @@ func (s *session) exchange(ctx context.Context, msg message, timeout time.Durati
 	}
 }
 
-// send frames one message onto the child's stdin, bounded by timeout. A child
-// that stops reading fills the pipe buffer, and an unbounded write there would
-// hold the request, the caller's cap slot, and shutdown behind a process that
-// is never coming back.
 func (s *session) send(line []byte, timeout time.Duration) error {
-	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
-	if err := s.stdin.SetWriteDeadline(time.Now().Add(timeout)); err != nil {
-		return fmt.Errorf("%w: bound write to stdio child: %v", proxy.ErrUpstreamUnavailable, err)
-	}
-	if _, err := s.stdin.Write(append(line, '\n')); err != nil {
-		if errors.Is(err, os.ErrDeadlineExceeded) {
-			return errStdinBlocked
-		}
-		return fmt.Errorf("%w: write to stdio child: %v", proxy.ErrUpstreamUnavailable, err)
-	}
-	return nil
+	return s.child.Send(line, timeout)
 }
 
-// terminate ends the session's child: stdin closes so a well-behaved server
-// exits on its own, and the process group is killed if it does not.
+// terminate ends the session's child, once however many callers reach it.
 func (s *session) terminate() {
-	s.terminateOnce.Do(func() {
-		go func() {
-			_ = s.stdin.Close()
-			select {
-			case <-s.exited:
-			case <-time.After(s.grace):
-				s.logger.Warn("stdio child ignored stdin close, killing process group")
-				s.killChild()
-			}
-		}()
-	})
+	s.terminateOnce.Do(s.child.Terminate)
 }
 
 // kill ends the child now, skipping the grace period terminate allows.
 func (s *session) kill() {
 	s.terminateOnce.Do(func() {})
-	_ = s.stdin.Close()
-	s.killChild()
-}
-
-// killChild signals the child's process group unless the child has already
-// been reaped, since its pid may since belong to something else. Holding
-// killMu across the check and the signal is what leaves no window between
-// them.
-func (s *session) killChild() {
-	s.killMu.Lock()
-	defer s.killMu.Unlock()
-	if s.reaped {
-		return
-	}
-	killProcessGroup(s.cmd.Process)
-}
-
-// markReaped records that cmd.Wait has collected the child, retiring its pid
-// as a signal target.
-func (s *session) markReaped() {
-	s.killMu.Lock()
-	defer s.killMu.Unlock()
-	s.reaped = true
+	s.child.Kill()
 }
 
 func (s *session) touch() { s.lastUsed.Store(time.Now().UnixNano()) }

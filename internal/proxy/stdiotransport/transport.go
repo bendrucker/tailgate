@@ -7,6 +7,15 @@
 // here spawns a process, the caps and lifecycles live per identity: one caller
 // cannot exhaust the host for others.
 //
+// # The child
+//
+// A child is reached through the Child interface: send a message, receive
+// messages, wait for the exit, end it. A configured upstream gets execChild,
+// which runs Options.Command in a process group of its own and under the uid
+// the upstream names. Options.StartChild replaces that constructor, so a test
+// drives a child answering in tailgate's own address space rather than one on
+// the far end of a pipe.
+//
 // # Two eras of caller
 //
 // What a child is addressed by depends on the revision the request declares.
@@ -52,8 +61,6 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
-	"slices"
-	"strings"
 	"sync"
 	"time"
 
@@ -72,6 +79,9 @@ const (
 	DefaultIdleTimeout = 5 * time.Minute
 	// DefaultRequestTimeout bounds one JSON-RPC exchange with a child.
 	DefaultRequestTimeout = time.Minute
+	// DefaultKeepAliveInterval is how often a quiet subscription stream says
+	// something, so nothing between tailgate and the client closes it.
+	DefaultKeepAliveInterval = 30 * time.Second
 )
 
 // AssumedProtocolVersion is the version a request without an
@@ -146,6 +156,27 @@ type Options struct {
 	// own: the session bindings it owns and the per-identity cap. A nil Audit
 	// still records, through the audit package's default logger.
 	Audit *audit.Logger
+	// KeepAliveInterval is how often a quiet subscription stream emits an SSE
+	// comment. Intermediaries and client idle timeouts close a connection that
+	// says nothing, and a subscription is silent whenever nothing has changed.
+	KeepAliveInterval time.Duration
+	// StartChild starts the child serving one session, defaulting to running
+	// Command as a process under the containment the fields above configure.
+	// Everything above the child is reachable through one that answers in
+	// tailgate's own address space, which is what a test supplies here.
+	StartChild StartChild
+}
+
+// execConfig is the child process this upstream's configuration names.
+func (o Options) execConfig() execConfig {
+	return execConfig{
+		Command: o.Command,
+		Args:    o.Args,
+		Env:     o.Env,
+		Dir:     o.Dir,
+		UID:     o.UID,
+		GID:     o.GID,
+	}
 }
 
 func (o Options) withDefaults() Options {
@@ -158,8 +189,14 @@ func (o Options) withDefaults() Options {
 	if o.RequestTimeout <= 0 {
 		o.RequestTimeout = DefaultRequestTimeout
 	}
+	if o.KeepAliveInterval <= 0 {
+		o.KeepAliveInterval = DefaultKeepAliveInterval
+	}
 	if o.Logger == nil {
 		o.Logger = slog.Default()
+	}
+	if o.StartChild == nil {
+		o.StartChild = startExec(o.execConfig())
 	}
 	return o
 }
@@ -171,8 +208,6 @@ type Transport struct {
 	logger  *slog.Logger
 	audit   *audit.Logger
 	drain   proxy.Drain
-
-	shutdownGrace time.Duration
 
 	reaperStopped chan struct{}
 	stop          chan struct{}
@@ -189,10 +224,6 @@ type Transport struct {
 	perIdentity map[string]int
 }
 
-// shutdownGrace is how long a child has to exit after its stdin closes before
-// its process group is killed.
-const shutdownGrace = 2 * time.Second
-
 // New returns a Transport that spawns opts.Command per MCP session.
 // Construction never spawns: a child that cannot start surfaces per-request as
 // 502.
@@ -202,7 +233,6 @@ func New(opts Options) *Transport {
 		options:       opts,
 		logger:        opts.Logger,
 		audit:         opts.Audit,
-		shutdownGrace: shutdownGrace,
 		reaperStopped: make(chan struct{}),
 		stop:          make(chan struct{}),
 		sessions:      make(map[string]*session),
@@ -439,7 +469,7 @@ func (t *Transport) serveInitialize(ctx context.Context, w http.ResponseWriter, 
 		return
 	}
 
-	t.logger.Info("stdio session established", "session", s.id, "sub", identity.Subject, "pid", s.cmd.Process.Pid)
+	t.logger.Info("stdio session established", "session", s.id, "sub", identity.Subject, "pid", s.child.Pid())
 	w.Header().Set(sessionHeader, s.id)
 	writeJSON(w, response)
 }
@@ -615,16 +645,9 @@ func (t *Transport) unregisterLocked(s *session) bool {
 // The cap slot is released here, once the child is known to be gone. Releasing
 // it at unregister instead would count registrations rather than processes, and
 // a caller looping initialize and DELETE could then hold live children well
-// past MaxSessions, since a terminated child has shutdownGrace to exit.
+// past MaxSessions, since a terminated child has a grace period to exit in.
 func (t *Transport) supervise(s *session) {
-	s.pipes.Wait()
-	err := s.cmd.Wait()
-	// The pid is the OS's to hand out again the moment Wait returns, so it is
-	// retired as a signal target before anything that can block: releaseSlot
-	// takes the transport's lock, and terminate's grace timer firing inside that
-	// window would signal a process group that is no longer the child's. Marking
-	// before the broadcast orders every waiter's view for the same reason.
-	s.markReaped()
+	err := s.child.Wait()
 	t.releaseSlot(s.subject)
 	close(s.exited)
 	t.removeSession(s)
@@ -734,43 +757,6 @@ func waitForExit(ctx context.Context, sessions []*session) error {
 		}
 	}
 	return nil
-}
-
-// scrubbedEnv names tailgate's tailnet auth key, which tsnet reads under both
-// spellings. It is the one secret in this environment that keeps working
-// wherever it is carried: a key that can join nodes to the tailnet outlives the
-// host it leaked from.
-var scrubbedEnv = []string{"TS_AUTHKEY", "TS_AUTH_KEY"}
-
-// childEnv passes tailgate's environment plus the upstream's additions, so a
-// child inherits PATH and HOME without every upstream restating them.
-//
-// The scrub removes the tailnet auth key and nothing else, and it is a denylist
-// because a child still needs the ordinary environment to run at all. It is not
-// a boundary: an upstream left at tailgate's uid reads the node state directory
-// and the config file whatever the environment says, and Options.UID is what
-// changes that. What the scrub buys either way is that the one long-lived
-// transportable credential tailgate holds is not handed to the child.
-//
-// An upstream's own Env is applied afterwards, since that is the operator
-// deliberately handing the child a value. Appending is also how it overrides
-// one: os/exec builds the child's environment keeping the last occurrence of
-// each name, so an upstream running under its own uid names its own HOME here
-// rather than inheriting tailgate's, which it cannot write.
-func (t *Transport) childEnv() []string {
-	parent := os.Environ()
-	env := make([]string, 0, len(parent)+len(t.options.Env))
-	for _, entry := range parent {
-		if !isScrubbed(entry) {
-			env = append(env, entry)
-		}
-	}
-	return append(env, t.options.Env...)
-}
-
-func isScrubbed(entry string) bool {
-	name, _, ok := strings.Cut(entry, "=")
-	return ok && slices.Contains(scrubbedEnv, name)
 }
 
 // newSessionID mints a session id that is cryptographically random and visible
