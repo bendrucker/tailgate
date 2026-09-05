@@ -123,13 +123,13 @@ func newFixture(t *testing.T) *fixture {
 	tokens := auth.NewTokens(auth.WithClock(clock.Now))
 	identify := &fakeIdentify{who: person()}
 	server, err := New(Options{
-		Resources: urls,
-		Upstreams: []string{testUpstream, "other"},
-		Tokens:    tokens,
-		Identify:  identify.identify,
-		Clients:   cimd.NewFetcher(clientOrigin.Client(), cimd.WithClock(clock.Now)),
-		Logger:    slog.New(slog.DiscardHandler),
-		Clock:     clock.Now,
+		Resources:   urls,
+		HasUpstream: func(name string) bool { return name == testUpstream || name == "other" },
+		Tokens:      tokens,
+		Identify:    identify.identify,
+		Clients:     cimd.NewFetcher(clientOrigin.Client(), cimd.WithClock(clock.Now)),
+		Logger:      slog.New(slog.DiscardHandler),
+		Clock:       clock.Now,
 	})
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -1084,10 +1084,11 @@ func TestNewRequiresCollaborators(t *testing.T) {
 		t.Fatal(err)
 	}
 	complete := Options{
-		Resources: urls,
-		Tokens:    auth.NewTokens(),
-		Identify:  (&fakeIdentify{}).identify,
-		Clients:   cimd.NewFetcher(http.DefaultClient),
+		Resources:   urls,
+		Tokens:      auth.NewTokens(),
+		Identify:    (&fakeIdentify{}).identify,
+		Clients:     cimd.NewFetcher(http.DefaultClient),
+		HasUpstream: func(string) bool { return true },
 	}
 	for _, tc := range []struct {
 		name string
@@ -1097,7 +1098,7 @@ func TestNewRequiresCollaborators(t *testing.T) {
 		{name: "tokens", edit: func(o *Options) { o.Tokens = nil }},
 		{name: "identify", edit: func(o *Options) { o.Identify = nil }},
 		{name: "clients", edit: func(o *Options) { o.Clients = nil }},
-		{name: "upstream name", edit: func(o *Options) { o.Upstreams = []string{"not valid"} }},
+		{name: "upstream check", edit: func(o *Options) { o.HasUpstream = nil }},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			opts := complete

@@ -107,4 +107,8 @@ For the header-mirroring era, `ValidateMirrored` parses the JSON-RPC envelope an
 
 The join is bounded, because tsnet reprints a login URL forever for a node that cannot authenticate and an unbounded wait under launchd looks healthy while serving nothing. [deploying.md](deploying.md#startup-failures) covers the windows and the other startup checks.
 
+## Reload
+
+The router is the one piece a configuration change rebuilds. `SIGHUP` loads the file again, refuses a changed `node` section, runs the same assembly the startup did, and swaps the new router in atomically behind the listener. The previous router drains and closes in the background under the shutdown deadline. The token store, the authorization server, and the client metadata cache sit outside the router and reach the current one through the reloader for their upstream check, so a reload never invalidates a token and a resource added by a reload is authorizable as soon as the swap lands. A reload that fails at any step is logged and leaves the previous router serving. [deploying.md](deploying.md#reloading) covers what an operator sees.
+
 Shutdown stops accepting connections, drains transports for up to 30 seconds so in-flight requests and open streams finish, gives remaining HTTP connections 10 more seconds, hard-closes what is left, then leaves the tailnet. The stdio transport's `Close` inverts the order and kills children first, since a request blocked on a child is released by that child's death.

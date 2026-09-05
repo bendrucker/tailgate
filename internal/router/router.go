@@ -374,6 +374,11 @@ func (rt *Router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	rt.route(rec, r)
 }
 
+func (rt *Router) HasUpstream(name string) bool {
+	_, ok := rt.upstreams[name]
+	return ok
+}
+
 // Shutdown drains every upstream transport concurrently and returns the first
 // error, or ctx's error if the drain deadline passes first.
 func (rt *Router) Shutdown(ctx context.Context) error {

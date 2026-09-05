@@ -106,9 +106,9 @@ func testHandler(t *testing.T, respond http.HandlerFunc) (http.Handler, *fakeVer
 
 	logger := discardLogger()
 	authServer, err := authserver.New(authserver.Options{
-		Resources: urls,
-		Upstreams: []string{testUpstream},
-		Tokens:    auth.NewTokens(),
+		Resources:   urls,
+		HasUpstream: func(name string) bool { return name == testUpstream },
+		Tokens:      auth.NewTokens(),
 		Identify: func(context.Context, netip.AddrPort) (*apitype.WhoIsResponse, error) {
 			return nil, errors.New("no tailnet in this test")
 		},

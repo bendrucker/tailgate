@@ -6,7 +6,10 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/bendrucker/tailgate/internal/audit"
@@ -48,6 +51,8 @@ type options struct {
 	// OpenLoginURL opens the interactive login URL in the default browser when
 	// the node joins without an auth key.
 	OpenLoginURL bool
+	// ConfigPath is the file cfg was loaded from, which a SIGHUP loads again.
+	ConfigPath string
 }
 
 // serve runs tailgate until ctx is canceled or the listener fails.
@@ -88,32 +93,49 @@ func serve(ctx context.Context, logger *slog.Logger, cfg *config.Config, opts op
 
 	// tailgate issues its own tokens, from memory. The store and the
 	// authorization server around it are built once here: they hold every
-	// token a client has, so nothing that reloads may rebuild them.
+	// token a client has, so a reload must never rebuild them. The router is
+	// what a reload rebuilds, and the authorization server reaches the current
+	// one through the reloader for its upstream check.
 	tokens := auth.NewTokens()
+	var routes *reloader
 	authServer, err := authserver.New(authserver.Options{
-		Resources: urls,
-		Upstreams: upstreamNames(cfg),
-		Tokens:    tokens,
-		Identify:  node.WhoIs,
-		Clients:   cimd.NewFetcher(cimd.NewClient()),
-		Logger:    logger,
+		Resources:   urls,
+		HasUpstream: func(name string) bool { return routes.HasUpstream(name) },
+		Tokens:      tokens,
+		Identify:    node.WhoIs,
+		Clients:     cimd.NewFetcher(cimd.NewClient()),
+		Logger:      logger,
 	})
 	if err != nil {
 		return err
 	}
 
-	rt, err := handler(cfg, urls, tokens, authServer, logger, audit.New(logger))
+	auditor := audit.New(logger)
+	routes, err = newReloader(opts.ConfigPath, cfg, func(cfg *config.Config) (served, error) {
+		rt, err := handler(cfg, urls, tokens, authServer, logger, auditor)
+		if err != nil {
+			return nil, err
+		}
+		return rt, nil
+	}, logger)
 	if err != nil {
 		return err
 	}
-	defer rt.Close()
+	defer routes.Close()
+
+	// SIGHUP's default disposition ends the process, so the handler is in
+	// place before anything serves.
+	hup := make(chan os.Signal, 1)
+	signal.Notify(hup, syscall.SIGHUP)
+	defer signal.Stop(hup)
+	go reloadOnSignal(ctx, hup, routes)
 
 	listener, err := node.ListenFunnel()
 	if err != nil {
 		return err
 	}
 
-	server := router.Server(rt)
+	server := router.Server(routes)
 	serving := make(chan error, 1)
 	go func() { serving <- server.Serve(listener) }()
 
@@ -128,7 +150,21 @@ func serve(ctx context.Context, logger *slog.Logger, cfg *config.Config, opts op
 		}
 		return err
 	case <-ctx.Done():
-		return drain(logger, node, server, rt)
+		return drain(logger, node, server, routes)
+	}
+}
+
+// A refused reload is logged by the reloader and leaves the running
+// configuration in service, so there is nothing for the loop to do with the
+// error.
+func reloadOnSignal(ctx context.Context, signals <-chan os.Signal, routes *reloader) {
+	for {
+		select {
+		case <-signals:
+			routes.Reload()
+		case <-ctx.Done():
+			return
+		}
 	}
 }
 

@@ -94,9 +94,11 @@ type Options struct {
 	// Resources mints the origin every endpoint lives on and the canonical
 	// resource URL each upstream's tokens are issued for.
 	Resources *resource.URLs
-	// Upstreams are the configured upstream names. A resource parameter must
-	// name one of them.
-	Upstreams []string
+	// HasUpstream reports whether a name is a configured upstream, which a
+	// resource parameter must name. It is consulted per request, since the
+	// upstream set changes under a configuration reload while the server,
+	// which holds every live token, does not.
+	HasUpstream func(name string) bool
 	// Tokens issues the access and refresh tokens.
 	Tokens *auth.Tokens
 	// Identify resolves the person behind a tailnet connection.
@@ -111,15 +113,15 @@ type Options struct {
 
 // Server is the authorization server. It is safe for concurrent use.
 type Server struct {
-	origin    string
-	resources *resource.URLs
-	upstreams map[string]bool
-	tokens    *auth.Tokens
-	identify  Identify
-	clients   *cimd.Fetcher
-	logger    *slog.Logger
-	now       func() time.Time
-	document  []byte
+	origin      string
+	resources   *resource.URLs
+	hasUpstream func(name string) bool
+	tokens      *auth.Tokens
+	identify    Identify
+	clients     *cimd.Fetcher
+	logger      *slog.Logger
+	now         func() time.Time
+	document    []byte
 
 	pending  *table[pendingAuthorization]
 	codes    *table[authorizationCode]
@@ -152,13 +154,8 @@ func New(opts Options) (*Server, error) {
 		return nil, errors.New("authserver: nil identify")
 	case opts.Clients == nil:
 		return nil, errors.New("authserver: nil client fetcher")
-	}
-	upstreams := make(map[string]bool, len(opts.Upstreams))
-	for _, name := range opts.Upstreams {
-		if err := resource.ValidateName(name); err != nil {
-			return nil, err
-		}
-		upstreams[name] = true
+	case opts.HasUpstream == nil:
+		return nil, errors.New("authserver: nil upstream check")
 	}
 	logger := opts.Logger
 	if logger == nil {
@@ -187,18 +184,18 @@ func New(opts Options) (*Server, error) {
 	}
 
 	return &Server{
-		origin:    origin,
-		resources: opts.Resources,
-		upstreams: upstreams,
-		tokens:    opts.Tokens,
-		identify:  opts.Identify,
-		clients:   opts.Clients,
-		logger:    logger,
-		now:       now,
-		document:  document,
-		pending:   newTable[pendingAuthorization](maxPending, pendingTTL, now),
-		codes:     newTable[authorizationCode](maxCodes, codeTTL, now),
-		redeemed:  newTable[auth.Issued](maxRedeemed, redeemedTTL, now),
+		origin:      origin,
+		resources:   opts.Resources,
+		hasUpstream: opts.HasUpstream,
+		tokens:      opts.Tokens,
+		identify:    opts.Identify,
+		clients:     opts.Clients,
+		logger:      logger,
+		now:         now,
+		document:    document,
+		pending:     newTable[pendingAuthorization](maxPending, pendingTTL, now),
+		codes:       newTable[authorizationCode](maxCodes, codeTTL, now),
+		redeemed:    newTable[auth.Issued](maxRedeemed, redeemedTTL, now),
 	}, nil
 }
 
@@ -208,7 +205,7 @@ func (s *Server) Handles(path string) bool {
 		return true
 	}
 	for _, prefix := range []string{MetadataPath, OpenIDMetadataPath} {
-		if name, ok := strings.CutPrefix(path, prefix+upstreamPathPrefix); ok && s.upstreams[name] {
+		if name, ok := strings.CutPrefix(path, prefix+upstreamPathPrefix); ok && s.hasUpstream(name) {
 			return true
 		}
 	}
@@ -248,16 +245,16 @@ func (s *Server) serveMetadata(w http.ResponseWriter, r *http.Request) {
 	w.Write(s.document)
 }
 
-// upstreamFor maps a resource parameter to the upstream it names, by exact
-// comparison against each canonical resource URL. Every resource string the
-// system issues comes from resource.URLs, so nothing is normalized here.
+// upstreamFor maps a resource parameter to the upstream it names. The prefix
+// cut only picks the candidate: the check is the exact comparison against
+// that upstream's canonical resource URL, since every resource string the
+// system issues comes from resource.URLs and nothing is normalized here.
 func (s *Server) upstreamFor(resourceURL string) (string, bool) {
-	for name := range s.upstreams {
-		if s.resources.ResourceURL(name) == resourceURL {
-			return name, true
-		}
+	name, ok := strings.CutPrefix(resourceURL, s.origin+upstreamPathPrefix)
+	if !ok || !s.hasUpstream(name) || s.resources.ResourceURL(name) != resourceURL {
+		return "", false
 	}
-	return "", false
+	return name, true
 }
 
 // writeOAuthError answers with the RFC 6749 section 5.2 error object.

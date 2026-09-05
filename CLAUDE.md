@@ -14,7 +14,7 @@ tailgate is a single Go binary that fronts MCP servers behind Tailscale Funnel, 
 - **Protocol revisions.** tailgate speaks every revision from `2024-11-05` through `2026-07-28` and chooses per request. It fronts servers and serves clients it does not control, so it can never cut over to a single revision. Every revision difference lives in `internal/protocol`.
 - **Routing.** Path prefix `/mcp/<name>`. Each upstream is a distinct protected resource whose audience is its canonical URI, and every resource string in the system comes from `resource.URLs`.
 - **Authorization.** Claim-match policy, limited to the claims a token carries.
-- **Config.** HuJSON. Reload is process restart for now.
+- **Config.** HuJSON. `SIGHUP` reloads it in place: upstreams, policy, and the favicon swap in behind a fresh router while the previous one drains, and the token store, authorization server, and CIMD cache stay put. The `node` section is fixed for the life of the process, since the tailnet node is joined once, and a reload that changes it is refused with the running configuration left serving.
 - **stdio upstreams.** One child process per MCP session for a stateful caller, one per identity for a stateless one, with a concurrency cap and idle reaping either way.
 - **Dependencies.** `go.mod` is the list and it stays short: adding one to an internet-facing binary needs a reason. Tokens are opaque lookups, so nothing is signed or parsed and no JOSE or JWT library belongs here.
 - **Naming.** No numbered phases or steps in code or names, and no catch-all packages. Descriptive functions called in sequence instead.
