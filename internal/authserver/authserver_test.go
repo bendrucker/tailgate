@@ -295,12 +295,15 @@ func TestAuthorizationCodeFlow(t *testing.T) {
 			t.Errorf("consent page does not show %q", want)
 		}
 	}
+	// Referrer-Policy is asserted exactly because tightening it to no-referrer
+	// nulls the Origin the consent form's POST carries, which the router then
+	// refuses. See renderPage.
 	for header, want := range map[string]string{
 		"Content-Type":            "text/html; charset=utf-8",
 		"Cache-Control":           "no-store",
 		"X-Content-Type-Options":  "nosniff",
 		"Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'",
-		"Referrer-Policy":         "no-referrer",
+		"Referrer-Policy":         "same-origin",
 	} {
 		if got := rec.Header().Get(header); got != want {
 			t.Errorf("%s = %q, want %q", header, got, want)

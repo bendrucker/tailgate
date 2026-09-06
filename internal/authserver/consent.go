@@ -65,7 +65,14 @@ func (s *Server) renderPage(w http.ResponseWriter, status int, name string, data
 	h.Set("Content-Length", strconv.Itoa(body.Len()))
 	h.Set("X-Content-Type-Options", "nosniff")
 	h.Set("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'")
-	h.Set("Referrer-Policy", "no-referrer")
+	// same-origin rather than no-referrer, which this page cannot use. Under
+	// no-referrer a browser serializes the Origin of a non-GET navigation as
+	// the opaque "null" rather than omitting it, so the consent form's own
+	// POST back to /authorize arrives at an origin check that refuses null and
+	// no one can ever approve a client. same-origin leaves the real Origin on
+	// that POST and still sends no referrer to the client's redirect_uri,
+	// which is what keeps the authorization request's parameters off the wire.
+	h.Set("Referrer-Policy", "same-origin")
 	w.WriteHeader(status)
 	w.Write(body.Bytes())
 }
