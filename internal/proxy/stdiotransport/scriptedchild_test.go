@@ -25,9 +25,9 @@ const (
 // in for the signal that ends a process.
 var errChildKilled = errors.New("scripted child killed")
 
-// scriptedChild is a Child that answers in the test's own process. What it
-// answers, and when, is the test's to decide, so a case that a real process
-// could only approximate with sleeps and polling states its ordering directly.
+// scriptedChild is a Child that answers in the test's own process, so a case a
+// real process could only approximate with sleeps and polling states its
+// ordering directly.
 type scriptedChild struct {
 	logger *slog.Logger
 	// answer handles one message the transport sent. It runs on a goroutine of
@@ -137,8 +137,7 @@ func (c *scriptedChild) endOutput(err error) {
 	close(c.messages)
 }
 
-// emit writes one message to the transport, and returns once it has been read.
-// A child whose output has ended writes nothing, as a dead process does.
+// A child whose output has ended emits nothing, as a dead process does.
 func (c *scriptedChild) emit(line string) {
 	c.outMu.Lock()
 	defer c.outMu.Unlock()
@@ -156,8 +155,6 @@ func (c *scriptedChild) failure(msg message, code int, text string) {
 	c.emit(fmt.Sprintf(`{"jsonrpc":"2.0","id":%s,"error":{"code":%d,"message":%q}}`, msg.ID, code, text))
 }
 
-// notify emits a server-initiated notification, which is what a subscription
-// stream carries.
 func (c *scriptedChild) notify(seq int, echo string) {
 	c.emit(fmt.Sprintf(`{"jsonrpc":"2.0","method":"notifications/message","params":{"seq":%d,"echo":%q}}`, seq, echo))
 }
@@ -184,8 +181,7 @@ func echoServer(c *scriptedChild, msg message) {
 	}
 }
 
-// echoParam reads the echo the caller asked to have reflected back, which is
-// what tells one request's answer from another's.
+// echoParam reads the echo that tells one request's answer from another's.
 func echoParam(msg message) string {
 	var envelope struct {
 		Params struct {
@@ -218,8 +214,6 @@ func (h *heldRequests) answer(c *scriptedChild, msg message) {
 	echoServer(c, msg)
 }
 
-// next returns the next held request, failing the test if the child is never
-// asked for one.
 func (h *heldRequests) next(t *testing.T) message {
 	t.Helper()
 	select {
@@ -231,11 +225,10 @@ func (h *heldRequests) next(t *testing.T) message {
 	}
 }
 
-// childScript starts scripted children and keeps every one in the order it
-// started them, so a test can drive the child a particular request spawned.
-//
-// The queue is unbounded, since a test that drives traffic rather than a
-// particular child takes none of them and a bounded one would stall the spawn.
+// childScript keeps every child it starts, in order, so a test can drive the
+// one a particular request spawned. The queue is unbounded: a test that drives
+// traffic rather than a particular child takes none of them, and a bounded one
+// would stall the spawn.
 type childScript struct {
 	answer   func(*scriptedChild, message)
 	startErr error
@@ -276,8 +269,6 @@ func (s *childScript) take() *scriptedChild {
 	return c
 }
 
-// next returns the child started for the next spawn, failing the test if
-// nothing spawns one.
 func (s *childScript) next(t *testing.T) *scriptedChild {
 	t.Helper()
 	deadline := time.After(testDeadline)
@@ -294,8 +285,7 @@ func (s *childScript) next(t *testing.T) *scriptedChild {
 	}
 }
 
-// startedCount reports how many children this upstream has spawned and the
-// test has not taken.
+// startedCount counts the children spawned but not yet taken.
 func (s *childScript) startedCount() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()

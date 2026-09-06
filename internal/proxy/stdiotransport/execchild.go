@@ -39,13 +39,11 @@ type execConfig struct {
 	Dir string
 	UID int
 	GID int
-	// Grace is how long the child has to exit after its stdin closes before its
-	// process group is killed.
+	// Grace overrides DefaultShutdownGrace.
 	Grace time.Duration
 }
 
-// startExec returns the constructor that runs cfg as an OS process, which is
-// what every configured stdio upstream gets.
+// startExec is the constructor every configured stdio upstream gets.
 func startExec(cfg execConfig) StartChild {
 	return func(logger *slog.Logger) (Child, error) { return cfg.start(logger) }
 }
@@ -79,7 +77,6 @@ type execChild struct {
 	reaped bool
 }
 
-// start spawns the child and the readers draining its pipes.
 func (cfg execConfig) start(logger *slog.Logger) (_ Child, err error) {
 	cmd := exec.Command(cfg.Command, cfg.Args...)
 	cmd.Dir = cfg.Dir
@@ -164,9 +161,7 @@ func (cfg execConfig) startError(err error) error {
 }
 
 // scanMessages splits the child's output into messages and sends each on out.
-// It returns nil at EOF and the scan error otherwise: a child past
-// maxLineBytes or a broken pipe leaves the stream unframed, so no later
-// message can be trusted to be a whole one.
+// It returns nil at EOF and the scan error otherwise.
 func scanMessages(stdout io.Reader, out chan<- []byte) error {
 	scanner := bufio.NewScanner(stdout)
 	scanner.Buffer(make([]byte, 0, 64<<10), maxLineBytes)
@@ -204,10 +199,9 @@ func (c *execChild) Pid() int {
 	return c.cmd.Process.Pid
 }
 
-// Send frames one message onto the child's stdin, bounded by timeout. A child
-// that stops reading fills the pipe buffer, and an unbounded write there would
-// hold the request, the caller's cap slot, and shutdown behind a process that
-// is never coming back.
+// Send writes to a pipe whose buffer a child that stopped reading has filled.
+// An unbounded write there would hold the request, the caller's cap slot, and
+// shutdown behind a process that is never coming back.
 func (c *execChild) Send(line []byte, timeout time.Duration) error {
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
@@ -257,9 +251,8 @@ func (c *execChild) Kill() {
 }
 
 // killGroup signals the child's process group unless the child has already
-// been reaped, since its pid may since belong to something else. Holding
-// killMu across the check and the signal is what leaves no window between
-// them.
+// been reaped, since its pid may since belong to something else. killMu is
+// held across the check and the signal so no window opens between them.
 func (c *execChild) killGroup() {
 	c.killMu.Lock()
 	defer c.killMu.Unlock()
@@ -269,8 +262,6 @@ func (c *execChild) killGroup() {
 	killProcessGroup(c.cmd.Process)
 }
 
-// markReaped records that cmd.Wait has collected the child, retiring its pid
-// as a signal target.
 func (c *execChild) markReaped() {
 	c.killMu.Lock()
 	defer c.killMu.Unlock()
@@ -286,18 +277,14 @@ var scrubbedEnv = []string{"TS_AUTHKEY", "TS_AUTH_KEY"}
 // environ passes tailgate's environment plus the upstream's additions, so a
 // child inherits PATH and HOME without every upstream restating them.
 //
-// The scrub removes the tailnet auth key and nothing else, and it is a denylist
-// because a child still needs the ordinary environment to run at all. It is not
-// a boundary: an upstream left at tailgate's uid reads the node state directory
-// and the config file whatever the environment says, and the configured uid is
-// what changes that. What the scrub buys either way is that the one long-lived
-// transportable credential tailgate holds is not handed to the child.
+// The scrub is a denylist because a child still needs the ordinary environment
+// to run at all, and it is not a boundary: an upstream left at tailgate's uid
+// reads the node state directory and the config file whatever the environment
+// says. The configured uid is what changes that.
 //
-// An upstream's own Env is applied afterwards, since that is the operator
-// deliberately handing the child a value. Appending is also how it overrides
-// one: os/exec builds the child's environment keeping the last occurrence of
-// each name, so an upstream running under its own uid names its own HOME here
-// rather than inheriting tailgate's, which it cannot write.
+// An upstream's own Env is appended last, which is also how it overrides an
+// inherited value: os/exec keeps the last occurrence of each name. An upstream
+// under its own uid names its own HOME that way.
 func (cfg execConfig) environ() []string {
 	parent := os.Environ()
 	env := make([]string, 0, len(parent)+len(cfg.Env))

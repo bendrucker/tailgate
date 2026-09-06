@@ -10,10 +10,7 @@ import (
 // gracefully or not.
 //
 // A configured stdio upstream is an OS process, and startExec is the
-// implementation every one of them gets. The interface is where the process
-// ends and the transport's own work begins: correlation, session lifecycle,
-// subscription streams, and the caps around them are all reachable through a
-// child that answers in the same address space.
+// implementation every one of them gets.
 type Child interface {
 	// Send frames one message onto the child's input, bounded by timeout. A
 	// child that has stopped reading fails the send with errStdinBlocked rather
@@ -25,9 +22,8 @@ type Child interface {
 	Messages() <-chan []byte
 
 	// Err reports why the output ended, and is meaningful once Messages has
-	// closed. Nil is the ordinary end of a child's output. Anything else leaves
-	// the stream unframed, so no later message could be trusted to be a whole
-	// one, which ends the session.
+	// closed. Anything but nil leaves the stream unframed, so no later message
+	// could be trusted to be a whole one, which ends the session.
 	Err() error
 
 	// Wait collects the exited child and reports how it exited. It returns only
@@ -35,9 +31,8 @@ type Child interface {
 	// the exit.
 	Wait() error
 
-	// Terminate ends the child by closing its input, so a well-behaved server
-	// exits on its own, and ends it the hard way if it does not. It returns
-	// without waiting for either.
+	// Terminate closes the child's input so a well-behaved server exits on its
+	// own, and ends it the hard way if it does not. It waits for neither.
 	Terminate()
 
 	// Kill ends the child now, skipping the grace period Terminate allows.
