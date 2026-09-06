@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"strings"
 	"testing"
+	"time"
 )
 
 func testLogger() *slog.Logger {
@@ -223,10 +224,26 @@ func TestExecConfigStartError(t *testing.T) {
 // configured without one must still bound how long a child that ignores its
 // stdin closing goes on running.
 func TestExecConfigGrace(t *testing.T) {
-	if grace := (execConfig{}).grace(); grace != DefaultShutdownGrace {
-		t.Errorf("grace = %v, want %v", grace, DefaultShutdownGrace)
-	}
-	if grace := (execConfig{Grace: 1}).grace(); grace != 1 {
-		t.Errorf("grace = %v, want the configured 1ns", grace)
+	for _, tc := range []struct {
+		name     string
+		cfg      execConfig
+		expected time.Duration
+	}{
+		{
+			name:     "an unconfigured grace takes the default",
+			cfg:      execConfig{},
+			expected: DefaultShutdownGrace,
+		},
+		{
+			name:     "a configured grace is kept",
+			cfg:      execConfig{Grace: time.Nanosecond},
+			expected: time.Nanosecond,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if grace := tc.cfg.grace(); grace != tc.expected {
+				t.Errorf("grace = %v, want %v", grace, tc.expected)
+			}
+		})
 	}
 }

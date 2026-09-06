@@ -40,12 +40,10 @@ func holdingSubscriptions() *heldSubscriptions {
 }
 
 func (h *heldSubscriptions) answer(c *scriptedChild, msg message) {
-	if msg.Method != listenMethod {
-		echoServer(c, msg)
-		return
+	if msg.Method == h.method {
+		c.emit(acknowledgement)
 	}
-	c.emit(acknowledgement)
-	h.held <- msg
+	h.heldRequests.answer(c, msg)
 }
 
 // statelessBody is a request as a stateless client sends it: no session, and

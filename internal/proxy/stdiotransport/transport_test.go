@@ -63,7 +63,7 @@ func newScriptedHarness(t *testing.T, options Options, answer func(*scriptedChil
 		options.StartChild = children.start
 	}
 	if options.Logger == nil {
-		options.Logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+		options.Logger = testLogger()
 	}
 	decisions := &auditCollector{}
 	options.Audit = audit.New(slog.New(decisions))
@@ -1136,7 +1136,7 @@ func TestCloseReleasesBackgroundWork(t *testing.T) {
 	children := newChildScript(echoServer)
 	transport := New(Options{
 		StartChild: children.start,
-		Logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Logger:     testLogger(),
 	})
 	gateway := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		identity := auth.Identity{Subject: r.Header.Get(subjectHeader)}

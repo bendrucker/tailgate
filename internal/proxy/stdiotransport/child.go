@@ -33,6 +33,11 @@ type Child interface {
 
 	// Terminate closes the child's input so a well-behaved server exits on its
 	// own, and ends it the hard way if it does not. It waits for neither.
+	//
+	// Terminate and Kill may be called any number of times and in any order.
+	// Callers reach them from the request path, the idle sweep, and shutdown at
+	// once, so an implementation guards its own teardown rather than leaving
+	// every caller to.
 	Terminate()
 
 	// Kill ends the child now, skipping the grace period Terminate allows.

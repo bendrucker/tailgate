@@ -46,8 +46,6 @@ type session struct {
 	lastUsed atomic.Int64
 	active   atomic.Int64
 
-	terminateOnce sync.Once
-
 	// removed is guarded by the owning Transport's mutex, which is what makes
 	// registration and teardown of a session that dies during spawn ordered.
 	removed bool
@@ -279,16 +277,9 @@ func (s *session) send(line []byte, timeout time.Duration) error {
 	return s.child.Send(line, timeout)
 }
 
-// terminate ends the session's child, once however many callers reach it.
-func (s *session) terminate() {
-	s.terminateOnce.Do(s.child.Terminate)
-}
+func (s *session) terminate() { s.child.Terminate() }
 
-// kill ends the child now, skipping the grace period terminate allows.
-func (s *session) kill() {
-	s.terminateOnce.Do(func() {})
-	s.child.Kill()
-}
+func (s *session) kill() { s.child.Kill() }
 
 func (s *session) touch() { s.lastUsed.Store(time.Now().UnixNano()) }
 
