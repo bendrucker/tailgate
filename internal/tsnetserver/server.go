@@ -8,7 +8,9 @@
 // A Server owns the node's lifecycle in the order shutdown requires: Up joins
 // the tailnet and yields the FQDN every canonical resource URL is built from,
 // ListenFunnel exposes the node on the public internet, and shutdown runs
-// StopAccepting, then the caller's transport drain, then Close.
+// StopAccepting, then the caller's transport drain, then Close. Node is that
+// lifecycle as an interface, so what a caller sequences around it is testable
+// without a control server.
 package tsnetserver
 
 import (
@@ -33,10 +35,23 @@ import (
 // ErrClosed is returned by operations attempted after Close.
 var ErrClosed = errors.New("tsnetserver: server closed")
 
-// node is the part of tsnet.Server this package drives. Joining a tailnet
-// needs a control server, so the interface exists to let tests exercise the
-// lifecycle around tsnet without one.
-type node interface {
+// Node is the embedded Tailscale node as tailgate serves through it: the join
+// that names it, the public listener, the WhoIs the consent page identifies a
+// person with, and the two shutdown steps a transport drain sits between.
+// *Server implements it, and taking it rather than a *Server is what lets the
+// startup and shutdown sequence run without a control server.
+type Node interface {
+	Up(ctx context.Context) (string, error)
+	ListenFunnel() (net.Listener, error)
+	WhoIs(ctx context.Context, peer netip.AddrPort) (*apitype.WhoIsResponse, error)
+	StopAccepting() error
+	Close() error
+}
+
+// tsnetServer is the part of tsnet.Server this package drives. Joining a
+// tailnet needs a control server, so the interface exists to let tests
+// exercise the lifecycle around tsnet without one.
+type tsnetServer interface {
 	Up(ctx context.Context) (*ipnstate.Status, error)
 	ListenFunnel(network, addr string, opts ...tsnet.FunnelOption) (net.Listener, error)
 	LocalClient() (*local.Client, error)
@@ -71,7 +86,7 @@ type Config struct {
 
 // Server is tailgate's embedded Tailscale node.
 type Server struct {
-	node node
+	node tsnetServer
 	addr string
 
 	mu       sync.Mutex
@@ -153,7 +168,7 @@ func ownerOnlyStateDir(dir string) error {
 	return nil
 }
 
-func newServer(n node, port int) *Server {
+func newServer(n tsnetServer, port int) *Server {
 	return &Server{node: n, addr: net.JoinHostPort("", strconv.Itoa(port))}
 }
 

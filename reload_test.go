@@ -25,8 +25,9 @@ import (
 )
 
 type fakeServed struct {
-	name  string
-	steps *recorder
+	name        string
+	steps       *recorder
+	shutdownErr error
 }
 
 func (s *fakeServed) ServeHTTP(w http.ResponseWriter, _ *http.Request) {
@@ -38,7 +39,7 @@ func (s *fakeServed) HasUpstream(name string) bool { return name == s.name }
 
 func (s *fakeServed) Shutdown(context.Context) error {
 	s.steps.record(s.name + " shutdown")
-	return nil
+	return s.shutdownErr
 }
 
 func (s *fakeServed) Close() error {
@@ -78,15 +79,15 @@ func fakeReloader(t *testing.T, path string, buildErr func(n int) error) (*reloa
 	}
 	steps := &recorder{}
 	builds := 0
-	routes, err := newReloader(path, cfg, func(*config.Config) (served, error) {
+	routes := newReloader(path, cfg.Node, discardLogger())
+	if err := routes.start(cfg, func(*config.Config) (served, error) {
 		builds++
 		if err := buildErr(builds); err != nil {
 			return nil, err
 		}
 		return &fakeServed{name: fmt.Sprintf("router-%d", builds), steps: steps}, nil
-	}, discardLogger())
-	if err != nil {
-		t.Fatalf("newReloader: %v", err)
+	}); err != nil {
+		t.Fatalf("start: %v", err)
 	}
 	return routes, steps
 }
@@ -273,10 +274,12 @@ func realReloader(t *testing.T, path string) (*reloader, *auth.Tokens, *resource
 
 	logger := discardLogger()
 	tokens := auth.NewTokens()
-	var routes *reloader
+	routes := newReloader(path, cfg.Node, logger)
+	t.Cleanup(func() { routes.Close() })
+
 	authServer, err := authserver.New(authserver.Options{
 		Resources:   urls,
-		HasUpstream: func(name string) bool { return routes.HasUpstream(name) },
+		HasUpstream: routes.HasUpstream,
 		Tokens:      tokens,
 		Identify: func(context.Context, netip.AddrPort) (*apitype.WhoIsResponse, error) {
 			return nil, errors.New("no tailnet in this test")
@@ -287,17 +290,15 @@ func realReloader(t *testing.T, path string) (*reloader, *auth.Tokens, *resource
 	if err != nil {
 		t.Fatalf("authserver.New: %v", err)
 	}
-	routes, err = newReloader(path, cfg, func(cfg *config.Config) (served, error) {
+	if err := routes.start(cfg, func(cfg *config.Config) (served, error) {
 		rt, err := handler(cfg, urls, tokens, authServer, logger, audit.New(logger))
 		if err != nil {
 			return nil, err
 		}
 		return rt, nil
-	}, logger)
-	if err != nil {
-		t.Fatalf("newReloader: %v", err)
+	}); err != nil {
+		t.Fatalf("start: %v", err)
 	}
-	t.Cleanup(func() { routes.Close() })
 	return routes, tokens, urls
 }
 
@@ -394,5 +395,53 @@ func TestReloadKeepsTokens(t *testing.T) {
 	// and the authorization server's upstream check follows it.
 	if got := metadataStatus(routes); got != http.StatusOK {
 		t.Errorf("authorization-server metadata under the upstream: %d, want 200", got)
+	}
+}
+
+// TestReloaderBeforeItStarts covers the window the reloader exists in before
+// the router does. The authorization server is built holding this reloader and
+// consults it per request, so every method has to answer for a process with
+// nothing to serve rather than reach through a router that is not there.
+func TestReloaderBeforeItStarts(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "tailgate.hujson")
+	writeConfig(t, path, "tailgate", "http://127.0.0.1:9000/mcp", "1")
+	routes := newReloader(path, config.Node{Hostname: "tailgate", Port: 443}, discardLogger())
+
+	if routes.HasUpstream(testUpstream) {
+		t.Error("HasUpstream named an upstream before a router was built")
+	}
+	rec := httptest.NewRecorder()
+	routes.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", nil))
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Errorf("a request before anything serves got %d, want 503", rec.Code)
+	}
+	if err := routes.Reload(); err == nil {
+		t.Error("Reload built a router before start did")
+	}
+	if err := routes.Shutdown(t.Context()); err != nil {
+		t.Errorf("Shutdown: %v", err)
+	}
+	if err := routes.Close(); err != nil {
+		t.Errorf("Close: %v", err)
+	}
+}
+
+// A build that fails at startup leaves the reloader with nothing, and serve
+// tears it down on the way out regardless.
+func TestReloaderStartFails(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "tailgate.hujson")
+	writeConfig(t, path, "tailgate", "http://127.0.0.1:9000/mcp", "1")
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	routes := newReloader(path, cfg.Node, discardLogger())
+
+	buildErr := errors.New("favicon unreadable")
+	if err := routes.start(cfg, func(*config.Config) (served, error) { return nil, buildErr }); !errors.Is(err, buildErr) {
+		t.Fatalf("start error = %v, want %v", err, buildErr)
+	}
+	if err := routes.Close(); err != nil {
+		t.Errorf("Close: %v", err)
 	}
 }

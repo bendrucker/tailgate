@@ -55,25 +55,19 @@ type options struct {
 	ConfigPath string
 }
 
-// serve runs tailgate until ctx is canceled or the listener fails.
+// serve runs tailgate on node until ctx is canceled or the listener fails.
+// The node is joined here rather than built here, so the whole sequence runs
+// against a tailnet or against a test's stand-in for one.
 //
 // The order is forced by what each step learns from the one before it: the
 // canonical resource URLs need the FQDN the join reports, the authorization
 // server needs those URLs and the node's WhoIs, and the router needs all of
 // it. Nothing serves until every one of them succeeds, so a startup failure
 // is downtime rather than an unauthenticated window.
-func serve(ctx context.Context, logger *slog.Logger, cfg *config.Config, opts options) error {
-	node, err := tsnetserver.New(tsnetserver.Config{
-		Hostname:     cfg.Node.Hostname,
-		StateDir:     cfg.Node.StateDir,
-		Port:         cfg.Node.Port,
-		Tags:         cfg.Node.Tags,
-		Logger:       logger,
-		OpenLoginURL: opts.OpenLoginURL,
-	})
-	if err != nil {
-		return err
-	}
+func serve(ctx context.Context, logger *slog.Logger, node tsnetserver.Node, cfg *config.Config, opts options) error {
+	// The node leaves the tailnet on every path out of here, including the one
+	// where the drain already closed it. Close is idempotent, so the two do not
+	// conflict.
 	defer node.Close()
 
 	fqdn, err := joinTailnet(ctx, node, joinTimeoutFor(opts))
@@ -95,12 +89,15 @@ func serve(ctx context.Context, logger *slog.Logger, cfg *config.Config, opts op
 	// authorization server around it are built once here: they hold every
 	// token a client has, so a reload must never rebuild them. The router is
 	// what a reload rebuilds, and the authorization server reaches the current
-	// one through the reloader for its upstream check.
+	// one through the reloader for its upstream check, which is why the
+	// reloader is built before the router it will serve.
 	tokens := auth.NewTokens()
-	var routes *reloader
+	routes := newReloader(opts.ConfigPath, cfg.Node, logger)
+	defer routes.Close()
+
 	authServer, err := authserver.New(authserver.Options{
 		Resources:   urls,
-		HasUpstream: func(name string) bool { return routes.HasUpstream(name) },
+		HasUpstream: routes.HasUpstream,
 		Tokens:      tokens,
 		Identify:    node.WhoIs,
 		Clients:     cimd.NewFetcher(cimd.NewClient()),
@@ -111,17 +108,15 @@ func serve(ctx context.Context, logger *slog.Logger, cfg *config.Config, opts op
 	}
 
 	auditor := audit.New(logger)
-	routes, err = newReloader(opts.ConfigPath, cfg, func(cfg *config.Config) (served, error) {
+	if err := routes.start(cfg, func(cfg *config.Config) (served, error) {
 		rt, err := handler(cfg, urls, tokens, authServer, logger, auditor)
 		if err != nil {
 			return nil, err
 		}
 		return rt, nil
-	}, logger)
-	if err != nil {
+	}); err != nil {
 		return err
 	}
-	defer routes.Close()
 
 	// SIGHUP's default disposition ends the process, so the handler is in
 	// place before anything serves.
@@ -168,12 +163,6 @@ func reloadOnSignal(ctx context.Context, signals <-chan os.Signal, routes *reloa
 	}
 }
 
-// joiner joins the tailnet and reports the node's name. *tsnetserver.Server
-// implements it.
-type joiner interface {
-	Up(ctx context.Context) (string, error)
-}
-
 // joinTimeoutFor reports how long tailgate waits for the join, which depends
 // on what it is waiting for: an unattended start has only the auth key it was
 // given, while -open-login is waiting on a person to approve a login in a
@@ -190,7 +179,7 @@ func joinTimeoutFor(opts options) time.Duration {
 //
 // The error names both remedies, since the log it lands in is all a launchd
 // deployment leaves behind.
-func joinTailnet(ctx context.Context, node joiner, timeout time.Duration) (string, error) {
+func joinTailnet(ctx context.Context, node tsnetserver.Node, timeout time.Duration) (string, error) {
 	joining, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
@@ -229,21 +218,19 @@ func expectedFQDN(node config.Node, joined string) error {
 	return nil
 }
 
-// stopper closes the public listener. *tsnetserver.Server implements it.
-type stopper interface {
-	StopAccepting() error
-}
-
-// transports drains the upstreams behind the router. *router.Router implements
-// it.
-type transports interface {
+// connections is the shutdown half of *http.Server. drain takes it as an
+// interface because a real http.Server that never served returns from Shutdown
+// before it has done anything, which leaves the end of the chain unobservable.
+type connections interface {
 	Shutdown(ctx context.Context) error
+	Close() error
 }
 
 // drain stops accepting, lets in-flight work finish, and only then tears
 // anything down. Transports drain ahead of the HTTP server because the server
-// waits on handlers the transports are still holding open.
-func drain(logger *slog.Logger, node stopper, server *http.Server, rt transports) error {
+// waits on handlers the transports are still holding open, and the node leaves
+// the tailnet last, once nothing it carries is still in flight.
+func drain(logger *slog.Logger, node tsnetserver.Node, server connections, rt served) error {
 	logger.Info("draining", "timeout", drainTimeout)
 
 	stopped := node.StopAccepting()
@@ -264,5 +251,5 @@ func drain(logger *slog.Logger, node stopper, server *http.Server, rt transports
 		// Close severs whatever the deadline left, so shutdown terminates.
 		drained = errors.Join(drained, server.Close())
 	}
-	return errors.Join(stopped, drained)
+	return errors.Join(stopped, drained, node.Close())
 }

@@ -33,45 +33,75 @@ type served interface {
 type reloader struct {
 	path   string
 	node   config.Node
-	build  func(*config.Config) (served, error)
 	logger *slog.Logger
 
 	// reloading serializes Reload, so two signals in quick succession build
-	// two routers in order. It also guards stopped.
+	// two routers in order. It also guards stopped and build.
 	reloading sync.Mutex
+	// build is set by start, which is also what puts the first router in
+	// service.
+	build func(*config.Config) (served, error)
 	// stopped is set by Shutdown and Close. A signal that lands during
 	// shutdown must not swap in a router nothing will ever drain.
 	stopped bool
-	current atomic.Pointer[served]
+	router  atomic.Pointer[served]
 	// retiring counts routers draining in the background, so shutdown waits
 	// for them.
 	retiring sync.WaitGroup
 }
 
-// newReloader builds the first router from cfg, which the caller already
-// loaded from path. The node section of cfg is fixed for the life of the
-// process, since the tailnet node it configures is joined once.
-func newReloader(path string, cfg *config.Config, build func(*config.Config) (served, error), logger *slog.Logger) (*reloader, error) {
-	r := &reloader{path: path, node: cfg.Node, build: build, logger: logger}
+// newReloader returns a reloader serving nothing yet. The authorization server
+// reaches the current router through it, and the router is built with that
+// authorization server, so the reloader has to exist before either of them:
+// start closes the loop by taking the build and running it.
+//
+// node is the section of the configuration fixed for the life of the process,
+// since the tailnet node it configures is joined once.
+func newReloader(path string, node config.Node, logger *slog.Logger) *reloader {
+	return &reloader{path: path, node: node, logger: logger}
+}
+
+// start puts the first router in service, built from cfg, which the caller
+// already loaded from path. Until it succeeds the reloader answers as what it
+// is: a process with nothing to serve.
+func (r *reloader) start(cfg *config.Config, build func(*config.Config) (served, error)) error {
+	r.reloading.Lock()
+	defer r.reloading.Unlock()
+
 	current, err := build(cfg)
 	if err != nil {
-		return nil, err
+		return err
 	}
-	r.current.Store(&current)
-	return r, nil
+	r.build = build
+	r.router.Store(&current)
+	return nil
+}
+
+// current is the router in service, or nil before start has put one there.
+func (r *reloader) current() served {
+	if rt := r.router.Load(); rt != nil {
+		return *rt
+	}
+	return nil
 }
 
 // A request in flight on the previous router finishes there, since the swap
 // replaces the pointer and never the router a handler already entered.
 func (r *reloader) ServeHTTP(w http.ResponseWriter, req *http.Request) {
-	(*r.current.Load()).ServeHTTP(w, req)
+	current := r.current()
+	if current == nil {
+		http.Error(w, "tailgate is starting", http.StatusServiceUnavailable)
+		return
+	}
+	current.ServeHTTP(w, req)
 }
 
 // The authorization server consults HasUpstream per request, so a resource
 // added by a reload is authorizable as soon as the swap lands and a removed
-// one no longer is.
+// one no longer is. Nothing is, before there is a router to serve it.
 func (r *reloader) HasUpstream(name string) bool {
-	return (*r.current.Load()).HasUpstream(name)
+	current := r.current()
+	return current != nil && current.HasUpstream(name)
 }
 
 // Reload loads the file again and swaps in a router built from it. A file
@@ -91,6 +121,9 @@ func (r *reloader) Reload() error {
 	if r.stopped {
 		return r.refuse(fmt.Errorf("reload: the process is shutting down"))
 	}
+	if r.build == nil {
+		return r.refuse(fmt.Errorf("reload: nothing is serving yet"))
+	}
 	cfg, err := config.Load(r.path)
 	if err != nil {
 		return r.refuse(fmt.Errorf("reload: %w", err))
@@ -103,7 +136,7 @@ func (r *reloader) Reload() error {
 		return r.refuse(fmt.Errorf("reload: %w", err))
 	}
 
-	previous := r.current.Swap(&next)
+	previous := r.router.Swap(&next)
 	r.logger.Info("configuration reloaded", "path", r.path, "upstreams", len(cfg.Upstreams))
 
 	r.retiring.Add(1)
@@ -121,6 +154,11 @@ func (r *reloader) refuse(err error) error {
 
 // retire drains a replaced router and then tears it down, so a request that
 // entered it before the swap finishes and a stdio child it spawned dies.
+//
+// drainTimeout is the only clock here. The second clock shutdown runs, which
+// covers connections no transport ever saw, has nothing to bound during a
+// reload: those connections belong to the one HTTP server, which a reload
+// never replaces and which goes on serving them through the swap.
 func (r *reloader) retire(previous served) {
 	ctx, cancel := context.WithTimeout(context.Background(), drainTimeout)
 	defer cancel()
@@ -136,7 +174,10 @@ func (r *reloader) retire(previous served) {
 // draining, which is bounded by the same deadline. Reloads are refused from
 // here on.
 func (r *reloader) Shutdown(ctx context.Context) error {
-	err := r.stop().Shutdown(ctx)
+	var err error
+	if current := r.stop(); current != nil {
+		err = current.Shutdown(ctx)
+	}
 	r.retiring.Wait()
 	return err
 }
@@ -144,16 +185,20 @@ func (r *reloader) Shutdown(ctx context.Context) error {
 func (r *reloader) Close() error {
 	current := r.stop()
 	r.retiring.Wait()
+	if current == nil {
+		return nil
+	}
 	return current.Close()
 }
 
 // stop marks the reloader stopped and returns the router that is current at
-// that moment, which is the last one there will be.
+// that moment, which is the last one there will be. It is nil when a startup
+// failure tears the process down before start put one in service.
 func (r *reloader) stop() served {
 	r.reloading.Lock()
 	defer r.reloading.Unlock()
 	r.stopped = true
-	return *r.current.Load()
+	return r.current()
 }
 
 // nodeChanges names the fields of the node section that differ between the

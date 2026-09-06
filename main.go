@@ -12,6 +12,7 @@ import (
 	"syscall"
 
 	"github.com/bendrucker/tailgate/internal/config"
+	"github.com/bendrucker/tailgate/internal/tsnetserver"
 )
 
 const usageHeader = `tailgate fronts MCP servers behind Tailscale Funnel. It joins the tailnet as
@@ -84,10 +85,25 @@ func main() {
 		os.Exit(1)
 	}
 
+	// The node is built here and handed to serve, which owns its lifecycle
+	// from the join through the shutdown that closes it.
+	node, err := tsnetserver.New(tsnetserver.Config{
+		Hostname:     cfg.Node.Hostname,
+		StateDir:     cfg.Node.StateDir,
+		Port:         cfg.Node.Port,
+		Tags:         cfg.Node.Tags,
+		Logger:       logger,
+		OpenLoginURL: *openLogin,
+	})
+	if err != nil {
+		logger.Error("configure tailnet node", "err", err)
+		os.Exit(1)
+	}
+
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	if err := serve(ctx, logger, cfg, options{OpenLoginURL: *openLogin, ConfigPath: *configPath}); err != nil {
+	if err := serve(ctx, logger, node, cfg, options{OpenLoginURL: *openLogin, ConfigPath: *configPath}); err != nil {
 		// A canceled context is the signal that asked tailgate to stop, so it
 		// reports the shutdown it completed rather than a failure.
 		if errors.Is(err, context.Canceled) {
