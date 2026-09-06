@@ -176,6 +176,44 @@ func TestValidateMirrored(t *testing.T) {
 			body: `{"jsonrpc":"2.0","id":13,"method":"tools/call","params":{"name":"x",` + meta + `}}`,
 			err:  ErrHeaderMismatch,
 		},
+		{
+			// What claude.ai sends. params._meta does not carry a protocol
+			// version before 2026-07-28, so the absent member restates nothing
+			// and the mirrored method is still checked against the body.
+			name: "older revision mirrors the method without a _meta version",
+			headers: map[string][]string{
+				VersionHeader: {"2025-11-25"},
+				MethodHeader:  {"tools/list"},
+			},
+			body: `{"jsonrpc":"2.0","id":14,"method":"tools/list","params":{}}`,
+		},
+		{
+			name: "older revision still answers for a method that disagrees",
+			headers: map[string][]string{
+				VersionHeader: {"2025-11-25"},
+				MethodHeader:  {"tools/list"},
+			},
+			body: `{"jsonrpc":"2.0","id":15,"method":"resources/list","params":{}}`,
+			err:  ErrHeaderMismatch,
+		},
+		{
+			name: "older revision declaring a version that disagrees",
+			headers: map[string][]string{
+				VersionHeader: {"2025-11-25"},
+				MethodHeader:  {"tools/list"},
+			},
+			body: `{"jsonrpc":"2.0","id":16,"method":"tools/list","params":{` + meta + `}}`,
+			err:  ErrHeaderMismatch,
+		},
+		{
+			name: "2026-07-28 still requires the _meta version",
+			headers: map[string][]string{
+				VersionHeader: {"2026-07-28"},
+				MethodHeader:  {"tools/list"},
+			},
+			body: `{"jsonrpc":"2.0","id":17,"method":"tools/list","params":{}}`,
+			err:  ErrHeaderMismatch,
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			header := http.Header{}
