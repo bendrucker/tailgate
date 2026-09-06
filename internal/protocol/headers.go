@@ -123,7 +123,7 @@ func ValidateMirrored(header http.Header, body []byte) error {
 	if err != nil {
 		return err
 	}
-	if msg.protocolVersion != version {
+	if versionsComparable(version, msg.protocolVersion) && msg.protocolVersion != version {
 		return mismatch(VersionHeader, "header is %q, body _meta declares %q", version, msg.protocolVersion)
 	}
 
@@ -139,6 +139,26 @@ func ValidateMirrored(header http.Header, body []byte) error {
 		return mismatch(NameHeader, "header is %q, body params.%s is %q", name, field, expected)
 	}
 	return nil
+}
+
+// versionsComparable reports whether the header's revision and the body's
+// _meta declaration are a pair that can disagree at all.
+//
+// Only 2026-07-28 carries the protocol version in params._meta, so a request
+// of an older revision has no such member and its absence restates nothing.
+// Clients of an older revision do send the mirrored method and name headers,
+// which stay checked either way, and refusing those requests over a member
+// their revision never defined rejects every call such a client makes.
+//
+// An absent declaration is still a mismatch once the header names a revision
+// that requires one, and a header naming no revision tailgate recognizes is
+// held to the comparison rather than excused by it.
+func versionsComparable(header, body string) bool {
+	if body != "" {
+		return true
+	}
+	declared, err := Parse(header)
+	return err != nil || declared.MirrorsHeaders()
 }
 
 // envelope is the part of a JSON-RPC message the mirrored headers restate.
