@@ -192,7 +192,7 @@ func (t *Transport) startStateless(entry *statelessChild, identity auth.Identity
 		t.logger.Warn("stateless stdio child refused", "sub", identity.Subject, "err", err)
 		return nil, err
 	}
-	t.logger.Info("stateless stdio child started", "sub", identity.Subject, "pid", s.cmd.Process.Pid)
+	t.logger.Info("stateless stdio child started", "sub", identity.Subject, "pid", s.child.Pid())
 	return s, nil
 }
 
@@ -277,7 +277,7 @@ func (t *Transport) serveListen(w http.ResponseWriter, inflight *proxy.InFlight,
 	defer release()
 
 	stream := newEventStream(w)
-	keepAlive := time.NewTicker(keepAliveInterval)
+	keepAlive := time.NewTicker(t.options.KeepAliveInterval)
 	defer keepAlive.Stop()
 	for {
 		select {
