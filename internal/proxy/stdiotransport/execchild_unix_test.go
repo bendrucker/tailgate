@@ -7,6 +7,7 @@ import (
 	"errors"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"testing"
@@ -263,4 +264,54 @@ func TestStartRefusesAUIDTailgateCannotAssume(t *testing.T) {
 	if !strings.Contains(err.Error(), "privilege") {
 		t.Errorf("error = %q, want it to name why the start failed", err)
 	}
+}
+
+// TestAFailedStartLeavesNoDescriptorsBehind defends against a leak that only
+// shows up once tailgate is already short of descriptors. start makes three
+// pipes before it runs the child, and os/exec closes the ends it holds from
+// Start, so a return on any path before Start has to close all six ends
+// itself. An upstream whose command cannot be run fails on every request, so
+// one pair kept per attempt is what takes the whole process down: no child
+// starts anywhere, not just for the upstream that was misconfigured.
+func TestAFailedStartLeavesNoDescriptorsBehind(t *testing.T) {
+	cfg := execConfig{Command: filepath.Join(t.TempDir(), "no-such-command")}
+	mustFail := func() {
+		t.Helper()
+		child, err := cfg.start(testLogger())
+		if err == nil {
+			child.Kill()
+			t.Fatal("a command that does not exist started a child")
+		}
+	}
+
+	// The first attempt is the warm-up: whatever os/exec allocates once stays
+	// allocated, and counting it would read as a leak.
+	mustFail()
+	before := openDescriptors(t)
+	for range 32 {
+		mustFail()
+	}
+
+	if leaked := openDescriptors(t) - before; leaked > 0 {
+		t.Errorf("32 failed starts left %d descriptors open", leaked)
+	}
+}
+
+// openDescriptors counts what this process holds open. /dev/fd is the listing
+// on both platforms tailgate builds for, directly on darwin and through
+// /proc/self/fd on linux.
+func openDescriptors(t *testing.T) int {
+	t.Helper()
+	dir, err := os.Open("/dev/fd")
+	if err != nil {
+		t.Skipf("no descriptor listing to count: %v", err)
+	}
+	defer dir.Close()
+	// Names rather than entries: the listing includes the descriptor opened to
+	// read it, and darwin refuses to stat that one.
+	names, err := dir.Readdirnames(-1)
+	if err != nil {
+		t.Skipf("no descriptor listing to count: %v", err)
+	}
+	return len(names)
 }

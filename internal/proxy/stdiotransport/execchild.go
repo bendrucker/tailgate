@@ -88,33 +88,30 @@ func (cfg execConfig) start(logger *slog.Logger) (_ Child, err error) {
 		}
 	}
 
+	// Both ends of all three pipes are this function's to close. os/exec closes
+	// the ends it holds from Start, so a return before Start leaves them open,
+	// and an upstream that fails this far in fails the same way on every
+	// request until the descriptors run out.
 	stdinRead, stdin, err := os.Pipe()
 	if err != nil {
 		return nil, err
 	}
 	cmd.Stdin = stdinRead
-	defer func() {
-		// The parent's copy of the read end goes once the child holds its own,
-		// or closing stdin never reaches the child as EOF.
-		stdinRead.Close()
-		if err != nil {
-			stdin.Close()
-		}
-	}()
+	defer closePipe(stdinRead, stdin, &err)
 
-	stdout, err := cmd.StdoutPipe()
+	stdout, childStdout, err := os.Pipe()
 	if err != nil {
 		return nil, err
 	}
-	stderr, err := cmd.StderrPipe()
+	cmd.Stdout = childStdout
+	defer closePipe(childStdout, stdout, &err)
+
+	stderr, childStderr, err := os.Pipe()
 	if err != nil {
-		// os/exec closes the pipes it made once Start has run, but nothing has
-		// started here, so the stdout pipe would outlive the attempt. An
-		// upstream that fails this far in fails the same way on every request,
-		// and a descriptor pair per attempt is what exhausts the process.
-		stdout.Close()
 		return nil, err
 	}
+	cmd.Stderr = childStderr
+	defer closePipe(childStderr, stderr, &err)
 
 	if err := cmd.Start(); err != nil {
 		return nil, cfg.startError(err)
@@ -131,14 +128,27 @@ func (cfg execConfig) start(logger *slog.Logger) (_ Child, err error) {
 	c.pipes.Add(2)
 	go func() {
 		defer c.pipes.Done()
+		defer stdout.Close()
 		defer close(c.messages)
 		c.err = scanMessages(stdout, c.messages)
 	}()
 	go func() {
 		defer c.pipes.Done()
+		defer stderr.Close()
 		logLines(stderr, logger)
 	}()
 	return c, nil
+}
+
+// closePipe retires the ends of one pipe that start is done with. The child's
+// end always goes: once it holds a descriptor of its own, the parent's copy
+// only keeps the reader from ever seeing EOF. The end this side keeps goes only
+// when start failed, since nothing will read it.
+func closePipe(child *os.File, parent *os.File, err *error) {
+	child.Close()
+	if *err != nil {
+		parent.Close()
+	}
 }
 
 func (cfg execConfig) grace() time.Duration {
