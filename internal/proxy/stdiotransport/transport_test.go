@@ -1099,7 +1099,8 @@ func TestShutdownRefusesNewWorkAndDrains(t *testing.T) {
 	}
 }
 
-// TestShutdownEndsEveryChild: a child that exits when its stdin closes is gone by the time Shutdown returns.
+// TestShutdownEndsEveryChild covers a child that exits when its stdin closes.
+// It is gone by the time Shutdown returns.
 func TestShutdownEndsEveryChild(t *testing.T) {
 	h := newHarness(t, Options{})
 	h.initialize(t, "alice")

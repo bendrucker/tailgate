@@ -132,7 +132,8 @@ func TestExecConfigEnviron(t *testing.T) {
 			expected: map[string]string{"TAILGATE_TEST_TOKEN": "upstream", "TAILGATE_TEST_HOME": "/parent"},
 		},
 		{
-			// A child running under its own uid names its own HOME here, since it cannot write to tailgate's.
+			// A child running under its own uid names its own HOME here,
+			// since it cannot write tailgate's.
 			name:     "an upstream entry overrides the inherited one",
 			env:      []string{"TAILGATE_TEST_HOME=/child"},
 			expected: map[string]string{"TAILGATE_TEST_HOME": "/child"},

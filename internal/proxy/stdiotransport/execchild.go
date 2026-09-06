@@ -177,7 +177,6 @@ func scanMessages(stdout io.Reader, out chan<- []byte) error {
 	return scanner.Err()
 }
 
-// logLines records the child's diagnostics.
 func logLines(stderr io.Reader, logger *slog.Logger) {
 	scanner := bufio.NewScanner(stderr)
 	scanner.Buffer(make([]byte, 0, 4<<10), maxLineBytes)

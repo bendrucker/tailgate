@@ -170,8 +170,8 @@ func (c *scriptedChild) messagesSent() []message {
 
 var _ Child = (*scriptedChild)(nil)
 
-// echoServer refuses the era probe the way a server that predates it refuses
-// an unknown method.
+// echoServer answers like a minimal stdio MCP server. Its era probe is
+// refused the way a server that predates the method refuses an unknown one.
 func echoServer(c *scriptedChild, msg message) {
 	switch {
 	case !msg.IsRequest():
