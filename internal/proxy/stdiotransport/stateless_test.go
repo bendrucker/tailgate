@@ -673,7 +673,7 @@ func TestSubscriptionStreamsAreCappedPerChild(t *testing.T) {
 
 // A child that goes away takes its streams with it, which is the other way a
 // slot comes back: the handlers holding them are released by the child's
-// output ending rather than by their callers.
+// output ending.
 func TestChildExitReleasesSubscriptionSlots(t *testing.T) {
 	held := holdingSubscriptions()
 	h := newScriptedHarness(t, Options{IdleTimeout: time.Hour}, held.answer)

@@ -81,9 +81,9 @@ func (t *Transport) spawn(id string, subject string) (*session, error) {
 // response any more, so leaving the session registered would strand every later
 // request on the request timeout and hold the caller's cap slot.
 func (t *Transport) readChild(s *session) {
-	// The child's output is the only source a subscription stream has, so its
-	// end is theirs: the handlers holding them are released here rather than
-	// left waiting on a channel nothing will write to again.
+	// The child's output is the only source a subscription stream has, so
+	// ending it here releases every listener still waiting on this session;
+	// nothing else will ever write to their channel again.
 	defer s.closeAllListeners()
 	for line := range s.child.Messages() {
 		s.deliver(line)

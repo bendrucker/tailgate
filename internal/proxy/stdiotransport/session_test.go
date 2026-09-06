@@ -146,8 +146,7 @@ func TestSubstituteRefusesWhatIsNotAMessage(t *testing.T) {
 
 // TestDrainNotifications covers the ordering a subscription ends on. The
 // child's closing result and its notifications arrive on separate channels, so
-// what it already emitted goes out first rather than losing a select race to
-// the message that ends the stream.
+// what it already emitted goes out first.
 func TestDrainNotifications(t *testing.T) {
 	for _, tc := range []struct {
 		name     string

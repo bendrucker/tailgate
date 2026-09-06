@@ -167,7 +167,6 @@ type Options struct {
 	StartChild StartChild
 }
 
-// execConfig is the child process this upstream's configuration names.
 func (o Options) execConfig() execConfig {
 	return execConfig{
 		Command: o.Command,

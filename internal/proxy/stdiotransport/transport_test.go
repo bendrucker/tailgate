@@ -56,7 +56,6 @@ func newHarness(t *testing.T, options Options) *harness {
 	return newScriptedHarness(t, options, echoServer)
 }
 
-// newScriptedHarness serves an upstream whose children answer with answer.
 func newScriptedHarness(t *testing.T, options Options, answer func(*scriptedChild, message)) *harness {
 	t.Helper()
 	children := newChildScript(answer)
@@ -212,8 +211,6 @@ func (h *harness) initialize(t *testing.T, subject string) string {
 	return session
 }
 
-// session resolves a registered session, which is what a test waits on to know
-// its child has been reaped and its cap slot released.
 func (h *harness) session(t *testing.T, id string) *session {
 	t.Helper()
 	h.transport.mu.Lock()
@@ -238,8 +235,6 @@ func decodeMessage(t *testing.T, response *http.Response) map[string]any {
 	return message
 }
 
-// awaitClose waits for a channel the transport closes, which is how a test
-// observes work that finishes on a goroutine of its own.
 func awaitClose(t *testing.T, done <-chan struct{}, what string) {
 	t.Helper()
 	select {
@@ -766,8 +761,8 @@ func TestIdleSessionsAreReaped(t *testing.T) {
 }
 
 // TestActiveSessionSurvivesIdleSweep holds a request open across a sweep that
-// would otherwise take the session, and the sweep is driven directly so the
-// ordering is the test's rather than a timer's.
+// would otherwise take the session, and drives the sweep directly so the
+// test controls the ordering.
 func TestActiveSessionSurvivesIdleSweep(t *testing.T) {
 	held := holding("tools/call")
 	h := newScriptedHarness(t, Options{IdleTimeout: time.Hour}, held.answer)
@@ -793,7 +788,6 @@ func TestActiveSessionSurvivesIdleSweep(t *testing.T) {
 }
 
 func TestChildExitTearsDownSession(t *testing.T) {
-	// A child that dies on the request rather than answering it.
 	h := newScriptedHarness(t, Options{}, func(c *scriptedChild, msg message) {
 		if msg.Method == "tools/call" {
 			c.Kill()
@@ -1105,8 +1099,7 @@ func TestShutdownRefusesNewWorkAndDrains(t *testing.T) {
 	}
 }
 
-// TestShutdownEndsEveryChild is the other half: a child that exits when its
-// stdin closes is gone by the time Shutdown returns.
+// TestShutdownEndsEveryChild: a child that exits when its stdin closes is gone by the time Shutdown returns.
 func TestShutdownEndsEveryChild(t *testing.T) {
 	h := newHarness(t, Options{})
 	h.initialize(t, "alice")

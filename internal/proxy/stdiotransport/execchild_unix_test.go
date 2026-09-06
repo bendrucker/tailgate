@@ -25,7 +25,6 @@ type runningChild struct {
 	err  error
 }
 
-// startShell runs script under /bin/sh as a real stdio child.
 func startShell(t *testing.T, cfg execConfig, script string) *runningChild {
 	t.Helper()
 	cfg.Command = "/bin/sh"
@@ -47,8 +46,6 @@ func startShell(t *testing.T, cfg execConfig, script string) *runningChild {
 	return c
 }
 
-// receive reads one message from the child, failing the test if it says
-// nothing.
 func (c *runningChild) receive(t *testing.T) string {
 	t.Helper()
 	select {

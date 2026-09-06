@@ -104,9 +104,8 @@ func TestBroadcastDropsOnlyTheStreamThatFellBehind(t *testing.T) {
 }
 
 // TestCloseAllListenersReleasesEveryHandler covers what the child's output
-// ending does to the streams it was the only source for. Their handlers are
-// released here rather than left waiting on a channel nothing will write to
-// again.
+// ending does to the streams it was the only source for: their handlers are
+// released here.
 func TestCloseAllListenersReleasesEveryHandler(t *testing.T) {
 	s := newTestSession()
 	var streams []*listener

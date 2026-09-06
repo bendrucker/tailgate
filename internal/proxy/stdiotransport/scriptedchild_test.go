@@ -48,8 +48,7 @@ type scriptedChild struct {
 	exitErr  error
 
 	// deaf stands in for a child that has stopped reading its stdin: the pipe
-	// buffer fills, and the write holds until its deadline rather than
-	// completing.
+	// buffer fills, and the write holds until its deadline.
 	deaf atomic.Bool
 	// linger stands in for a child that ignores its stdin closing, which is
 	// what leaves only the kill to end it.
@@ -149,13 +148,10 @@ func (c *scriptedChild) emit(line string) {
 	c.messages <- []byte(line)
 }
 
-// result answers a request with a JSON-RPC result, under the id the transport
-// addressed it by.
 func (c *scriptedChild) result(msg message, result string) {
 	c.emit(fmt.Sprintf(`{"jsonrpc":"2.0","id":%s,"result":%s}`, msg.ID, result))
 }
 
-// failure answers a request with a JSON-RPC error.
 func (c *scriptedChild) failure(msg message, code int, text string) {
 	c.emit(fmt.Sprintf(`{"jsonrpc":"2.0","id":%s,"error":{"code":%d,"message":%q}}`, msg.ID, code, text))
 }
@@ -166,8 +162,6 @@ func (c *scriptedChild) notify(seq int, echo string) {
 	c.emit(fmt.Sprintf(`{"jsonrpc":"2.0","method":"notifications/message","params":{"seq":%d,"echo":%q}}`, seq, echo))
 }
 
-// messagesSent reports every message the transport wrote to the child, in the
-// order it wrote them.
 func (c *scriptedChild) messagesSent() []message {
 	c.sentMu.Lock()
 	defer c.sentMu.Unlock()
@@ -176,9 +170,8 @@ func (c *scriptedChild) messagesSent() []message {
 
 var _ Child = (*scriptedChild)(nil)
 
-// echoServer answers like a minimal stdio MCP server: the handshake, the era
-// probe refused the way a server that predates it refuses an unknown method,
-// and an echo of every other request.
+// echoServer refuses the era probe the way a server that predates it refuses
+// an unknown method.
 func echoServer(c *scriptedChild, msg message) {
 	switch {
 	case !msg.IsRequest():
@@ -272,7 +265,6 @@ func (s *childScript) start(logger *slog.Logger) (Child, error) {
 	return c, nil
 }
 
-// take returns the oldest child the test has not seen, or nil.
 func (s *childScript) take() *scriptedChild {
 	s.mu.Lock()
 	defer s.mu.Unlock()

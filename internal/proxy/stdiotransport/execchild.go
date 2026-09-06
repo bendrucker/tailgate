@@ -20,9 +20,9 @@ import (
 // before its process group is killed.
 const DefaultShutdownGrace = 2 * time.Second
 
-// maxLineBytes bounds one JSON-RPC message read from the child. A child that
-// emits a longer line ends its own session rather than growing tailgate's heap
-// without limit.
+// maxLineBytes bounds one JSON-RPC message read from the child. A longer
+// line ends the child's session, keeping an unbounded line from growing
+// tailgate's heap.
 const maxLineBytes = 4 << 20
 
 // errStdinBlocked reports a child that is alive but has stopped reading its
@@ -31,7 +31,6 @@ const maxLineBytes = 4 << 20
 // whatever partially reached it is already broken.
 var errStdinBlocked = fmt.Errorf("%w: stdio child stopped reading stdin", proxy.ErrUpstreamTimeout)
 
-// execConfig is the process an upstream's configuration names.
 type execConfig struct {
 	Command string
 	Args    []string
@@ -54,9 +53,8 @@ func startExec(cfg execConfig) StartChild {
 // execChild is a Child served by a process of its own.
 type execChild struct {
 	cmd *exec.Cmd
-	// stdin is the write end of a pipe this package creates itself, rather than
-	// exec.Cmd.StdinPipe, because only an *os.File exposes the write deadline
-	// that bounds Send.
+	// stdin is the write end of a pipe this package creates itself, because only
+	// an *os.File exposes the write deadline that bounds Send.
 	stdin  *os.File
 	grace  time.Duration
 	logger *slog.Logger
