@@ -4,7 +4,9 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net/url"
 	"testing"
+	"time"
 
 	"github.com/bendrucker/tailgate/internal/audit"
 	"github.com/bendrucker/tailgate/internal/config"
@@ -14,6 +16,15 @@ import (
 
 func discardLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
+}
+
+func mustParseURL(t *testing.T, raw string) *url.URL {
+	t.Helper()
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		t.Fatalf("parse %s: %v", raw, err)
+	}
+	return parsed
 }
 
 func TestUpstreamRoute(t *testing.T) {
@@ -28,7 +39,7 @@ func TestUpstreamRoute(t *testing.T) {
 			upstream: config.Upstream{
 				Name:      "docs",
 				Transport: config.TransportHTTP,
-				URL:       "http://127.0.0.1:9000/mcp",
+				URL:       mustParseURL(t, "http://127.0.0.1:9000/mcp"),
 			},
 			expectedType: (*httptransport.Transport)(nil),
 		},
@@ -40,10 +51,21 @@ func TestUpstreamRoute(t *testing.T) {
 				Command:     "mcp-files",
 				Args:        []string{"--root", "/srv"},
 				MaxChildren: 2,
-				IdleTimeout: "90s",
+				IdleTimeout: 90 * time.Second,
 			},
 			expectedType: (*stdiotransport.Transport)(nil),
 			// The router must not bind sessions this transport binds itself.
+			managesSession: true,
+		},
+		{
+			name: "stdio under its own credential",
+			upstream: config.Upstream{
+				Name:       "files",
+				Transport:  config.TransportStdio,
+				Command:    "mcp-files",
+				Credential: &config.Credential{UID: 570, GID: 570},
+			},
+			expectedType:   (*stdiotransport.Transport)(nil),
 			managesSession: true,
 		},
 	} {
@@ -68,45 +90,15 @@ func TestUpstreamRoute(t *testing.T) {
 	}
 }
 
-func TestUpstreamRouteRejects(t *testing.T) {
-	for _, tc := range []struct {
-		name     string
-		upstream config.Upstream
-	}{
-		{
-			name:     "unknown transport",
-			upstream: config.Upstream{Name: "docs", Transport: "grpc"},
-		},
-		{
-			name:     "relative url",
-			upstream: config.Upstream{Name: "docs", Transport: config.TransportHTTP, URL: "/mcp"},
-		},
-		{
-			name:     "non http scheme",
-			upstream: config.Upstream{Name: "docs", Transport: config.TransportHTTP, URL: "ws://127.0.0.1:9000/mcp"},
-		},
-		{
-			name:     "unparseable url",
-			upstream: config.Upstream{Name: "docs", Transport: config.TransportHTTP, URL: "http://[::1"},
-		},
-		{
-			name: "unparseable idle timeout",
-			upstream: config.Upstream{
-				Name:        "files",
-				Transport:   config.TransportStdio,
-				Command:     "mcp-files",
-				IdleTimeout: "forever",
-			},
-		},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			logger := discardLogger()
-			route, err := upstreamRoute(tc.upstream, logger, audit.New(logger))
-			if err == nil {
-				route.Transport.Close()
-				t.Fatalf("expected error for %+v", tc.upstream)
-			}
-		})
+// A transport name the switch does not know is all a parsed configuration
+// leaves for this to reject, since every value an upstream carries was parsed
+// before it got here.
+func TestUpstreamRouteRejectsUnknownTransport(t *testing.T) {
+	logger := discardLogger()
+	route, err := upstreamRoute(config.Upstream{Name: "docs", Transport: "grpc"}, logger, audit.New(logger))
+	if err == nil {
+		route.Transport.Close()
+		t.Fatal("expected an error for an unknown transport")
 	}
 }
 
@@ -117,7 +109,7 @@ func TestUpstreamsClosesOnFailure(t *testing.T) {
 	logger := discardLogger()
 	routes, err := upstreams([]config.Upstream{
 		{Name: "files", Transport: config.TransportStdio, Command: "mcp-files"},
-		{Name: "docs", Transport: config.TransportHTTP, URL: "ws://127.0.0.1:9000/mcp"},
+		{Name: "docs", Transport: "grpc"},
 	}, logger, audit.New(logger))
 	if err == nil {
 		closeUpstreams(routes)

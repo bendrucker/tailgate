@@ -4,8 +4,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"net/url"
-	"time"
 
 	"github.com/bendrucker/tailgate/internal/audit"
 	"github.com/bendrucker/tailgate/internal/config"
@@ -31,72 +29,44 @@ func upstreams(cfgs []config.Upstream, logger *slog.Logger, auditor *audit.Logge
 	return routes, nil
 }
 
+// upstreamRoute builds one transport from an upstream the config package has
+// already parsed, so there is nothing left here to reject but a transport name
+// the switch does not know.
 func upstreamRoute(cfg config.Upstream, logger *slog.Logger, auditor *audit.Logger) (router.Upstream, error) {
 	logger = logger.With("upstream", cfg.Name)
 
 	switch cfg.Transport {
 	case config.TransportHTTP:
-		target, err := upstreamURL(cfg.URL)
-		if err != nil {
-			return router.Upstream{}, fmt.Errorf("upstream %q: %w", cfg.Name, err)
-		}
 		return router.Upstream{
 			Name:      cfg.Name,
-			Transport: httptransport.New(target, logger),
+			Transport: httptransport.New(cfg.URL, logger),
 		}, nil
 
 	case config.TransportStdio:
-		idle, err := idleTimeout(cfg.IdleTimeout)
-		if err != nil {
-			return router.Upstream{}, fmt.Errorf("upstream %q: idle_timeout: %w", cfg.Name, err)
+		options := stdiotransport.Options{
+			Name:        cfg.Name,
+			Command:     cfg.Command,
+			Args:        cfg.Args,
+			Env:         cfg.Env,
+			Dir:         cfg.Dir,
+			MaxSessions: cfg.MaxChildren,
+			IdleTimeout: cfg.IdleTimeout,
+			Logger:      logger,
+			Audit:       auditor,
+		}
+		// The transport still spells an unset credential as a zero uid and gid.
+		if credential := cfg.Credential; credential != nil {
+			options.UID, options.GID = credential.UID, credential.GID
 		}
 		return router.Upstream{
-			Name: cfg.Name,
-			Transport: stdiotransport.New(stdiotransport.Options{
-				Name:        cfg.Name,
-				Command:     cfg.Command,
-				Args:        cfg.Args,
-				Env:         cfg.Env,
-				Dir:         cfg.Dir,
-				UID:         cfg.UID,
-				GID:         cfg.GID,
-				MaxSessions: cfg.MaxChildren,
-				IdleTimeout: idle,
-				Logger:      logger,
-				Audit:       auditor,
-			}),
+			Name:      cfg.Name,
+			Transport: stdiotransport.New(options),
 			// A stdio child has no sessions of its own, so this transport mints
 			// the ids and binds them to the caller itself.
 			TransportManagesSessions: true,
 		}, nil
 	}
 	return router.Upstream{}, fmt.Errorf("upstream %q: unknown transport %q", cfg.Name, cfg.Transport)
-}
-
-// upstreamURL parses an HTTP upstream's endpoint. The config validates only
-// that it is present, and construction never dials, so an address no request
-// could ever be built from is the one failure still catchable before serving.
-func upstreamURL(raw string) (*url.URL, error) {
-	target, err := url.Parse(raw)
-	if err != nil {
-		return nil, fmt.Errorf("url: %w", err)
-	}
-	if target.Host == "" {
-		return nil, fmt.Errorf("url %q has no host", raw)
-	}
-	switch target.Scheme {
-	case "http", "https":
-	default:
-		return nil, fmt.Errorf("url %q must be http or https", raw)
-	}
-	return target, nil
-}
-
-func idleTimeout(raw string) (time.Duration, error) {
-	if raw == "" {
-		return 0, nil
-	}
-	return time.ParseDuration(raw)
 }
 
 func closeUpstreams(routes []router.Upstream) error {

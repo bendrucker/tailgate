@@ -26,13 +26,12 @@ import (
 	"tailscale.com/client/tailscale/apitype"
 	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/tsnet"
+
+	"github.com/bendrucker/tailgate/internal/config"
 )
 
 // ErrClosed is returned by operations attempted after Close.
 var ErrClosed = errors.New("tsnetserver: server closed")
-
-// funnelPorts are the only TCP ports Tailscale Funnel supports.
-var funnelPorts = map[int]bool{443: true, 8443: true, 10000: true}
 
 // node is the part of tsnet.Server this package drives. Joining a tailnet
 // needs a control server, so the interface exists to let tests exercise the
@@ -51,7 +50,8 @@ type Config struct {
 	Hostname string
 	// StateDir holds the node's persistent state, including its machine key.
 	StateDir string
-	// Port is the Funnel port: 443, 8443, or 10000.
+	// Port is the port the Funnel listener serves, which config.FunnelPort
+	// constrains.
 	Port int
 	// Tags are the ACL tags the node advertises on join. The control server
 	// decides whether the node may adopt them.
@@ -82,15 +82,14 @@ type Server struct {
 }
 
 // New configures a node from cfg without contacting the control server. The
-// Funnel port is validated here because Funnel serves only 443, 8443, and
-// 10000, and a listener on any other port would come up locally and then be
-// unreachable from the internet.
+// port and the state directory are checked before anything is built from
+// them, since each describes a node that would join and then be unusable.
 func New(cfg Config) (*Server, error) {
 	if cfg.Hostname == "" {
 		return nil, fmt.Errorf("tsnetserver: hostname is required")
 	}
-	if !funnelPorts[cfg.Port] {
-		return nil, fmt.Errorf("tsnetserver: port %d is not a Funnel port (443, 8443, 10000)", cfg.Port)
+	if err := config.FunnelPort(cfg.Port); err != nil {
+		return nil, fmt.Errorf("tsnetserver: %w", err)
 	}
 	if err := ownerOnlyStateDir(cfg.StateDir); err != nil {
 		return nil, err
@@ -148,8 +147,8 @@ func ownerOnlyStateDir(dir string) error {
 	if !info.IsDir() {
 		return fmt.Errorf("tsnetserver: state dir %s is not a directory", dir)
 	}
-	if perm := info.Mode().Perm(); perm&0o077 != 0 {
-		return fmt.Errorf("tsnetserver: state dir %s is mode %#o, readable beyond its owner, and it holds the node key", dir, perm)
+	if err := config.OwnerOnly("state dir "+dir, info.Mode(), "the node key"); err != nil {
+		return fmt.Errorf("tsnetserver: %w", err)
 	}
 	return nil
 }

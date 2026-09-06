@@ -256,15 +256,12 @@ func TestNodeChanges(t *testing.T) {
 	}
 }
 
-// TestReloadKeepsTokens drives the real handler through a reload. A token
-// issued before the reload must still verify afterward, and the policy that
-// decides what it reaches must be the reloaded one.
-func TestReloadKeepsTokens(t *testing.T) {
-	upstream := httptest.NewServer(http.HandlerFunc(respondJSON))
-	t.Cleanup(upstream.Close)
+// realReloader builds a reloader over the real handler and the real
+// authorization server, so a reload runs the assembly a running tailgate runs
+// rather than a stand-in for it.
+func realReloader(t *testing.T, path string) (*reloader, *auth.Tokens, *resource.URLs) {
+	t.Helper()
 
-	path := filepath.Join(t.TempDir(), "tailgate.hujson")
-	writeConfig(t, path, "tailgate", upstream.URL, "1")
 	cfg, err := config.Load(path)
 	if err != nil {
 		t.Fatalf("Load: %v", err)
@@ -301,6 +298,62 @@ func TestReloadKeepsTokens(t *testing.T) {
 		t.Fatalf("newReloader: %v", err)
 	}
 	t.Cleanup(func() { routes.Close() })
+	return routes, tokens, urls
+}
+
+// metadataStatus asks the current router for the authorization-server metadata
+// under the upstream, which only a router that built and swapped in answers.
+func metadataStatus(routes *reloader) int {
+	rec := httptest.NewRecorder()
+	routes.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, authserver.MetadataPath+"/mcp/"+testUpstream, nil))
+	return rec.Code
+}
+
+// TestReloadRefusesAFileTheLoadAccepted covers the gap between the two gates a
+// reload passes. The favicon names a file the config package never opens, so a
+// document that loads cleanly can still fail the assembly, and that refusal
+// has to leave the running configuration serving like any other.
+func TestReloadRefusesAFileTheLoadAccepted(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "tailgate.hujson")
+	writeConfig(t, path, "tailgate", "http://127.0.0.1:9000/mcp", "1")
+	routes, _, _ := realReloader(t, path)
+
+	raw := fmt.Sprintf(`{
+  "node": {"hostname": "tailgate", "port": 443},
+  "upstreams": [{"name": %q, "transport": "http", "url": "http://127.0.0.1:9000/mcp"}],
+  "policy": [{"upstream": %q, "allow": [{"sub": "1"}]}],
+  "favicon": %q,
+}`, testUpstream, testUpstream, filepath.Join(dir, "missing.png"))
+	if err := os.WriteFile(path, []byte(raw), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	if _, err := config.Load(path); err != nil {
+		t.Fatalf("the load this test needs to accept refused it: %v", err)
+	}
+	err := routes.Reload()
+	if err == nil {
+		t.Fatal("Reload accepted a favicon that cannot be read")
+	}
+	if !strings.Contains(err.Error(), "missing.png") {
+		t.Errorf("error %q does not name the file it could not read", err)
+	}
+	if got := metadataStatus(routes); got != http.StatusOK {
+		t.Errorf("the running configuration answers %d after a refused reload, want 200", got)
+	}
+}
+
+// TestReloadKeepsTokens drives the real handler through a reload. A token
+// issued before the reload must still verify afterward, and the policy that
+// decides what it reaches must be the reloaded one.
+func TestReloadKeepsTokens(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(respondJSON))
+	t.Cleanup(upstream.Close)
+
+	path := filepath.Join(t.TempDir(), "tailgate.hujson")
+	writeConfig(t, path, "tailgate", upstream.URL, "1")
+	routes, tokens, urls := realReloader(t, path)
 
 	issued := tokens.Issue(auth.Grant{
 		Identity: auth.Identity{Subject: "1", Email: "you@example.ts.net"},
@@ -339,9 +392,7 @@ func TestReloadKeepsTokens(t *testing.T) {
 
 	// The metadata for the upstream is served by whichever router is current,
 	// and the authorization server's upstream check follows it.
-	rec := httptest.NewRecorder()
-	routes.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, authserver.MetadataPath+"/mcp/"+testUpstream, nil))
-	if rec.Code != http.StatusOK {
-		t.Errorf("authorization-server metadata under the upstream: %d, want 200", rec.Code)
+	if got := metadataStatus(routes); got != http.StatusOK {
+		t.Errorf("authorization-server metadata under the upstream: %d, want 200", got)
 	}
 }

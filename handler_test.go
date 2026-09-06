@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
@@ -80,17 +81,13 @@ func testHandler(t *testing.T, respond http.HandlerFunc) (http.Handler, *fakeVer
 	}))
 	t.Cleanup(upstream.Close)
 
-	cfg := &config.Config{
-		Node: config.Node{Hostname: "tailgate", Port: testPort},
-		Upstreams: []config.Upstream{
-			{Name: testUpstream, Transport: config.TransportHTTP, URL: upstream.URL},
-		},
-		Policy: []config.Rule{
-			{Upstream: testUpstream, Allow: []config.Match{{Email: "you@example.ts.net"}}},
-		},
-	}
-	if err := cfg.Validate(); err != nil {
-		t.Fatalf("Validate: %v", err)
+	cfg, err := config.LoadReader(strings.NewReader(fmt.Sprintf(`{
+		"node": {"hostname": "tailgate", "port": %d},
+		"upstreams": [{"name": %q, "transport": "http", "url": %q}],
+		"policy": [{"upstream": %q, "allow": [{"email": "you@example.ts.net"}]}],
+	}`, testPort, testUpstream, upstream.URL, testUpstream)))
+	if err != nil {
+		t.Fatalf("LoadReader: %v", err)
 	}
 
 	urls, err := resource.NewURLs(testFQDN, testPort)
