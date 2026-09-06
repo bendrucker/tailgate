@@ -113,6 +113,11 @@ func (cfg execConfig) start(logger *slog.Logger) (_ Child, err error) {
 	}
 	stderr, err := cmd.StderrPipe()
 	if err != nil {
+		// os/exec closes the pipes it made once Start has run, but nothing has
+		// started here, so the stdout pipe would outlive the attempt. An
+		// upstream that fails this far in fails the same way on every request,
+		// and a descriptor pair per attempt is what exhausts the process.
+		stdout.Close()
 		return nil, err
 	}
 
