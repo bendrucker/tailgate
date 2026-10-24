@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/bendrucker/tailgate/internal/resource"
@@ -33,9 +34,9 @@ var (
 )
 
 const (
-	// DefaultAccessTokenTTL is how long an access token verifies. Revocation
-	// is a restart, so the lifetime is the window a client keeps working
-	// after being cut off by any other means.
+	// DefaultAccessTokenTTL is how long an access token verifies. Access
+	// tokens are never persisted, so the lifetime is the window a client keeps
+	// working after its refresh grant is deleted.
 	DefaultAccessTokenTTL = time.Hour
 	// DefaultRefreshTokenTTL is how long a refresh token can be redeemed. Each
 	// redemption rotates it, so the lifetime bounds an idle client.
@@ -87,9 +88,10 @@ type grantEntry struct {
 
 // Tokens issues and verifies tailgate's own opaque bearer tokens from memory.
 // A token is 32 random bytes, and the tables key on its SHA-256 digest so a
-// heap dump cannot yield usable credentials. Nothing persists: a restart
-// invalidates every token, and clients recover through the ordinary 401
-// challenge. It is safe for concurrent use.
+// heap dump cannot yield usable credentials. Access tokens never outlive the
+// process. Refresh tokens do when WithRefreshFile names a file, so a client
+// whose access token a restart forgot redeems its refresh token on the 401
+// rather than returning to consent. It is safe for concurrent use.
 type Tokens struct {
 	now        func() time.Time
 	accessTTL  time.Duration
@@ -97,6 +99,11 @@ type Tokens struct {
 	required   []string
 	access     *tokenCache[grantEntry]
 	refresh    *tokenCache[grantEntry]
+	// store is nil when refresh tokens live in memory only. saving serializes
+	// snapshots, so the file never moves back to an older table than one
+	// already written.
+	store  *refreshStore
+	saving sync.Mutex
 }
 
 type TokensOption func(*tokensOptions)
@@ -107,6 +114,7 @@ type tokensOptions struct {
 	refreshTTL    time.Duration
 	accessTokens  int
 	refreshTokens int
+	refreshFile   *refreshStore
 }
 
 // WithClock replaces the clock used for issue and expiry.
@@ -120,6 +128,15 @@ func WithAccessTokenTTL(d time.Duration) TokensOption {
 
 func WithRefreshTokenTTL(d time.Duration) TokensOption {
 	return func(o *tokensOptions) { o.refreshTTL = d }
+}
+
+// WithRefreshFile keeps the refresh table in the file at path, read at
+// construction and rewritten after every issue, redemption, and revocation.
+// onError hears every read or write failure, none of which stops issuing: an
+// unreadable file starts the table empty, and a failed write leaves the last
+// good file in place.
+func WithRefreshFile(path string, onError func(error)) TokensOption {
+	return func(o *tokensOptions) { o.refreshFile = &refreshStore{path: path, onError: onError} }
 }
 
 // withTableSizes bounds the two tables. Tests use it to exercise eviction.
@@ -147,13 +164,58 @@ func NewTokens(opts ...TokensOption) *Tokens {
 	if o.refreshTTL <= 0 {
 		o.refreshTTL = DefaultRefreshTokenTTL
 	}
-	return &Tokens{
+	t := &Tokens{
 		now:        o.now,
 		accessTTL:  o.accessTTL,
 		refreshTTL: o.refreshTTL,
 		required:   resource.RequiredScopes(),
 		access:     newTokenCache[grantEntry](o.accessTokens),
 		refresh:    newTokenCache[grantEntry](o.refreshTokens),
+		store:      o.refreshFile,
+	}
+	t.restore()
+	return t
+}
+
+// restore fills the refresh table from the store. Records go in oldest first,
+// so the eviction order after a restart matches the one before it.
+func (t *Tokens) restore() {
+	if t.store == nil {
+		return
+	}
+	now := t.now()
+	records, err := t.store.load(now)
+	if err != nil {
+		t.store.report(err)
+		return
+	}
+	for _, record := range records {
+		digest, entry, err := record.entry()
+		if err != nil {
+			t.store.report(err)
+			continue
+		}
+		t.refresh.put(digest, entry, entry.expires, now)
+	}
+}
+
+// persist writes the refresh table as it stands. The snapshot is taken under
+// saving, so of two racing writes the later one carries both changes.
+func (t *Tokens) persist() {
+	if t.store == nil {
+		return
+	}
+	t.saving.Lock()
+	defer t.saving.Unlock()
+	now := t.now()
+	var records []refreshRecord
+	t.refresh.each(func(digest string, e grantEntry, expires time.Time) {
+		if now.Before(expires) {
+			records = append(records, recordOf(digest, e))
+		}
+	})
+	if err := t.store.save(records); err != nil {
+		t.store.report(err)
 	}
 }
 
@@ -171,6 +233,7 @@ func (t *Tokens) Issue(g Grant) Issued {
 	entry.expires = now.Add(t.refreshTTL)
 	refresh := newToken()
 	t.refresh.put(tokenDigest(refresh), entry, entry.expires, now)
+	t.persist()
 
 	return Issued{AccessToken: access, RefreshToken: refresh, ExpiresIn: t.accessTTL, family: g.family}
 }
@@ -202,6 +265,9 @@ func (t *Tokens) Redeem(refreshToken, clientID string, accept func(Grant) error)
 	if refused != nil {
 		return Grant{}, refused
 	}
+	if ok {
+		t.persist()
+	}
 	if !ok || entry.grant.ClientID != clientID {
 		return Grant{}, fmt.Errorf("%w: unknown, expired, already used, or another client's", ErrInvalidToken)
 	}
@@ -219,7 +285,9 @@ func (t *Tokens) Revoke(issued Issued) {
 	}
 	sameFamily := func(e grantEntry) bool { return e.grant.family == issued.family }
 	t.access.deleteWhere(sameFamily)
-	t.refresh.deleteWhere(sameFamily)
+	if t.refresh.deleteWhere(sameFamily) > 0 {
+		t.persist()
+	}
 }
 
 // Verify returns the caller's identity if token is a live access token issued
