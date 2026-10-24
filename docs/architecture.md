@@ -36,7 +36,7 @@ A refusal is a single value. It carries its status, its body, and the authorizat
 
 ## Token Verification
 
-`auth.Tokens` holds every access and refresh token tailgate has issued, in memory, keyed by the SHA-256 digest of the token. `Verify` is a lookup. It rejects anything outside the [RFC 6750](https://www.rfc-editor.org/rfc/rfc6750) token grammar, an unknown or expired token, a token whose audience is not the requested upstream's canonical URI, and one missing a required scope. Access tokens live an hour and refresh tokens thirty days. Each table holds 16,384 entries and evicts the oldest when full, and a restart empties both.
+`auth.Tokens` holds every access and refresh token tailgate has issued, in memory, keyed by the SHA-256 digest of the token. `Verify` is a lookup. It rejects anything outside the [RFC 6750](https://www.rfc-editor.org/rfc/rfc6750) token grammar, an unknown or expired token, a token whose audience is not the requested upstream's canonical URI, and one missing a required scope. Access tokens live an hour and refresh tokens thirty days. Each table holds 16,384 entries and evicts the oldest when full. A restart empties the access table. The refresh table is rewritten to `state_dir/refresh-tokens.json` after every change and reloaded at startup, so a client whose access token a restart forgot redeems its refresh token on the `401`. Without `state_dir` it stays in memory and a restart empties it too.
 
 The authorizer walks the upstream's rules in configured order and the first matching `allow` entry wins. Conditions within an entry are conjunctive.
 
@@ -51,7 +51,7 @@ tailgate issues the tokens its own resources accept. `internal/authserver` serve
 - `POST /token` redeems a code against its PKCE verifier and issues an access and refresh pair, or rotates a refresh token. A replayed code revokes the pair it first issued. A refresh token presented by another client is consumed and refused. Any `client_secret` is refused, since no client has one.
 - `/register` is absent. CIMD is the registration mechanism.
 
-Every table is in memory and capped: pending authorizations, codes, redeemed codes, and tokens. Restarting tailgate forgets them all, and clients recover through the ordinary `401`.
+Every table is in memory and capped: pending authorizations, codes, redeemed codes, and tokens. Restarting tailgate forgets them all except refresh tokens, and clients recover through the ordinary `401`.
 
 ## `proxy.Transport`
 

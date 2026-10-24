@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -85,13 +86,13 @@ func serve(ctx context.Context, logger *slog.Logger, node tsnetserver.Node, cfg 
 		return err
 	}
 
-	// tailgate issues its own tokens, from memory. The store and the
-	// authorization server around it are built once here: they hold every
-	// token a client has, so a reload must never rebuild them. The router is
-	// what a reload rebuilds, and the authorization server reaches the current
-	// one through the reloader for its upstream check, which is why the
-	// reloader is built before the router it will serve.
-	tokens := auth.NewTokens()
+	// tailgate issues its own tokens. The store and the authorization server
+	// around it are built once here: they hold every token a client has, so a
+	// reload must never rebuild them. The router is what a reload rebuilds,
+	// and the authorization server reaches the current one through the
+	// reloader for its upstream check, which is why the reloader is built
+	// before the router it will serve.
+	tokens := auth.NewTokens(tokenOptions(cfg.Node, logger)...)
 	routes := newReloader(opts.ConfigPath, cfg.Node, logger)
 	defer routes.Close()
 
@@ -167,6 +168,24 @@ func reloadOnSignal(ctx context.Context, signals <-chan os.Signal, routes *reloa
 // on what it is waiting for: an unattended start has only the auth key it was
 // given, while -open-login is waiting on a person to approve a login in a
 // browser.
+// refreshFileName is the refresh table's file inside node.state_dir, beside
+// the node key it is no more sensitive than.
+const refreshFileName = "refresh-tokens.json"
+
+// tokenOptions keeps refresh tokens in node.state_dir so they survive a
+// restart. With no state_dir configured, tsnet picks its own directory and
+// tailgate has nowhere it is sure of to write, so refresh tokens stay in
+// memory as access tokens always do.
+func tokenOptions(node config.Node, logger *slog.Logger) []auth.TokensOption {
+	if node.StateDir == "" {
+		return nil
+	}
+	path := filepath.Join(node.StateDir, refreshFileName)
+	return []auth.TokensOption{auth.WithRefreshFile(path, func(err error) {
+		logger.Error("refresh token file", "path", path, "err", err)
+	})}
+}
+
 func joinTimeoutFor(opts options) time.Duration {
 	if opts.OpenLoginURL {
 		return interactiveJoinTimeout

@@ -66,7 +66,7 @@ A reload rebuilds the routes from the file. Upstreams added appear, upstreams re
 
 Everything under `node` is fixed for the life of the process, since the tailnet node is joined once. A reload whose `node` section differs is refused, and so is a file that fails to load or a configuration whose routes fail to build. Each refusal is logged with its reason and leaves the running configuration in service, so a mistyped file never takes tailgate down.
 
-Tokens survive a reload, because the store holding them is outside what a reload rebuilds. Sessions do not. A stateful client's next request answers `404`, the MCP signal to re-initialize, and a stdio child of the previous configuration is terminated once its in-flight requests finish.
+Tokens survive a reload, because the store holding them is outside what a reload rebuilds. Refresh tokens also survive a restart when `state_dir` is set, since they are kept in `state_dir/refresh-tokens.json`. Sessions survive neither. A stateful client's next request answers `404`, the MCP signal to re-initialize, and a stdio child of the previous configuration is terminated once its in-flight requests finish.
 
 ## Startup Failures
 
