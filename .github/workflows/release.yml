@@ -1,0 +1,148 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - .github/workflows/release.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  ASSET: tailgate-darwin-arm64
+  IDENTIFIER: dev.bendrucker.tailgate
+
+jobs:
+  build:
+    runs-on: macos-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: build
+        env:
+          CGO_ENABLED: "1"
+          GOOS: darwin
+          GOARCH: arm64
+        run: go build -trimpath -o "$ASSET" .
+      - name: confirm cgo
+        run: go version -m "$ASSET" | grep -q 'CGO_ENABLED=1'
+      - name: run under the hardened runtime
+        run: |
+          cp "$ASSET" "$RUNNER_TEMP/adhoc"
+          codesign --force --sign - --identifier "$IDENTIFIER" --options runtime "$RUNNER_TEMP/adhoc"
+          "$RUNNER_TEMP/adhoc" help > /dev/null
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: unsigned
+          path: ${{ env.ASSET }}
+          if-no-files-found: error
+          retention-days: 1
+
+  sign:
+    if: github.event_name != 'pull_request'
+    needs: build
+    runs-on: macos-latest
+    environment: release
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: unsigned
+      - name: import the signing identity
+        env:
+          P12_BASE64: ${{ secrets.SIGNING_P12_BASE64 }}
+          P12_PASSWORD: ${{ secrets.SIGNING_P12_PASSWORD }}
+          CERT_SHA1: ${{ vars.SIGNING_CERT_SHA1 }}
+        run: |
+          if [ -z "$P12_BASE64" ] || [ -z "$P12_PASSWORD" ] || [ -z "$CERT_SHA1" ]; then
+            echo "::error::the release environment needs SIGNING_P12_BASE64, SIGNING_P12_PASSWORD, and SIGNING_CERT_SHA1"
+            exit 1
+          fi
+          keychain="$RUNNER_TEMP/signing.keychain-db"
+          keychain_password="$(openssl rand -hex 32)"
+          umask 077
+          printf '%s' "$P12_BASE64" | base64 -D > "$RUNNER_TEMP/signing.p12"
+          security create-keychain -p "$keychain_password" "$keychain"
+          security set-keychain-settings -lut 900 "$keychain"
+          security unlock-keychain -p "$keychain_password" "$keychain"
+          security import "$RUNNER_TEMP/signing.p12" -k "$keychain" -P "$P12_PASSWORD" -f pkcs12 -T /usr/bin/codesign
+          rm -f "$RUNNER_TEMP/signing.p12"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$keychain_password" "$keychain" > /dev/null
+          imported="$(security find-certificate -c "tailgate Code Signing" -Z "$keychain" | awk '/SHA-1/ { print tolower($3) }')"
+          expected="$(printf '%s' "$CERT_SHA1" | tr 'A-F' 'a-f')"
+          if [ "$imported" != "$expected" ]; then
+            echo "::error::imported certificate $imported does not match SIGNING_CERT_SHA1 $expected"
+            exit 1
+          fi
+          echo "KEYCHAIN=$keychain" >> "$GITHUB_ENV"
+      - name: sign
+        env:
+          CERT_SHA1: ${{ vars.SIGNING_CERT_SHA1 }}
+        run: |
+          sha1="$(printf '%s' "$CERT_SHA1" | tr 'A-F' 'a-f')"
+          requirement="designated => identifier \"$IDENTIFIER\" and certificate leaf = H\"$sha1\""
+          codesign --force --sign "$sha1" --keychain "$KEYCHAIN" \
+            --identifier "$IDENTIFIER" --options runtime \
+            --requirements "=$requirement" "$ASSET"
+          codesign --verify --strict --verbose=2 "$ASSET"
+          actual="$(codesign -d -r - "$ASSET" 2> /dev/null)"
+          if [ "$(printf '%s' "$actual" | tr 'A-F' 'a-f')" != "$(printf '%s' "$requirement" | tr 'A-F' 'a-f')" ]; then
+            echo "::error::designated requirement is '$actual', expected '$requirement'"
+            exit 1
+          fi
+          codesign -dv "$ASSET" 2>&1 | grep -q 'flags=0x10000(runtime)'
+      - name: delete the signing keychain
+        if: always()
+        run: |
+          if [ -n "${KEYCHAIN:-}" ]; then security delete-keychain "$KEYCHAIN"; fi
+          rm -f "$RUNNER_TEMP/signing.p12"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: signed
+          path: ${{ env.ASSET }}
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    if: github.event_name != 'pull_request' && startsWith(github.ref, 'refs/tags/v')
+    needs: sign
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: signed
+      - name: checksum
+        run: sha256sum "$ASSET" > "$ASSET.sha256"
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: ${{ env.ASSET }}
+      - name: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          if gh release view "$TAG" > /dev/null 2>&1; then
+            gh release upload "$TAG" "$ASSET" "$ASSET.sha256" --clobber
+          else
+            gh release create "$TAG" "$ASSET" "$ASSET.sha256" --verify-tag --generate-notes
+          fi
