@@ -68,6 +68,39 @@ Everything under `node` is fixed for the life of the process, since the tailnet 
 
 Tokens survive a reload, because the store holding them is outside what a reload rebuilds. Sessions do not. A stateful client's next request answers `404`, the MCP signal to re-initialize, and a stdio child of the previous configuration is terminated once its in-flight requests finish.
 
+## Refresh Token Persistence
+
+Refresh tokens persist across restarts, so a deploy doesn't send clients back through consent. After a restart each client's access token answers `401` and the client refreshes silently. Access tokens, codes, pending authorizations, and session bindings are still in memory only.
+
+The refresh-token table is written to `refresh-tokens.sealed` in `state_dir` at mode `0600` after every issue, redemption, and revocation. It is sealed with AES-256-GCM under a 32-byte key that tailgate generates on its first start and stores in the login keychain as a generic password with service `dev.bendrucker.tailgate` and account set to the absolute `state_dir`. The login keychain belongs to a GUI session, so run tailgate as a LaunchAgent in the `gui/<uid>` domain. A LaunchDaemon can't use the login keychain.
+
+### Code Signing
+
+The keychain item's access list trusts only the binary that created it, identified by its code signature's designated requirement. Sign every installed build with the same identity and identifier. Each rebuild then matches the requirement the item recorded. The identity is a self-signed code signing certificate named `tailgate Code Signing` in the login keychain, and the identifier is `dev.bendrucker.tailgate`.
+
+```sh
+codesign --force --sign "tailgate Code Signing" --identifier dev.bendrucker.tailgate "$(go env GOPATH)/bin/tailgate"
+codesign --display --requirements - "$(go env GOPATH)/bin/tailgate"
+```
+
+The second command prints a designated requirement that specifies the identifier and the certificate leaf hash.
+
+A build without that signature is a different application to the keychain. `go build` and `go install` leave the binary ad hoc signed, whose requirement is its own cdhash, so even two unsigned builds don't match each other. tailgate disables keychain prompts, so a build the item doesn't trust is refused the key. That start logs an error and serves from memory. The sealed file is left in place for the next correctly signed start. Each restart in that state sends every client back through consent.
+
+A key created by an unsigned build is readable only by that build. After switching to the signed identity, delete it once and let the next start generate a new one:
+
+```sh
+security delete-generic-password -s dev.bendrucker.tailgate -a "$HOME/.local/state/tailgate"
+```
+
+### Other Platforms
+
+The keychain store needs macOS and a cgo build. Anywhere else, set `node.token_store` to `"memory"`, which keeps every token in memory. A restart then sends every client back through consent. tailgate refuses to start with the default store on a build without keychain support, so memory-only is always stated in the config. It never writes the table unsealed.
+
+### Revoking Refresh Tokens
+
+`tailgate -config <path> -forget-tokens` deletes the sealed file and the keychain key, then exits without serving. Restart the service afterward to drop the tokens the running process still has in memory. Anything that process wrote in between is sealed under the deleted key, and the next start rejects it.
+
 ## Startup Failures
 
 Nothing serves until every startup step succeeds, so a failure here is downtime rather than an unauthenticated window.

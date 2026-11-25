@@ -28,6 +28,10 @@ Flags:
 const usageFooter = `
 Set TS_AUTHKEY to join the tailnet on the first start. The node key then
 persists in node.state_dir, so later starts do not log in again.
+
+Refresh tokens persist in node.state_dir, sealed under a key in the macOS
+login keychain, unless node.token_store is "memory". -forget-tokens revokes
+all of them.
 `
 
 // refuse reports a bad invocation and exits. Both entry points to it are usage
@@ -51,6 +55,7 @@ func usage() {
 func main() {
 	configPath := flag.String("config", "tailgate.hujson", "path to the tailgate config file")
 	openLogin := flag.Bool("open-login", false, "open the interactive login URL in the default browser when the node has no auth key")
+	forget := flag.Bool("forget-tokens", false, "revoke every refresh token by deleting the sealed token file and its keychain key, then exit without serving")
 	flag.CommandLine.Usage = usage
 
 	// Serving is the default, so a deployment's command line stays
@@ -83,6 +88,15 @@ func main() {
 	if err != nil {
 		logger.Error("load config", "path", *configPath, "err", err)
 		os.Exit(1)
+	}
+
+	if *forget {
+		if err := forgetTokens(cfg.Node, nil); err != nil {
+			logger.Error("forget tokens", "err", err)
+			os.Exit(1)
+		}
+		logger.Info("refresh tokens forgotten. Restart tailgate to drop the ones a running process still has in memory")
+		return
 	}
 
 	// The node is built here and handed to serve, which owns its lifecycle

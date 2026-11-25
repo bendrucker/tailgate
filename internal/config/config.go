@@ -90,6 +90,25 @@ type Node struct {
 	// auth key happened to mint the node. The control server still decides
 	// whether the node may adopt a tag it advertises.
 	Tags []string `json:"tags,omitempty"`
+
+	// TokenStore is where refresh tokens are kept: TokenStoreKeychain, the
+	// default, or TokenStoreMemory. It belongs to node because, like the rest
+	// of the section, it is fixed for the life of the process.
+	TokenStore string `json:"token_store,omitempty"`
+}
+
+const (
+	// TokenStoreKeychain seals refresh tokens to a file in state_dir under a
+	// key held in the macOS login keychain. They persist across restarts.
+	TokenStoreKeychain = "keychain"
+	// TokenStoreMemory keeps every token in memory. A restart sends every
+	// client back through consent.
+	TokenStoreMemory = "memory"
+)
+
+// PersistsTokens reports whether refresh tokens are kept across restarts.
+func (n Node) PersistsTokens() bool {
+	return n.TokenStore != TokenStoreMemory
 }
 
 // FQDN reports the tailnet DNS name the node is expected to join under, or the
@@ -113,6 +132,11 @@ func (n Node) validate() error {
 	// URIs no client could be configured with.
 	if n.Tailnet != "" && strings.ContainsAny(n.Tailnet, "/:?# ") {
 		return fmt.Errorf("config: node.tailnet %q must be a bare DNS suffix", n.Tailnet)
+	}
+	switch n.TokenStore {
+	case "", TokenStoreKeychain, TokenStoreMemory:
+	default:
+		return fmt.Errorf("config: node.token_store %q must be %q or %q", n.TokenStore, TokenStoreKeychain, TokenStoreMemory)
 	}
 	for _, tag := range n.Tags {
 		// A tag the control server rejects leaves the node joined and untagged

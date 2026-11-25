@@ -13,7 +13,6 @@ import (
 	"time"
 
 	"github.com/bendrucker/tailgate/internal/audit"
-	"github.com/bendrucker/tailgate/internal/auth"
 	"github.com/bendrucker/tailgate/internal/authserver"
 	"github.com/bendrucker/tailgate/internal/cimd"
 	"github.com/bendrucker/tailgate/internal/config"
@@ -53,6 +52,8 @@ type options struct {
 	OpenLoginURL bool
 	// ConfigPath is the file cfg was loaded from, which a SIGHUP loads again.
 	ConfigPath string
+	// Secrets replaces the login keychain item holding the refresh-token key.
+	Secrets secretStore
 }
 
 // serve runs tailgate on node until ctx is canceled or the listener fails.
@@ -70,6 +71,15 @@ func serve(ctx context.Context, logger *slog.Logger, node tsnetserver.Node, cfg 
 	// conflict.
 	defer node.Close()
 
+	// tailgate issues its own tokens. The store and the authorization server
+	// around it are built once: they store every token a client has, so a
+	// reload must never rebuild them. A store that cannot be built fails
+	// before the node joins.
+	tokens, err := newTokens(logger, cfg.Node, opts.Secrets)
+	if err != nil {
+		return err
+	}
+
 	fqdn, err := joinTailnet(ctx, node, joinTimeoutFor(opts))
 	if err != nil {
 		return err
@@ -85,13 +95,9 @@ func serve(ctx context.Context, logger *slog.Logger, node tsnetserver.Node, cfg 
 		return err
 	}
 
-	// tailgate issues its own tokens, from memory. The store and the
-	// authorization server around it are built once here: they hold every
-	// token a client has, so a reload must never rebuild them. The router is
-	// what a reload rebuilds, and the authorization server reaches the current
-	// one through the reloader for its upstream check, which is why the
-	// reloader is built before the router it will serve.
-	tokens := auth.NewTokens()
+	// The router is what a reload rebuilds, and the authorization server
+	// reaches the current one through the reloader for its upstream check,
+	// which is why the reloader is built before the router it will serve.
 	routes := newReloader(opts.ConfigPath, cfg.Node, logger)
 	defer routes.Close()
 

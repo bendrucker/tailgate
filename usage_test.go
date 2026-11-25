@@ -23,11 +23,17 @@ Usage:
 Flags:
   -config string
     	path to the tailgate config file (default "tailgate.hujson")
+  -forget-tokens
+    	revoke every refresh token by deleting the sealed token file and its keychain key, then exit without serving
   -open-login
     	open the interactive login URL in the default browser when the node has no auth key
 
 Set TS_AUTHKEY to join the tailnet on the first start. The node key then
 persists in node.state_dir, so later starts do not log in again.
+
+Refresh tokens persist in node.state_dir, sealed under a key in the macOS
+login keychain, unless node.token_store is "memory". -forget-tokens revokes
+all of them.
 `
 
 // TestDispatch covers the argument handling that only main performs, including
