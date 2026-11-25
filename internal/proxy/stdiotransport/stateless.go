@@ -65,7 +65,7 @@ func (t *Transport) serveStateless(w http.ResponseWriter, r *http.Request, infli
 		if errors.Is(err, proxy.ErrCapExceeded) {
 			t.audit.Deny(r.Context(), identity, t.options.Name, ReasonSessionCap)
 		}
-		t.writeError(w, err)
+		t.writeErrorFor(w, err, msg.ID)
 		return
 	}
 	defer s.finish()
@@ -136,7 +136,7 @@ func (t *Transport) statelessSession(ctx context.Context, identity auth.Identity
 			entry = &statelessChild{ready: make(chan struct{})}
 			t.stateless[identity.Subject] = entry
 			t.mu.Unlock()
-			return t.startStateless(entry, identity)
+			return t.startStateless(ctx, entry, identity)
 		}
 		t.mu.Unlock()
 
@@ -165,8 +165,8 @@ func (t *Transport) statelessSession(ctx context.Context, identity auth.Identity
 // startStateless spawns the caller's child and brings it to a state where it
 // answers requests, then publishes it to whoever is waiting. The returned
 // session is already claimed for the request that started it.
-func (t *Transport) startStateless(entry *statelessChild, identity auth.Identity) (*session, error) {
-	s, err := t.newSession(identity)
+func (t *Transport) startStateless(ctx context.Context, entry *statelessChild, identity auth.Identity) (*session, error) {
+	s, err := t.newSession(ctx, identity)
 	if err == nil {
 		if err = t.handshake(s); err != nil {
 			// A child that will not come up has no session to belong to, and
@@ -264,7 +264,7 @@ func (t *Transport) initialize(ctx context.Context, s *session) error {
 func (t *Transport) serveListen(w http.ResponseWriter, inflight *proxy.InFlight, s *session, msg message) {
 	l, unlisten, err := s.listen(t.options.MaxSessions)
 	if err != nil {
-		t.writeError(w, err)
+		t.writeErrorFor(w, err, msg.ID)
 		return
 	}
 	defer unlisten()

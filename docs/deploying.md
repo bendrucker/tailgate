@@ -130,7 +130,7 @@ Deleting the node first frees the hostname. A name still held comes back from th
 
 ## Limits
 
-Request bodies are capped at 1 MiB and session bindings expire after an hour. Neither has a config key. On a stdio upstream, `max_children` (default 4) and `idle_timeout` (default 5m) are the only tunable limits.
+Request bodies are capped at 1 MiB and session bindings expire after an hour. Neither has a config key. On a stdio upstream, `max_children` (default 4) and `idle_timeout` (default 5m) are the only tunable limits. `max_children` bounds the caller's concurrently busy sessions: at the cap, a new session evicts the caller's least recently used idle one rather than waiting out `idle_timeout`.
 
 ## Operating Notes
 

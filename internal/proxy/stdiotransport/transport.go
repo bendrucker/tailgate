@@ -55,6 +55,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -140,7 +141,8 @@ type Options struct {
 	GID int
 	// MaxSessions caps live sessions per identity per upstream, which is the
 	// config's max_children: a session is a child. The cap is per-identity so
-	// one caller cannot starve the others. It bounds one further thing that is
+	// one caller cannot starve the others. At the cap, a new session evicts the
+	// caller's least recently used idle one. It bounds one further thing that is
 	// not a child: the subscription streams a single child will carry at once,
 	// which cost no process but hold one open for as long as they last.
 	MaxSessions int
@@ -449,13 +451,13 @@ func (t *Transport) serveInitialize(ctx context.Context, w http.ResponseWriter, 
 		return
 	}
 
-	s, err := t.newSession(identity)
+	s, err := t.newSession(ctx, identity)
 	if err != nil {
 		if errors.Is(err, proxy.ErrCapExceeded) {
 			t.audit.Deny(ctx, identity, t.options.Name, ReasonSessionCap)
 		}
 		t.logger.Warn("stdio session refused", "sub", identity.Subject, "err", err)
-		t.writeError(w, err)
+		t.writeErrorFor(w, err, msg.ID)
 		return
 	}
 	defer s.finish()
@@ -548,8 +550,8 @@ func (t *Transport) sessionFor(ctx context.Context, id string, identity auth.Ide
 // a burst of concurrent initializes cannot overshoot the cap. It is released
 // here only while no child exists to hold it. Once one is started, supervise
 // owns the release.
-func (t *Transport) newSession(identity auth.Identity) (*session, error) {
-	if err := t.reserveSlot(identity.Subject); err != nil {
+func (t *Transport) newSession(ctx context.Context, identity auth.Identity) (*session, error) {
+	if err := t.reserveSlot(ctx, identity.Subject); err != nil {
 		return nil, err
 	}
 
@@ -583,17 +585,66 @@ func (t *Transport) newSession(identity auth.Identity) (*session, error) {
 	return s, nil
 }
 
-func (t *Transport) reserveSlot(subject string) error {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	if t.closed {
-		return proxy.ErrDraining
+// reserveSlot takes one of subject's cap slots. At the cap it evicts subject's
+// least recently used idle session and waits for that child to exit. Clients
+// rarely send DELETE, so without eviction abandoned sessions fill the cap until
+// the idle timeout. It refuses only when every one of subject's sessions is busy.
+func (t *Transport) reserveSlot(ctx context.Context, subject string) error {
+	for {
+		t.mu.Lock()
+		if t.closed {
+			t.mu.Unlock()
+			return proxy.ErrDraining
+		}
+		if t.perIdentity[subject] < t.options.MaxSessions {
+			t.perIdentity[subject]++
+			t.mu.Unlock()
+			return nil
+		}
+		victim := t.leastRecentlyUsedIdleLocked(subject)
+		if victim != nil {
+			t.unregisterLocked(victim)
+		}
+		t.mu.Unlock()
+
+		if victim == nil {
+			return fmt.Errorf("%w: %d sessions, all busy", proxy.ErrCapExceeded, t.options.MaxSessions)
+		}
+		t.logger.Info("evicting idle stdio session at the cap", "session", victim.id, "sub", subject)
+		victim.terminate()
+		if err := t.awaitEviction(ctx, victim); err != nil {
+			return err
+		}
 	}
-	if t.perIdentity[subject] >= t.options.MaxSessions {
-		return fmt.Errorf("%w: %d sessions", proxy.ErrCapExceeded, t.options.MaxSessions)
+}
+
+// leastRecentlyUsedIdleLocked returns subject's registered session with no
+// request in flight that was touched longest ago, or nil. An open subscription
+// stream is a request in flight and is never chosen.
+func (t *Transport) leastRecentlyUsedIdleLocked(subject string) *session {
+	var victim *session
+	for _, s := range t.sessions {
+		if s.subject != subject || s.active.Load() > 0 {
+			continue
+		}
+		if victim == nil || s.lastUsed.Load() < victim.lastUsed.Load() {
+			victim = s
+		}
 	}
-	t.perIdentity[subject]++
-	return nil
+	return victim
+}
+
+func (t *Transport) awaitEviction(ctx context.Context, victim *session) error {
+	timer := time.NewTimer(t.options.RequestTimeout)
+	defer timer.Stop()
+	select {
+	case <-victim.exited:
+		return nil
+	case <-ctx.Done():
+		return context.Cause(ctx)
+	case <-timer.C:
+		return fmt.Errorf("%w: evicted child did not exit", proxy.ErrCapExceeded)
+	}
 }
 
 func (t *Transport) releaseSlot(subject string) {
@@ -780,6 +831,12 @@ func writeJSON(w http.ResponseWriter, response []byte) {
 // the child command, the caller's cap, and other internals an internet-facing
 // response must not carry, so it goes to the log instead.
 func (t *Transport) writeError(w http.ResponseWriter, err error) {
+	t.writeErrorFor(w, err, nil)
+}
+
+// writeErrorFor is writeError for a refusal of a request whose id is known. A
+// cap refusal answers in JSON-RPC so a proxy relaying it can parse the body.
+func (t *Transport) writeErrorFor(w http.ResponseWriter, err error, id json.RawMessage) {
 	if errors.Is(err, context.Canceled) {
 		// The caller hung up. There is nobody to answer.
 		return
@@ -799,6 +856,10 @@ func (t *Transport) writeError(w http.ResponseWriter, err error) {
 		protocol.WriteError(w, status, protocol.CodeInvalidRequest, message, nil)
 		return
 	}
+	if status == http.StatusTooManyRequests {
+		protocol.ErrorObject{Code: protocol.CodeServerError, Message: capMessage}.WriteFor(w, status, id)
+		return
+	}
 	http.Error(w, http.StatusText(status), status)
 }
 
@@ -808,6 +869,9 @@ func (t *Transport) writeError(w http.ResponseWriter, err error) {
 // identity, or this transport's internals. The text is written here rather
 // than taken from the sentinel, whose own is prefixed with this package's name
 // for the log.
+// capMessage says no more than the status does. The cap's size goes to the log.
+const capMessage = "session limit reached: every session is busy"
+
 var badRequestMessages = map[error]string{
 	errInvalidMessage:     "invalid JSON-RPC message",
 	errMissingSessionID:   "Mcp-Session-Id is required",

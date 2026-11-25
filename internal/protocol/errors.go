@@ -27,6 +27,9 @@ const (
 const (
 	CodeParseError     = -32700
 	CodeInvalidRequest = -32600
+	// CodeServerError is the first of JSON-RPC's implementation-defined server
+	// errors, outside the sub-range the MCP specification reserves.
+	CodeServerError = -32000
 )
 
 // IsRevisionError reports whether a JSON-RPC error code is one the MCP
@@ -37,13 +40,12 @@ func IsRevisionError(code int) bool {
 	return code <= revisionCodeFirst && code >= revisionCodeLast
 }
 
-// errorResponse is a JSON-RPC error response. The id is always null: every
-// error tailgate originates is a refusal of a message it declined to act on,
-// and it does not claim to have read an id out of a body it rejected.
+// errorResponse is a JSON-RPC error response. The id is null unless the
+// refusal is of a well-formed request whose id tailgate has read.
 type errorResponse struct {
-	JSONRPC string      `json:"jsonrpc"`
-	ID      *string     `json:"id"`
-	Error   ErrorObject `json:"error"`
+	JSONRPC string          `json:"jsonrpc"`
+	ID      json.RawMessage `json:"id"`
+	Error   ErrorObject     `json:"error"`
 }
 
 // ErrorObject is the error member of a JSON-RPC error response. It is a value
@@ -64,7 +66,15 @@ type ErrorObject struct {
 // into downgrading. tailgate answers in the modern shape so a rejected request
 // reads as a rejected request.
 func (e ErrorObject) Write(w http.ResponseWriter, status int) {
-	body, err := json.Marshal(errorResponse{JSONRPC: "2.0", Error: e})
+	e.WriteFor(w, status, nil)
+}
+
+// WriteFor is Write answering the request with id, or null when id is nil.
+func (e ErrorObject) WriteFor(w http.ResponseWriter, status int, id json.RawMessage) {
+	if id == nil {
+		id = json.RawMessage("null")
+	}
+	body, err := json.Marshal(errorResponse{JSONRPC: "2.0", ID: id, Error: e})
 	if err != nil {
 		http.Error(w, http.StatusText(status), status)
 		return
