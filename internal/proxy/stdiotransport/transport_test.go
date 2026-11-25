@@ -680,12 +680,21 @@ func TestDeleteTerminatesSessionAndChild(t *testing.T) {
 }
 
 func TestSessionCapIsPerIdentity(t *testing.T) {
-	h := newHarness(t, Options{MaxSessions: 2})
+	// Initializes are held until every attempt has been decided, so each
+	// session at the cap is busy and none can be evicted.
+	gate := make(chan struct{})
+	h := newScriptedHarness(t, Options{MaxSessions: 2}, func(c *scriptedChild, msg message) {
+		if msg.Method == initializeMethod {
+			<-gate
+		}
+		echoServer(c, msg)
+	})
 
 	const attempts = 10
 	var wg sync.WaitGroup
 	statuses := make([]int, attempts)
 	sessions := make([]string, attempts)
+	refusals := make(chan struct{}, attempts)
 	for i := range attempts {
 		wg.Add(1)
 		go func() {
@@ -694,8 +703,19 @@ func TestSessionCapIsPerIdentity(t *testing.T) {
 			defer response.Body.Close()
 			statuses[i] = response.StatusCode
 			sessions[i] = response.Header.Get(sessionHeader)
+			if response.StatusCode == http.StatusTooManyRequests {
+				refusals <- struct{}{}
+			}
 		}()
 	}
+	for range attempts - 2 {
+		select {
+		case <-refusals:
+		case <-time.After(testDeadline):
+			t.Fatal("timed out waiting for the refusals")
+		}
+	}
+	close(gate)
 	wg.Wait()
 
 	var allowed, refused int
@@ -1028,8 +1048,21 @@ func TestUnauthenticatedRequestNeverSpawns(t *testing.T) {
 }
 
 func TestRefusedRequestsAreAudited(t *testing.T) {
-	h := newHarness(t, Options{Name: "docs", MaxSessions: 1})
+	held := holding("tools/call")
+	h := newScriptedHarness(t, Options{Name: "docs", MaxSessions: 1}, held.answer)
 	session := h.initialize(t, "alice")
+	child := h.children.next(t)
+	answered := make(chan struct{})
+	go func() {
+		defer close(answered)
+		response := h.do(t, call{subject: "alice", session: session, body: requestBody(9, "tools/call", "held")})
+		response.Body.Close()
+	}()
+	inflight := held.next(t)
+	defer func() {
+		child.result(inflight, `{"echo":"held"}`)
+		<-answered
+	}()
 
 	hijack := h.do(t, call{subject: "mallory", session: session, body: requestBody(2, "tools/list", "")})
 	hijack.Body.Close()

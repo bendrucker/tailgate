@@ -91,7 +91,7 @@ A caller on 2026-07-28 gets one child per identity, shared across its concurrent
 
 ### Concurrency and Reaping
 
-The concurrency cap is per identity per upstream, defaults to 4, and counts live processes: a slot releases only when the child has exited. A reaper terminates sessions idle past the configured timeout, defaulting to five minutes.
+The concurrency cap is per identity per upstream, defaults to 4, and counts live processes: a slot releases only when the child has exited. A reaper terminates sessions idle past the configured timeout, defaulting to five minutes. Clients rarely send `DELETE`, so a new session at the cap evicts the caller's least recently used idle session and takes its slot once the child exits. The evicted client gets `404` on its next request and re-initializes. A session with a request in flight or an open subscription stream is never evicted, and the cap refuses with `429` only when every one of the caller's sessions is busy. Its body is a JSON-RPC error so a relaying proxy can parse it.
 
 ### Child Processes
 
