@@ -166,6 +166,10 @@ func TestParseRejectsNode(t *testing.T) {
 			name: "a tailnet that is not a bare suffix",
 			node: Node{Hostname: "tailgate", Port: 443, Tailnet: "https://example.ts.net"},
 		},
+		{
+			name: "an unknown token store",
+			node: Node{Hostname: "tailgate", Port: 443, TokenStore: "file"},
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			d := document{Node: tc.node}

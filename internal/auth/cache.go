@@ -104,16 +104,36 @@ func (c *tokenCache[T]) take(key string, now time.Time, consume func(T) bool) (T
 	return entry.value, true
 }
 
-func (c *tokenCache[T]) deleteWhere(match func(T) bool) {
+// deleteWhere forgets every entry match accepts and reports how many it
+// forgot.
+func (c *tokenCache[T]) deleteWhere(match func(T) bool) int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	deleted := 0
 	for el := c.order.Front(); el != nil; {
 		next := el.Next()
 		if match(el.Value.(*cacheEntry[T]).value) {
 			c.remove(el)
+			deleted++
 		}
 		el = next
 	}
+	return deleted
+}
+
+// live returns every entry unexpired at now, least recently used first, so
+// putting them back in order rebuilds the same eviction order.
+func (c *tokenCache[T]) live(now time.Time) []cacheEntry[T] {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	entries := make([]cacheEntry[T], 0, c.order.Len())
+	for el := c.order.Back(); el != nil; el = el.Prev() {
+		entry := el.Value.(*cacheEntry[T])
+		if now.Before(entry.expires) {
+			entries = append(entries, *entry)
+		}
+	}
+	return entries
 }
 
 func (c *tokenCache[T]) remove(el *list.Element) {

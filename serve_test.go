@@ -284,6 +284,7 @@ func TestServe(t *testing.T) {
 				t.Fatalf("Load: %v", err)
 			}
 			cfg.Node.Tailnet = tc.tailnet
+			cfg.Node.TokenStore = config.TokenStoreMemory
 
 			steps := &recorder{}
 			tc.node.steps = steps

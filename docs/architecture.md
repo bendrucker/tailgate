@@ -36,7 +36,7 @@ A refusal is a single value. It carries its status, its body, and the authorizat
 
 ## Token Verification
 
-`auth.Tokens` holds every access and refresh token tailgate has issued, in memory, keyed by the SHA-256 digest of the token. `Verify` is a lookup. It rejects anything outside the [RFC 6750](https://www.rfc-editor.org/rfc/rfc6750) token grammar, an unknown or expired token, a token whose audience is not the requested upstream's canonical URI, and one missing a required scope. Access tokens live an hour and refresh tokens thirty days. Each table holds 16,384 entries and evicts the oldest when full, and a restart empties both.
+`auth.Tokens` holds every access and refresh token tailgate has issued, in memory, keyed by the SHA-256 digest of the token. `Verify` is a lookup. It rejects anything outside the [RFC 6750](https://www.rfc-editor.org/rfc/rfc6750) token grammar, an unknown or expired token, a token whose audience is not the requested upstream's canonical URI, and one missing a required scope. Access tokens live an hour and refresh tokens thirty days. Each table holds 16,384 entries and evicts the oldest when full. A restart empties the access table. The refresh table persists through `auth.SealedFile`, which rewrites `refresh-tokens.sealed` in `state_dir` after every issue, redemption, and revocation, sealed with AES-256-GCM under a key in the macOS login keychain (`internal/keychain`). After a restart a client's access token answers `401` and its refresh token still redeems. The client refreshes without returning to consent. `node.token_store` set to `"memory"` keeps both tables in memory only.
 
 The authorizer walks the upstream's rules in configured order and the first matching `allow` entry wins. Conditions within an entry are conjunctive.
 
@@ -51,7 +51,7 @@ tailgate issues the tokens its own resources accept. `internal/authserver` serve
 - `POST /token` redeems a code against its PKCE verifier and issues an access and refresh pair, or rotates a refresh token. A replayed code revokes the pair it first issued. A refresh token presented by another client is consumed and refused. Any `client_secret` is refused, since no client has one.
 - `/register` is absent. CIMD is the registration mechanism.
 
-Every table is in memory and capped: pending authorizations, codes, redeemed codes, and tokens. Restarting tailgate forgets them all, and clients recover through the ordinary `401`.
+Every table is capped: pending authorizations, codes, redeemed codes, and tokens. All of them except the refresh tokens are in memory only, and restarting tailgate forgets them.
 
 ## `proxy.Transport`
 
@@ -109,7 +109,7 @@ For the header-mirroring era, `ValidateMirrored` parses the JSON-RPC envelope an
 
 ## Startup and Shutdown
 
-`main` loads the config and configures the tailnet node, then hands the node to `serve`, which runs a forced sequence: join the tailnet, seed resource URLs from the joined FQDN, build the token store and the authorization server over the node's `WhoIs`, assemble the router, then serve Funnel. Nothing serves until every step succeeds. `serve` takes the node as a `tsnetserver.Node`, so the sequence and the shutdown that reverses it run without a control server.
+`main` loads the config and configures the tailnet node, then hands the node to `serve`, which runs a forced sequence: build the token store, join the tailnet, seed resource URLs from the joined FQDN, build the authorization server over the node's `WhoIs`, assemble the router, then serve Funnel. Nothing serves until every step succeeds. `serve` takes the node as a `tsnetserver.Node`, so the sequence and the shutdown that reverses it run without a control server.
 
 The join is bounded, because tsnet reprints a login URL forever for a node that cannot authenticate and an unbounded wait under launchd looks healthy while serving nothing. [deploying.md](deploying.md#startup-failures) covers the windows and the other startup checks.
 
