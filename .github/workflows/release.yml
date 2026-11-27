@@ -80,6 +80,9 @@ jobs:
           security create-keychain -p "$keychain_password" "$keychain"
           security set-keychain-settings -lut 900 "$keychain"
           security unlock-keychain -p "$keychain_password" "$keychain"
+          # codesign finds an identity only in a keychain on the search list,
+          # even with --keychain.
+          security list-keychains -d user | xargs security list-keychains -d user -s "$keychain"
           security import "$RUNNER_TEMP/signing.p12" -k "$keychain" -P "$P12_PASSWORD" -f pkcs12 -T /usr/bin/codesign
           rm -f "$RUNNER_TEMP/signing.p12"
           security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$keychain_password" "$keychain" > /dev/null
