@@ -2,9 +2,77 @@
 
 ## Installing
 
-```sh
-go install github.com/bendrucker/tailgate@latest
+Each `v*` tag publishes `tailgate-darwin-arm64` to its GitHub release, with a `.sha256` file beside it. The binary is built with cgo, signed with the identifier `dev.bendrucker.tailgate` under the hardened runtime, and attested with GitHub build provenance. With mise:
+
+```toml
+[tools."github:bendrucker/tailgate"]
+version = "latest"
+asset_pattern = "tailgate-darwin-arm64"
 ```
+
+mise strips the platform suffix and installs the binary as `tailgate`. By default it verifies the release's GitHub artifact attestation (`github.github_attestations`), which proves the binary was built in this repository but doesn't check which workflow built it. To require the release workflow itself:
+
+```sh
+gh attestation verify "$(mise which tailgate)" \
+  --repo bendrucker/tailgate \
+  --signer-workflow bendrucker/tailgate/.github/workflows/release.yml
+```
+
+`codesign -d -r - "$(mise which tailgate)"` prints the designated requirement, `identifier "dev.bendrucker.tailgate" and certificate leaf = H"<SHA-1>"`. A keychain item's ACL that admits tailgate by code signature checks this requirement. Every release signed with the same certificate satisfies it.
+
+`go install github.com/bendrucker/tailgate@latest` still builds from source, but the result has only the linker's ad-hoc signature and doesn't satisfy a requirement that references the certificate.
+
+### Gatekeeper
+
+The release binary is self-signed and not notarized, and it runs as installed by mise. Gatekeeper assesses a binary only when it has the `com.apple.quarantine` extended attribute. Browsers and other apps that opt into quarantine set it on their downloads. mise downloads over its own HTTP client and doesn't set it. Its github-backend installs have only `com.apple.provenance`, which doesn't trigger an assessment. On Apple silicon the kernel requires a valid signature to execute any binary, and an untrusted self-signed one is valid.
+
+A binary fetched through a browser is quarantined, and Gatekeeper refuses to open it, since no Developer ID signed it. Clear the attribute after verifying the attestation:
+
+```sh
+xattr -d com.apple.quarantine tailgate-darwin-arm64
+```
+
+### Release Signing Setup
+
+The signing key lives only in the `release` environment's secrets. Setting it up is a one-time, attended step.
+
+Create the environment and restrict it to `v*` tags, so only a release run can read its secrets:
+
+```sh
+gh api -X PUT repos/bendrucker/tailgate/environments/release \
+  -F 'deployment_branch_policy[protected_branches]=false' \
+  -F 'deployment_branch_policy[custom_branch_policies]=true'
+gh api -X POST repos/bendrucker/tailgate/environments/release/deployment-branch-policies \
+  -f name='v*' -f type=tag
+```
+
+Generate the certificate and upload it without printing any secret. Homebrew's OpenSSL is required: the system LibreSSL lacks `-legacy`, and the legacy PKCS#12 encryption is the form `security import` accepts.
+
+```sh
+openssl=/opt/homebrew/bin/openssl
+umask 077
+dir="$(mktemp -d)"
+"$openssl" req -x509 -newkey rsa:3072 -noenc -days 3650 \
+  -keyout "$dir/key.pem" -out "$dir/cert.pem" \
+  -subj '/CN=tailgate Code Signing' \
+  -addext 'basicConstraints=critical,CA:FALSE' \
+  -addext 'keyUsage=critical,digitalSignature' \
+  -addext 'extendedKeyUsage=critical,codeSigning'
+"$openssl" rand -base64 32 > "$dir/password"
+"$openssl" pkcs12 -export -legacy -name 'tailgate Code Signing' \
+  -inkey "$dir/key.pem" -in "$dir/cert.pem" \
+  -passout "file:$dir/password" -out "$dir/signing.p12"
+base64 -i "$dir/signing.p12" | gh secret set SIGNING_P12_BASE64 --env release --repo bendrucker/tailgate
+gh secret set SIGNING_P12_PASSWORD --env release --repo bendrucker/tailgate < "$dir/password"
+"$openssl" x509 -in "$dir/cert.pem" -noout -fingerprint -sha1 \
+  | cut -d= -f2 | tr -d : | tr 'A-F' 'a-f' \
+  | gh variable set SIGNING_CERT_SHA1 --env release --repo bendrucker/tailgate
+rm -rf "$dir"
+```
+
+`SIGNING_CERT_SHA1` is public. The workflow refuses a p12 whose certificate doesn't match it, then checks that the signed binary's designated requirement names it. Run the release workflow on a tag to confirm the setup.
+
+Replacing the certificate changes the designated requirement. Every keychain ACL that trusted the old one stops trusting the next release.
 
 ## Tailnet Prerequisites
 
