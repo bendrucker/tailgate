@@ -90,6 +90,13 @@ jobs:
             exit 1
           fi
           echo "KEYCHAIN=$keychain" >> "$GITHUB_ENV"
+          security list-keychains -d user > "$RUNNER_TEMP/keychains.orig"
+          xargs security list-keychains -d user -s "$keychain" < "$RUNNER_TEMP/keychains.orig"
+      - name: list signing identities
+        run: |
+          security list-keychains -d user
+          security find-identity -v -p codesigning "$KEYCHAIN"
+          security find-identity -p codesigning "$KEYCHAIN"
       - name: sign
         env:
           CERT_SHA1: ${{ vars.SIGNING_CERT_SHA1 }}
@@ -109,6 +116,9 @@ jobs:
       - name: delete the signing keychain
         if: always()
         run: |
+          if [ -f "$RUNNER_TEMP/keychains.orig" ]; then
+            xargs security list-keychains -d user -s < "$RUNNER_TEMP/keychains.orig"
+          fi
           if [ -n "${KEYCHAIN:-}" ]; then security delete-keychain "$KEYCHAIN"; fi
           rm -f "$RUNNER_TEMP/signing.p12"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
