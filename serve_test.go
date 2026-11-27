@@ -17,6 +17,7 @@ import (
 	"github.com/google/go-cmp/cmp"
 	"tailscale.com/client/tailscale/apitype"
 
+	"github.com/bendrucker/tailgate/internal/auth"
 	"github.com/bendrucker/tailgate/internal/config"
 )
 
@@ -454,6 +455,36 @@ func TestJoinTailnet(t *testing.T) {
 				if strings.Contains(err.Error(), remedy) != tc.remedy {
 					t.Errorf("expected mention of %s to be %t in %v", remedy, tc.remedy, err)
 				}
+			}
+		})
+	}
+}
+
+// TestTokenOptions covers where refresh grants survive a restart: under a
+// configured state_dir, and nowhere without one.
+func TestTokenOptions(t *testing.T) {
+	grant := auth.Grant{
+		Identity: auth.Identity{Subject: "12345", Email: "person@example.com"},
+		ClientID: "https://client.example.com/oauth/client",
+		Resource: "https://" + testFQDN + "/mcp/docs",
+		Scopes:   []string{"openid"},
+	}
+
+	for _, tc := range []struct {
+		name     string
+		stateDir string
+		survives bool
+	}{
+		{name: "state dir configured", stateDir: t.TempDir(), survives: true},
+		{name: "no state dir", survives: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			node := config.Node{StateDir: tc.stateDir}
+			issued := auth.NewTokens(tokenOptions(node, discardLogger())...).Issue(grant)
+
+			_, err := auth.NewTokens(tokenOptions(node, discardLogger())...).Redeem(issued.RefreshToken, grant.ClientID, nil)
+			if survives := err == nil; survives != tc.survives {
+				t.Errorf("refresh token survives a restart = %v, want %v (err %v)", survives, tc.survives, err)
 			}
 		})
 	}

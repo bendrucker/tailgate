@@ -1,10 +1,10 @@
 // Package auth issues and verifies tailgate's bearer tokens and authorizes
 // identities against policy.
 //
-// tailgate is its own issuer. Tokens are opaque random strings looked up in
-// memory, so nothing is signed, nothing is parsed, and no JOSE or JWT
-// dependency belongs here. A restart forgets every token, and clients recover
-// through the ordinary 401 challenge.
+// tailgate is its own issuer. Tokens are opaque random strings looked up by
+// digest, so nothing is signed, nothing is parsed, and no JOSE or JWT
+// dependency belongs here. A restart forgets every access token, and clients
+// recover by refreshing on the ordinary 401 challenge.
 package auth
 
 // Identity is the person a token was issued to. Subject is the bare decimal

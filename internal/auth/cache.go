@@ -104,15 +104,31 @@ func (c *tokenCache[T]) take(key string, now time.Time, consume func(T) bool) (T
 	return entry.value, true
 }
 
-func (c *tokenCache[T]) deleteWhere(match func(T) bool) {
+// deleteWhere forgets every entry match accepts and reports how many it
+// forgot.
+func (c *tokenCache[T]) deleteWhere(match func(T) bool) int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	deleted := 0
 	for el := c.order.Front(); el != nil; {
 		next := el.Next()
 		if match(el.Value.(*cacheEntry[T]).value) {
 			c.remove(el)
+			deleted++
 		}
 		el = next
+	}
+	return deleted
+}
+
+// each visits every entry from least to most recently used, the order a put
+// sequence must replay to rebuild the cache as it is.
+func (c *tokenCache[T]) each(visit func(key string, value T, expires time.Time)) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for el := c.order.Back(); el != nil; el = el.Prev() {
+		entry := el.Value.(*cacheEntry[T])
+		visit(entry.key, entry.value, entry.expires)
 	}
 }
 
